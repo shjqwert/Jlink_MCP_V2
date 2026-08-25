@@ -1,0 +1,32 @@
+# Rust build output
+/target/
+
+# Local Agent context and generated indexes
+/AGENTS.md
+/.agent/
+/.agents/
+/.codegraph/
+/.serena/
+
+# Local architecture and design review material
+/architecture/
+
+# Local OpenSpec development specifications
+/openspec/
+
+# Machine-specific J-Link and MCP configuration
+/jlink-mcp.toml
+/.mcp.json
+
+# Local captures, validation evidence, and transient files
+/captures/
+/validation/evidence/
+/openspec/changes/*/evidence/
+*.partial
+*.log
+
+# Editor and operating-system files
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
