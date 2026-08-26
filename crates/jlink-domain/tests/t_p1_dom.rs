@@ -89,6 +89,10 @@ fn t_p1_dom_stable_error_shape_uses_screaming_snake_case_code() {
         "WORKER_UNAVAILABLE: worker is unavailable"
     );
     assert_eq!(ErrorCode::WorkerUnavailable.as_str(), "WORKER_UNAVAILABLE");
+    assert_eq!(
+        ErrorCode::TargetConnectFailed.as_str(),
+        "TARGET_CONNECT_FAILED"
+    );
 
     let error = JlinkError::new(ErrorCode::WorkerUnavailable, "worker is unavailable", true)
         .with_detail("attempt", json!(1));
@@ -155,6 +159,10 @@ fn t_p1_dom_session_transitions_accept_only_legal_edges() {
 
 #[test]
 fn t_p1_dom_worker_loss_preserves_execution_boundary() {
+    assert_eq!(
+        SessionCommand::Validate.execution_kind(),
+        ExecutionKind::SideEffect
+    );
     let uncertain = classify_worker_loss(ExecutionKind::SideEffect, DispatchState::Dispatched)
         .expect("dispatched side effects must be classified");
     assert_eq!(uncertain.code, ErrorCode::ExecutionUncertain);

@@ -40,12 +40,12 @@ public contract and is recorded in the implementation constraints.
 | RUN-004 | T-P3-RECOVER | Windows process integration | F0-B |
 | RUN-005 | T-P1-DOM | Unit/contract fixture | F0-B fault model |
 | RUN-006 | T-P3-ABI | J-Link hardware/DLL exports | F0-A |
-| SES-001 | T-P1-SES | J-Link hardware integration | F0-A identity |
-| SES-002 | T-P1-SES | J-Link hardware integration | F0-A |
-| SES-003 | T-P1-SES | J-Link hardware state recovery | F0-A |
-| SES-004 | T-P1-SES | J-Link hardware integration | F0-A |
-| SES-005 | T-P1-SES | Hardware + identity fixture | F0-A |
-| SES-006 | T-P1-SES | J-Link hardware diagnostics | F0-A |
+| SES-001 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A identity |
+| SES-002 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
+| SES-003 | T-P1-SES | `validation/p1-ses.md` hardware state recovery | F0-A |
+| SES-004 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
+| SES-005 | T-P1-SES | `validation/p1-ses.md` hardware + identity fixture | F0-A |
+| SES-006 | T-P1-SES | `validation/p1-ses.md` hardware diagnostics | F0-A |
 | ART-001 | T-P2-IMG | Image-format fixture | F0-C ELF fixture |
 | ART-002 | T-P2-IMG | ELF fixture + target Flash | F0-A + F0-C |
 | ART-003 | T-P2-DWARF | IAR DWARF fixture | F0-C |

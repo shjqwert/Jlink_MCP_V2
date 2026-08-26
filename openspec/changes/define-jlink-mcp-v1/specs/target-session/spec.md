@@ -19,11 +19,19 @@
 - **THEN** 后续普通读取和 HSS 启动不得重复执行完整环境验证
 
 ### Requirement: SES-003 halted 与 HardFault 自动恢复
-连接或 HSS 启动发现目标 halted 时，系统 MUST 先尝试 resume；resume 失败或目标进入 HardFault 时 MUST 执行 reset 后再次尝试运行。恢复成功后 MUST 保持实际最终状态并通知恢复动作，不得恢复最初 halted 状态。
+Worker 建立并持有 J-Link 目标会话后，连接完成检查或 HSS 启动检查发现目标 halted 时，系统 MUST 先尝试 resume；resume 失败或同一活动会话观察到目标进入 HardFault 时 MUST 执行 reset 后再次尝试运行。恢复成功后 MUST 保持实际最终状态并通知恢复动作，不得恢复最初 halted 状态。若器件专用的 J-Link 首次建连初始化已经复位、暂停或以其他方式归一化连接前状态，系统 MUST 只依据建连后的首个可观察状态执行和报告恢复，不得声称观察到已被厂商初始化清除的连接前 HardFault。
 
 #### Scenario: resume 后正常运行
 - **WHEN** 目标最初 halted 且 resume 成功
 - **THEN** 操作继续并返回 `resumed_from_halt` 通知
+
+#### Scenario: 活动会话观察到 HardFault
+- **WHEN** Worker 已持有目标会话并真实观察到目标进入 HardFault，且复位后能够稳定运行
+- **THEN** 系统执行 reset 后运行并返回 `reset_after_fault` 通知
+
+#### Scenario: 首次建连归一化连接前状态
+- **WHEN** 器件专用 J-Link 建连初始化使连接前 HardFault 不再可观察，建连后的首个可观察状态为 halted
+- **THEN** 系统按 halted 路径恢复并只报告实际执行的 `resume`，不得伪造 HardFault 或 reset 通知
 
 #### Scenario: reset 后仍不能运行
 - **WHEN** resume 和 reset 恢复均失败
@@ -48,8 +56,20 @@
 - **THEN** 下一次变量或 HSS 操作重新验证固件与 ELF 身份
 
 ### Requirement: SES-006 显式诊断
-`jlink_target.validate` MUST 在不产生业务副作用的前提下返回实际完成的 DLL、导出、探针、HSS 和目标检查结果；失败 MUST 给出可操作修正建议。
+`jlink_target.validate` MUST 返回实际完成的 DLL、导出、探针、HSS 和目标检查结果；失败 MUST 给出可操作修正建议。活动目标已经连接时，validate MUST 只观察当前会话，MUST NOT 接受 `after` 或改变目标状态。目标未连接且目标级检查需要建立临时会话时，请求 MUST 显式提供 `after: run | halt`；Worker MUST 先复用 SES-003 的唯一恢复流程得到可控运行状态，再收口到请求的最终状态，并返回实际最终状态和全部恢复通知。系统 MUST NOT 根据临时建连后的状态推断建连前状态。除显式目标状态收口外，validate MUST NOT 修改 Flash、RAM、MMIO、业务变量或用户请求的核心寄存器。
 
 #### Scenario: Agent 修正配置后复检
-- **WHEN** Agent 修改 DLL 路径并调用 validate
-- **THEN** 系统重新计算文件身份和能力，不复用修改前的验证结果
+- **WHEN** Agent 修改 DLL 路径并在断开状态调用带 `after: run` 的 validate
+- **THEN** 系统重新计算文件身份和能力、不复用修改前的验证结果，并在临时会话结束前确认目标稳定运行
+
+#### Scenario: 断开状态缺少最终状态
+- **WHEN** 目标未连接且 Agent 调用未提供 `after` 的 validate
+- **THEN** 系统在建立临时目标会话前拒绝请求，不猜测验证后的目标状态
+
+#### Scenario: 断开状态要求最终暂停
+- **WHEN** 目标未连接且 Agent 调用带 `after: halt` 的 validate
+- **THEN** 系统完成实际检查和必要恢复后显式暂停目标，返回 `target_state: halted` 及实际恢复通知
+
+#### Scenario: 活动连接携带 after
+- **WHEN** 目标已经连接且 Agent 调用携带 `after` 的 validate
+- **THEN** 系统拒绝请求且不改变当前目标状态；不携带 `after` 的 validate 只观察活动会话

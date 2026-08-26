@@ -17,7 +17,8 @@ use std::{
 
 use jlink_domain::{
     ErrorCode, IpcRequest, IpcResponse, JlinkError, ProtocolVersion, RequestId, SessionCommand,
-    WorkerStatus, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+    TargetConnectionSpec, ValidationAfter, ValidationReport, WorkerStatus, read_ipc_frame,
+    worker_endpoint_name, write_ipc_frame,
 };
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE},
@@ -91,12 +92,54 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn status(&self) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Status)?;
+        let response = self.request(SessionCommand::Status, None, None)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
                     ErrorCode::IpcProtocolError,
                     format!("Worker 状态响应无效：{error}"),
+                    false,
+                )
+            })
+        })
+    }
+
+    /// Establishes the only active target using explicit immutable inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable configuration, connection, recovery, validation, or
+    /// transport error without selecting a different probe or interface.
+    pub fn connect(&self, target: &TargetConnectionSpec) -> Result<WorkerStatus, JlinkError> {
+        let response = self.request(SessionCommand::Connect, Some(target), None)?;
+        response_result(response).and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                JlinkError::new(
+                    ErrorCode::IpcProtocolError,
+                    format!("Worker 连接响应无效：{error}"),
+                    false,
+                )
+            })
+        })
+    }
+
+    /// Performs a fresh explicit environment validation pass.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable configuration, connection, or transport error when a
+    /// validation report cannot be completed.
+    pub fn validate(
+        &self,
+        target: &TargetConnectionSpec,
+        after: Option<ValidationAfter>,
+    ) -> Result<ValidationReport, JlinkError> {
+        let response = self.request(SessionCommand::Validate, Some(target), after)?;
+        response_result(response).and_then(|value| {
+            serde_json::from_value(value).map_err(|error| {
+                JlinkError::new(
+                    ErrorCode::IpcProtocolError,
+                    format!("Worker 验证响应无效：{error}"),
                     false,
                 )
             })
@@ -109,7 +152,7 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn disconnect(&self) -> Result<(), JlinkError> {
-        let value = response_result(self.request(SessionCommand::Disconnect)?)?;
+        let value = response_result(self.request(SessionCommand::Disconnect, None, None)?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -120,13 +163,24 @@ impl WorkerClient {
         Ok(())
     }
 
-    fn request(&self, command: SessionCommand) -> Result<IpcResponse, JlinkError> {
+    fn request(
+        &self,
+        command: SessionCommand,
+        target: Option<&TargetConnectionSpec>,
+        after: Option<ValidationAfter>,
+    ) -> Result<IpcResponse, JlinkError> {
         let request_id = RequestId::new(format!(
             "{}-{}",
             std::process::id(),
             NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         ))?;
-        let request = IpcRequest::new(ProtocolVersion::V1, request_id.clone(), command);
+        let mut request = IpcRequest::new(ProtocolVersion::V1, request_id.clone(), command);
+        if let Some(target) = target {
+            request = request.with_target(target.clone());
+        }
+        if let Some(after) = after {
+            request = request.with_validation_after(after);
+        }
         let mut pipe = open_pipe(&self.endpoint, 100)?;
         write_ipc_frame(&mut pipe, &request)?;
         let response: IpcResponse = read_ipc_frame(&mut pipe)?;

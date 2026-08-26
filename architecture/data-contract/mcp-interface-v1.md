@@ -167,30 +167,19 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 
 ### 4.4 `validate`
 
+断开状态必须显式声明验证后的目标状态：
+
+```json
+{ "action": "validate", "after": "run" }
+```
+
+`after` 只能是 `run | halt`。临时会话先复用唯一恢复流程收口到可控运行态，完成验证后再进入请求状态；接口不推断建连前状态。连接状态下 `validate` 只观察当前会话，必须省略 `after`：
+
 ```json
 { "action": "validate" }
 ```
 
-用于配置修正后的显式复检。它是诊断接口，允许返回比普通操作更多的信息：
-
-```json
-{
-  "dll": {
-    "version": "9.70",
-    "sha256_match": true,
-    "exports": "complete"
-  },
-  "probe": {
-    "serial": "123456789",
-    "hss": true
-  },
-  "target": {
-    "reachable": true
-  }
-}
-```
-
-只返回实际完成的检查项；失败项通过工具执行错误返回明确修正建议。
+用于配置修正后的显式复检。它返回确定顺序的 `checks`、实际最终 `target_state`、`target_id`、`validation_runs`，以及本次发生时才出现的 `recovery_notifications`。失败项包含明确修正建议；执行失败通过稳定错误返回。断开状态缺少 `after`，或连接状态携带 `after`，均拒绝执行。
 
 ### 4.5 `config_get`
 

@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{JlinkError, state::ExecutionKind};
+use crate::{JlinkError, TargetConnectionSpec, state::ExecutionKind};
 
 /// Maximum UTF-8 JSON payload carried by one local IPC frame.
 pub const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
@@ -272,7 +272,7 @@ pub enum SessionCommand {
     Disconnect,
     /// Read the worker's observed session status.
     Status,
-    /// Perform a side-effect-free validation pass.
+    /// Perform an observational or explicitly finalized validation pass.
     Validate,
 }
 
@@ -281,8 +281,8 @@ impl SessionCommand {
     #[must_use]
     pub const fn execution_kind(self) -> ExecutionKind {
         match self {
-            Self::Status | Self::Validate => ExecutionKind::ReadOnly,
-            Self::Connect | Self::Disconnect => ExecutionKind::SideEffect,
+            Self::Status => ExecutionKind::ReadOnly,
+            Self::Connect | Self::Disconnect | Self::Validate => ExecutionKind::SideEffect,
         }
     }
 }
@@ -297,6 +297,12 @@ pub struct IpcRequest {
     pub request_id: RequestId,
     /// The closed-set session operation.
     pub command: SessionCommand,
+    /// Immutable target inputs required by connect and validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<TargetConnectionSpec>,
+    /// Required final state for disconnected validation and forbidden otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<crate::ValidationAfter>,
 }
 
 impl IpcRequest {
@@ -311,7 +317,23 @@ impl IpcRequest {
             protocol_version,
             request_id,
             command,
+            target: None,
+            after: None,
         }
+    }
+
+    /// Attaches immutable target inputs to connect or validate.
+    #[must_use]
+    pub fn with_target(mut self, target: TargetConnectionSpec) -> Self {
+        self.target = Some(target);
+        self
+    }
+
+    /// Attaches the explicit final state for a disconnected validation pass.
+    #[must_use]
+    pub const fn with_validation_after(mut self, after: crate::ValidationAfter) -> Self {
+        self.after = Some(after);
+        self
     }
 }
 
@@ -341,6 +363,21 @@ pub struct WorkerStatus {
     pub probe_identity_hash: String,
     /// Whether the validated DLL is currently held by the unique gateway.
     pub dll_loaded: bool,
+    /// Last authoritative connection lifecycle state.
+    pub connection_state: crate::ConnectionState,
+    /// Last target execution state observed by the Worker.
+    pub target_state: crate::TargetState,
+    /// Target identifier observed after a successful connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<u32>,
+    /// Whether an HSS capture currently prevents disconnect.
+    pub hss_active: bool,
+    /// Whether normal device operations may reuse successful validation.
+    pub validation_cached: bool,
+    /// Number of complete validation passes in this Worker process.
+    pub validation_runs: u64,
+    /// Recovery notifications retained for the active connection.
+    pub recovery_notifications: Vec<crate::RecoveryNotification>,
 }
 
 impl IpcResponse {

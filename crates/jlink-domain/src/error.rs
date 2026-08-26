@@ -37,6 +37,12 @@ pub enum ErrorCode {
     ProbeBusy,
     /// Windows could not load the validated J-Link DLL into the Worker.
     DllLoadFailed,
+    /// The loaded J-Link DLL does not provide a required V1 export.
+    DllExportMissing,
+    /// The configured probe or target could not be connected.
+    TargetConnectFailed,
+    /// The target could not be returned to a stable running state.
+    TargetRecoveryFailed,
 }
 
 impl ErrorCode {
@@ -59,6 +65,9 @@ impl ErrorCode {
             Self::IpcProtocolError => "IPC_PROTOCOL_ERROR",
             Self::ProbeBusy => "PROBE_BUSY",
             Self::DllLoadFailed => "DLL_LOAD_FAILED",
+            Self::DllExportMissing => "DLL_EXPORT_MISSING",
+            Self::TargetConnectFailed => "TARGET_CONNECT_FAILED",
+            Self::TargetRecoveryFailed => "TARGET_RECOVERY_FAILED",
         }
     }
 }

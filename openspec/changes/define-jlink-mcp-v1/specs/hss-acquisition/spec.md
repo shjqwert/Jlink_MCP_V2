@@ -31,7 +31,7 @@ HSS 选择项 MUST 由 ELF/DWARF 静态变量路径解析，不得接受原始�
 - **THEN** 系统在启动前拒绝该选择项并指出不受支持的定位方式
 
 ### Requirement: HSSA-003 启动预检与目标恢复
-系统 MUST 在启动前检查必要 HSS 导出函数、探针能力、目标连接、目标运行状态、后台内存访问能力，以及源时间戳的单位、分辨率和单调性能力。V1 MUST 支持 J-Link 6.98a 的毫秒源时间戳模式，不得要求 DLL 提供微秒模式。目标 halted 或 HardFault 时 MUST 复用 `target-session` SES-003 的唯一恢复流程；HSS 只消费恢复结果并保存其通知，不得实现第二套恢复规则。
+系统 MUST 在启动前检查必要 HSS 导出函数、探针能力、目标连接、目标运行状态、后台内存访问能力，以及源时间戳的单位、分辨率和单调性能力。V1 MUST 支持 J-Link 6.98a 的毫秒源时间戳模式，不得要求 DLL 提供微秒模式。HSS 启动检查 MUST 在 Worker 已持有的同一 J-Link 目标会话内观察目标状态；目标 halted 或 HardFault 时 MUST 复用 `target-session` SES-003 的唯一恢复流程。HSS 只消费恢复结果并保存其通知，不得实现第二套恢复规则。
 
 #### Scenario: halted 目标恢复成功
 - **WHEN** HSS 启动预检发现目标 halted 且 `resume` 后能够稳定运行

@@ -2,12 +2,18 @@
 
 mod error;
 mod ipc;
+mod session;
 mod state;
 
 pub use error::{ErrorCode, JlinkError};
 pub use ipc::{
     IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, ProtocolVersion, RequestId, SessionCommand,
     WorkerStatus, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+};
+pub use session::{
+    FaultDiagnostics, RecoveryAction, RecoveryNotification, TargetConnectionSpec, ValidationAfter,
+    ValidationCheck, ValidationCheckKind, ValidationInvalidation, ValidationReport,
+    ensure_disconnect_allowed,
 };
 pub use state::{
     ConnectionState, DispatchState, ExecutionKind, SessionEvent, TargetInterface, TargetState,
