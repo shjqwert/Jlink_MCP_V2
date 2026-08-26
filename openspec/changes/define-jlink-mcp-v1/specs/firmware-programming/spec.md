@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: PRG-001 镜像烧录
-`jlink_program.flash` MUST 使用设备 Flash 算法烧录支持的镜像格式，MUST 在执行前验证所有目标段位于已知 Flash 边界内，并 MUST 默认执行镜像校验。
+`jlink_program.flash` MUST 使用设备 Flash 算法烧录支持的镜像格式，MUST 在执行前完成 ART-001 的 BIN 基地址校验并验证所有目标段位于已知 Flash 边界内，并 MUST 默认执行镜像校验。
 
 #### Scenario: ELF 段超出 Flash
 - **WHEN** 镜像包含已知 Flash 边界之外的可加载段
@@ -30,7 +30,7 @@ flash 和 erase 请求 MUST 提供 `after: none | reset_halt | reset_run`；系�
 - **THEN** 系统使用设备算法擦除该范围并执行显式 after 状态
 
 ### Requirement: PRG-004 独立镜像校验
-`jlink_program.verify` MUST 比较请求镜像与目标内容。完全匹配 MUST 返回空成功结果；不匹配 MUST 返回 `VERIFY_FAILED`，并只返回首个已确认不匹配区域和总不匹配数量。
+`jlink_program.verify` MUST 在完成 ART-001 的 BIN 基地址校验后比较请求镜像与目标内容。完全匹配 MUST 返回空成功结果；不匹配 MUST 返回 `VERIFY_FAILED`，并只返回首个已确认不匹配区域和总不匹配数量。
 
 #### Scenario: 镜像存在多个不匹配区域
 - **WHEN** 目标内容与镜像在多个区域不一致

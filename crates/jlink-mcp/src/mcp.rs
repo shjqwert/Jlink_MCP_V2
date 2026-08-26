@@ -250,6 +250,9 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::WorkerUnavailable | ErrorCode::TargetConnectFailed => "TARGET_CONNECT_FAILED",
         ErrorCode::InvalidStateTransition => "TARGET_STATE_INVALID",
         ErrorCode::TargetRecoveryFailed => "TARGET_RECOVERY_FAILED",
+        ErrorCode::ValueInvalid => "VALUE_INVALID",
+        ErrorCode::FirmwareIdentityUnknown => "FIRMWARE_IDENTITY_UNKNOWN",
+        ErrorCode::FirmwareElfMismatch => "FIRMWARE_ELF_MISMATCH",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
@@ -342,12 +345,14 @@ fn target_tool() -> Value {
 
 fn program_tool() -> Value {
     let image = non_empty_string();
+    let base_address = address_schema();
     let after = string_enum(&["none", "reset_halt", "reset_run"]);
     let input = action_union(vec![
         action_object(
             "flash",
             vec![
                 ("image", image.clone()),
+                ("base_address", base_address.clone()),
                 ("verify", boolean()),
                 ("after", after.clone()),
             ],
@@ -363,7 +368,11 @@ fn program_tool() -> Value {
             ],
             &["address", "length", "after"],
         ),
-        action_object("verify", vec![("image", image)], &[]),
+        action_object(
+            "verify",
+            vec![("image", image), ("base_address", base_address)],
+            &[],
+        ),
     ]);
     tool_definition(
         "jlink_program",

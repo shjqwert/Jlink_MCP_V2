@@ -251,6 +251,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 ```
 
 - `image` 可省略，省略时使用工程配置中的默认镜像。
+- `base_address` 只允许用于裸 BIN，格式为十六进制地址；BIN 即使来自默认镜像，每次请求仍必须显式提供。ELF/AXF/OUT、HEX 和 SREC 自带地址，携带该字段会返回 `VALUE_INVALID`。
 - `verify` 默认 `true`。
 - `after` 必填：`none | reset_halt | reset_run`。显式字段避免 Agent 误解烧录后的目标状态。
 - 已知 Flash 边界之外的镜像段返回 `FLASH_RANGE_INVALID`。
@@ -283,7 +284,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 { "action": "verify", "image": "build/firmware.elf" }
 ```
 
-`image` 可省略。匹配返回 `{}`；不匹配返回 `VERIFY_FAILED`，`details` 只给出首个已确认不匹配区域和总不匹配计数。
+`image` 可省略。裸 BIN 使用与 `flash` 相同的显式 `base_address` 规则；系统不从芯片、文件名、默认镜像或相邻 OUT 猜测该值。匹配返回 `{}`；不匹配返回 `VERIFY_FAILED`，`details` 只给出首个已确认不匹配区域和总不匹配计数。
 
 ## 6. `jlink_inspect`
 
@@ -755,6 +756,8 @@ V1 不依赖 `JLink_x64.dll` 对同一连接的并发安全。所有 DLL 调用�
 | `TARGET_CONNECT_FAILED` | 目标连接失败 | true |
 | `TARGET_RECOVERY_FAILED` | resume/reset 后仍不能正常运行 | true |
 | `TARGET_STATE_INVALID` | 当前状态不能执行该动作 | true |
+| `FIRMWARE_IDENTITY_UNKNOWN` | 无法证明目标 Flash 与符号 ELF 匹配 | false |
+| `FIRMWARE_ELF_MISMATCH` | 目标 Flash 已确认与符号 ELF 不匹配 | false |
 | `SYMBOL_NOT_FOUND` | DWARF 路径不存在 | false |
 | `SYMBOL_AMBIGUOUS` | 路径不能唯一解析 | false |
 | `TYPE_UNSUPPORTED` | 类型无法按 V1 规则编码 | false |

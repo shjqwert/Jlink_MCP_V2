@@ -19,7 +19,7 @@
 
 ## 3. P2 静态调试
 
-- [ ] 3.1 实现 ELF/AXF/OUT、HEX、SREC、BIN 输入和 ELF/目标固件身份计划，并以主要测试 T-P2-IMG 覆盖 ART-001、ART-002
+- [x] 3.1 实现 ELF/AXF/OUT、HEX、SREC、BIN 输入，补齐 `flash/verify` 的 BIN `base_address` Schema、`VALUE_INVALID` 及固件身份稳定错误，并实现 ELF/目标固件身份计划；以主要测试 T-P2-IMG 覆盖 ART-001、ART-002，同时回归 T-P1-MCP/T-P1-DOM
 - [ ] 3.2 实现唯一 DWARF 路径解析、`symbols` 搜索、按 ELF SHA-256/选择器/解析器版本缓存的不可变 `AccessPlan`，覆盖静态成员、数组、柔性切片与动态位置拒绝，并以主要测试 T-P2-DWARF 覆盖 ART-003、ART-005、ART-007、DBG-008
 - [ ] 3.3 实现位域/union 与无损 `TypedValue` 编解码和复合写入全量预校验，并以主要测试 T-P2-VALUE 覆盖 ART-004、ART-006、DBG-001
 - [ ] 3.4 实现 Flash 烧录、整片/范围擦除、默认与独立校验、边界检查及显式 `after`，并以主要测试 T-P2-PRG 覆盖 PRG-001、PRG-002、PRG-003、PRG-004、PRG-005、PRG-006

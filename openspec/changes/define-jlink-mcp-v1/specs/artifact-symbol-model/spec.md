@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: ART-001 固件与符号输入格式
-系统 MUST 接受带 DWARF 的 ELF 作为变量和 HSS 符号来源；扩展名为 `.axf` 或 `.out` 但内容为 ELF 时 MUST 同等处理。烧录输入 MUST 支持 ELF、Intel HEX、Motorola S-record 和 BIN；BIN MUST 显式提供基地址。系统 MUST NOT 从 MAP 文件解析变量。
+系统 MUST 接受带 DWARF 的 ELF 作为变量和 HSS 符号来源；扩展名为 `.axf` 或 `.out` 但内容为 ELF 时 MUST 同等处理。烧录输入 MUST 支持 ELF、Intel HEX、Motorola S-record 和 BIN。`jlink_program.flash/verify` 的 `base_address` MUST 是可选十六进制地址；解析后的镜像为 BIN 时，即使 `image` 来自工程默认值，每次请求仍 MUST 显式提供该字段；解析后的镜像为其他格式时 MUST 拒绝该字段。系统 MUST NOT 根据芯片、文件名或相邻文件猜测 BIN 基地址，也 MUST NOT 从 MAP 文件解析变量。
 
 #### Scenario: AXF 实际为 ELF
 - **WHEN** 输入文件扩展名为 `.axf` 且魔数和结构为有效 ELF/DWARF
@@ -15,8 +15,12 @@
 - **WHEN** Agent 请求烧录 BIN 且未提供 base address
 - **THEN** 系统在访问探针前返回 `VALUE_INVALID`
 
+#### Scenario: 自描述镜像携带基地址
+- **WHEN** Agent 为 ELF、HEX 或 SREC 请求提供 `base_address`
+- **THEN** 系统在访问探针前返回 `VALUE_INVALID`，要求使用镜像自带地址
+
 ### Requirement: ART-002 ELF 与目标固件身份
-系统 MUST 记录 ELF SHA-256 和可加载 Flash 段指纹，并在建立新的符号采集会话时验证目标固件与 ELF 匹配。无法证明匹配时 MUST 返回 `FIRMWARE_IDENTITY_UNKNOWN`，已证明不匹配时 MUST 返回 `FIRMWARE_ELF_MISMATCH`。
+系统 MUST 记录 ELF SHA-256 和可加载 Flash 段指纹，并在同一目标连接会话首次执行变量或 HSS 符号操作前，以只读 Flash 读取验证目标固件与 ELF 匹配；验证成功后 MAY 在相关指纹不变时按连接会话缓存。无法证明匹配时 MUST 返回 `FIRMWARE_IDENTITY_UNKNOWN`，已证明不匹配时 MUST 返回 `FIRMWARE_ELF_MISMATCH`。连接丢失、Worker 退出、Flash 修改或 ELF/目标/接口/DLL 身份变化 MUST 使缓存失效。
 
 #### Scenario: ELF 与目标 Flash 不匹配
 - **WHEN** 目标可读取 Flash 段指纹与 ELF 记录不同

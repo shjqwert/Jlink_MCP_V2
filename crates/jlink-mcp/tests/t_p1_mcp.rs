@@ -134,6 +134,25 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         })
     ));
 
+    let program = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_program")
+        .expect("program tool");
+    for request in [
+        json!({ "action": "flash", "image": "firmware.bin", "base_address": "0x0", "after": "reset_run" }),
+        json!({ "action": "verify", "image": "firmware.bin", "base_address": "0x10000" }),
+    ] {
+        assert!(jsonschema::is_valid(&program["inputSchema"], &request));
+    }
+    assert!(!jsonschema::is_valid(
+        &program["inputSchema"],
+        &json!({ "action": "erase", "base_address": "0x0", "after": "none" })
+    ));
+    assert!(!jsonschema::is_valid(
+        &program["inputSchema"],
+        &json!({ "action": "flash", "base_address": "0", "after": "none" })
+    ));
+
     let hss = catalog
         .iter()
         .find(|tool| tool["name"] == "jlink_hss")

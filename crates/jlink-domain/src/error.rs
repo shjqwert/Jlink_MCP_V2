@@ -43,6 +43,12 @@ pub enum ErrorCode {
     TargetConnectFailed,
     /// The target could not be returned to a stable running state.
     TargetRecoveryFailed,
+    /// A request value is malformed, unsupported, or inconsistent with another field.
+    ValueInvalid,
+    /// The target Flash could not be read completely enough to prove the ELF identity.
+    FirmwareIdentityUnknown,
+    /// The target Flash was read successfully and differs from the symbol ELF.
+    FirmwareElfMismatch,
 }
 
 impl ErrorCode {
@@ -68,6 +74,9 @@ impl ErrorCode {
             Self::DllExportMissing => "DLL_EXPORT_MISSING",
             Self::TargetConnectFailed => "TARGET_CONNECT_FAILED",
             Self::TargetRecoveryFailed => "TARGET_RECOVERY_FAILED",
+            Self::ValueInvalid => "VALUE_INVALID",
+            Self::FirmwareIdentityUnknown => "FIRMWARE_IDENTITY_UNKNOWN",
+            Self::FirmwareElfMismatch => "FIRMWARE_ELF_MISMATCH",
         }
     }
 }

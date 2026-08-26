@@ -93,6 +93,15 @@ fn t_p1_dom_stable_error_shape_uses_screaming_snake_case_code() {
         ErrorCode::TargetConnectFailed.as_str(),
         "TARGET_CONNECT_FAILED"
     );
+    assert_eq!(ErrorCode::ValueInvalid.as_str(), "VALUE_INVALID");
+    assert_eq!(
+        ErrorCode::FirmwareIdentityUnknown.as_str(),
+        "FIRMWARE_IDENTITY_UNKNOWN"
+    );
+    assert_eq!(
+        ErrorCode::FirmwareElfMismatch.as_str(),
+        "FIRMWARE_ELF_MISMATCH"
+    );
 
     let error = JlinkError::new(ErrorCode::WorkerUnavailable, "worker is unavailable", true)
         .with_detail("attempt", json!(1));
