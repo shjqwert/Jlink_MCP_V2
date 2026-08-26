@@ -1,0 +1,6 @@
+{
+  "$schema": "https://likec4.dev/schemas/config.json",
+  "name": "jlink-mcp-v2-data-contract",
+  "title": "J-Link MCP V2 Data Contract Architecture",
+  "exclude": ["history/**", ".generated/**", "**/node_modules/**"]
+}
