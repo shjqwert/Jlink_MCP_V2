@@ -10,7 +10,7 @@
 ## 2. P1 骨架与连接
 
 - [x] 2.1 创建根 `Cargo.toml` 与 `crates/jlink-mcp`、`crates/jlink-worker`、`crates/jlink-domain`、`crates/jlink-capture` 四 crate workspace，冻结默认私有、禁止无职责通用层/纯转发 helper、依赖与抽象必要性门禁，加入依赖方向检查、统一格式/静态检查、英文 Rust 文档注释门禁，以及不进入普通 MCP 结果的本地阶段耗时观测；目标 IAR 测试 C/header 同时应用 embedded-code-style
-- [ ] 2.2 在 `jlink-domain` 实现版本化公共值对象、IPC 消息、稳定错误和状态转换，并以主要测试 T-P1-DOM 覆盖 MCP-004、RUN-005 的确定/不确定执行边界
+- [x] 2.2 在 `jlink-domain` 实现版本化公共值对象、IPC 消息、稳定错误和状态转换，并以主要测试 T-P1-DOM 覆盖 MCP-004、RUN-005 的确定/不确定执行边界
 - [ ] 2.3 在 `jlink-mcp` 实现分层配置、逐字段来源、原子 `config_set`、具体器件标识、确定速度基线、DLL 身份和本机配置隔离，并以主要测试 T-P1-CFG 覆盖 CFG-001、CFG-002、CFG-003、CFG-004、CFG-005
 - [ ] 2.4 实现 Windows 命名管道、Worker 启动/附着、探针租约和唯一 DLL gateway，并以主要测试 T-P1-IPC 覆盖 RUN-001、RUN-003
 - [ ] 2.5 实现单活动目标的 connect/status/disconnect/validate、首次验证缓存和 halted/HardFault 恢复，并以主要测试 T-P1-SES 覆盖 SES-001、SES-002、SES-003、SES-004、SES-005、SES-006
