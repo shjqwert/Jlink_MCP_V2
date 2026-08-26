@@ -63,6 +63,8 @@ pub enum ErrorCode {
     AddressOutOfRange,
     /// A Flash operation is empty, overflowing, or outside known device regions.
     FlashRangeInvalid,
+    /// A canonical core-register name is invalid or unsupported by the target.
+    RegisterNotFound,
     /// Target Flash readback differs from the requested image.
     VerifyFailed,
 }
@@ -100,6 +102,7 @@ impl ErrorCode {
             Self::SliceRequired => "SLICE_REQUIRED",
             Self::AddressOutOfRange => "ADDRESS_OUT_OF_RANGE",
             Self::FlashRangeInvalid => "FLASH_RANGE_INVALID",
+            Self::RegisterNotFound => "REGISTER_NOT_FOUND",
             Self::VerifyFailed => "VERIFY_FAILED",
         }
     }

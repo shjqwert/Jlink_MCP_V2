@@ -31,7 +31,9 @@ pub(crate) fn execute_program(
             validate_image_flash_ranges(&image, &regions)?;
             if let Err(error) = gateway.program_image(&image) {
                 gateway.close_target();
-                session.record_program_uncertain()?;
+                session.record_execution_uncertain(
+                    jlink_domain::ValidationInvalidation::FlashModified,
+                )?;
                 return Err(error);
             }
             if verify && let Err(error) = verify_image(gateway, &image) {
@@ -55,7 +57,9 @@ pub(crate) fn execute_program(
             };
             if let Err(error) = result {
                 gateway.close_target();
-                session.record_program_uncertain()?;
+                session.record_execution_uncertain(
+                    jlink_domain::ValidationInvalidation::FlashModified,
+                )?;
                 return Err(error);
             }
             let state = gateway.apply_program_after(after)?;

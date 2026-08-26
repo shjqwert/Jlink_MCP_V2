@@ -11,9 +11,10 @@ use std::{
 };
 
 use jlink_domain::{
-    DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion, JlinkError,
-    MemoryRegion, MemoryRegionKind, ProgramAfter, TargetConnectionSpec, TargetInterface,
-    TargetState, ValidationCheck, ValidationCheckKind, ValidationReport, validate_write_count,
+    CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
+    JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter, TargetConnectionSpec,
+    TargetInterface, TargetState, ValidationCheck, ValidationCheckKind, ValidationReport,
+    validate_write_count,
 };
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, GetLastError, HMODULE},
@@ -37,6 +38,7 @@ const DEMCR_VC_HARDERR: u32 = 1 << 10;
 #[cfg(test)]
 const TEST_HARDFAULT_PC: u32 = 0xE000_0000;
 const DEVICE_AREA_COUNT: usize = 32;
+const MAX_REGISTER_COUNT: usize = 256;
 const PROGRAM_CHUNK_BYTES: usize = 64 * 1024;
 const PROGRAM_CHUNK_BYTES_U64: u64 = 64 * 1024;
 
@@ -50,7 +52,12 @@ type SelectProbeFn = unsafe extern "C" fn(u32) -> i32;
 type GetU32Fn = unsafe extern "C" fn() -> u32;
 type GetI32Fn = unsafe extern "C" fn() -> i32;
 type VoidFn = unsafe extern "C" fn();
+type GetRegisterListFn = unsafe extern "C" fn(*mut i32, i32) -> i32;
+type GetRegisterNameFn = unsafe extern "C" fn(i32) -> *const c_char;
 type ReadRegFn = unsafe extern "C" fn(i32) -> u32;
+type ReadRegsFn = unsafe extern "C" fn(*const i32, *mut u32, *mut u8, u32) -> i32;
+type WriteRegFn = unsafe extern "C" fn(i32, u32) -> u8;
+type StepFn = unsafe extern "C" fn() -> u8;
 type ReadMemU32Fn = unsafe extern "C" fn(u32, u32, *mut u32, *mut u8) -> i32;
 type ReadMemFn = unsafe extern "C" fn(u32, u32, *mut u8) -> i32;
 type WriteMemFn = unsafe extern "C" fn(u32, u32, *const u8) -> i32;
@@ -59,8 +66,6 @@ type DeviceGetInfoFn = unsafe extern "C" fn(i32, *mut DeviceInfo) -> i32;
 type BeginDownloadFn = unsafe extern "C" fn(u32);
 type EndDownloadFn = unsafe extern "C" fn() -> i32;
 type EraseChipFn = unsafe extern "C" fn() -> i32;
-#[cfg(test)]
-type WriteRegFn = unsafe extern "C" fn(i32, u32) -> u8;
 #[cfg(test)]
 type WriteU32Fn = unsafe extern "C" fn(u32, u32) -> i32;
 type HssGetCapsFn = unsafe extern "C" fn(*mut HssCaps) -> i32;
@@ -134,7 +139,12 @@ struct Api {
     halt: VoidFn,
     go: VoidFn,
     reset: VoidFn,
+    get_register_list: GetRegisterListFn,
+    get_register_name: GetRegisterNameFn,
     read_reg: ReadRegFn,
+    read_regs: ReadRegsFn,
+    write_reg: WriteRegFn,
+    step: StepFn,
     read_mem: ReadMemFn,
     read_mem_u32: ReadMemU32Fn,
     write_mem: WriteMemFn,
@@ -143,8 +153,6 @@ struct Api {
     begin_download: BeginDownloadFn,
     end_download: EndDownloadFn,
     erase_chip: EraseChipFn,
-    #[cfg(test)]
-    write_reg: WriteRegFn,
     #[cfg(test)]
     write_u32: WriteU32Fn,
     hss_get_caps: HssGetCapsFn,
@@ -168,7 +176,12 @@ impl Api {
             halt: load_symbol(module, b"JLINKARM_Halt\0")?,
             go: load_symbol(module, b"JLINKARM_Go\0")?,
             reset: load_symbol(module, b"JLINKARM_Reset\0")?,
+            get_register_list: load_symbol(module, b"JLINKARM_GetRegisterList\0")?,
+            get_register_name: load_symbol(module, b"JLINKARM_GetRegisterName\0")?,
             read_reg: load_symbol(module, b"JLINKARM_ReadReg\0")?,
+            read_regs: load_symbol(module, b"JLINKARM_ReadRegs\0")?,
+            write_reg: load_symbol(module, b"JLINKARM_WriteReg\0")?,
+            step: load_symbol(module, b"JLINKARM_Step\0")?,
             read_mem: load_symbol(module, b"JLINKARM_ReadMem\0")?,
             read_mem_u32: load_symbol(module, b"JLINKARM_ReadMemU32\0")?,
             write_mem: load_symbol(module, b"JLINKARM_WriteMem\0")?,
@@ -177,8 +190,6 @@ impl Api {
             begin_download: load_symbol(module, b"JLINKARM_BeginDownload\0")?,
             end_download: load_symbol(module, b"JLINKARM_EndDownload\0")?,
             erase_chip: load_symbol(module, b"JLINK_EraseChip\0")?,
-            #[cfg(test)]
-            write_reg: load_symbol(module, b"JLINKARM_WriteReg\0")?,
             #[cfg(test)]
             write_u32: load_symbol(module, b"JLINKARM_WriteU32\0")?,
             hss_get_caps: load_symbol(module, b"JLINK_HSS_GetCaps\0")?,
@@ -725,6 +736,116 @@ impl DllGateway {
         }
     }
 
+    /// Returns the register indices and names reported by the active target.
+    pub(crate) fn register_entries(&self) -> Result<Vec<(i32, String)>, JlinkError> {
+        if !self.opened || !self.is_connected()? {
+            return Err(target_connection_error("读取寄存器目录要求已建立目标连接"));
+        }
+        let mut indices = [0_i32; MAX_REGISTER_COUNT];
+        let capacity = i32::try_from(indices.len()).expect("register capacity fits i32");
+        // SAFETY: the buffer is writable for `capacity` indices and the active
+        // target owns the register catalog for this serialized DLL session.
+        let count = unsafe { (self.api.get_register_list)(indices.as_mut_ptr(), capacity) };
+        if count < 0 {
+            return Err(target_connection_error(format!(
+                "JLINKARM_GetRegisterList 返回 {count}"
+            )));
+        }
+        let count = usize::try_from(count).expect("non-negative register count fits usize");
+        if count > indices.len() {
+            return Err(target_connection_error(format!(
+                "J-Link 寄存器数量 {count} 超过固定上限 {}",
+                indices.len()
+            )));
+        }
+        indices[..count]
+            .iter()
+            .copied()
+            .map(|index| {
+                // SAFETY: `index` came from the active target's register list.
+                let name = unsafe { (self.api.get_register_name)(index) };
+                if name.is_null() {
+                    return Err(target_connection_error(format!(
+                        "JLINKARM_GetRegisterName({index}) 返回空指针"
+                    )));
+                }
+                // SAFETY: J-Link owns the NUL-terminated name for the loaded DLL lifetime.
+                let name = unsafe { CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned();
+                if name.is_empty() {
+                    return Err(target_connection_error(format!(
+                        "JLINKARM_GetRegisterName({index}) 返回空名称"
+                    )));
+                }
+                Ok((index, name))
+            })
+            .collect()
+    }
+
+    fn register_index(&self, register: CoreRegister) -> Result<i32, JlinkError> {
+        self.register_entries()?
+            .into_iter()
+            .find_map(|(index, name)| (name == register.jlink_name()).then_some(index))
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::RegisterNotFound,
+                    format!("当前目标不支持核心寄存器 {}", register.canonical_name()),
+                    false,
+                )
+                .with_detail("register", serde_json::json!(register.canonical_name()))
+            })
+    }
+
+    /// Reads one target-supported canonical core register without truncation.
+    pub(crate) fn read_register(&mut self, register: CoreRegister) -> Result<u32, JlinkError> {
+        let index = self.register_index(register)?;
+        let mut value = 0_u32;
+        let mut status = u8::MAX;
+        // SAFETY: all buffers hold one element and the unique gateway owns the
+        // active target session for the complete call.
+        let result =
+            unsafe { (self.api.read_regs)(&raw const index, &raw mut value, &raw mut status, 1) };
+        if result < 0 {
+            return Err(target_connection_error(format!(
+                "JLINKARM_ReadRegs({}) 返回 {result}",
+                register.canonical_name()
+            )));
+        }
+        if status != 0 {
+            return Err(JlinkError::new(
+                ErrorCode::RegisterNotFound,
+                format!("当前目标不能读取核心寄存器 {}", register.canonical_name()),
+                false,
+            )
+            .with_detail("register", serde_json::json!(register.canonical_name()))
+            .with_detail("dll_status", serde_json::json!(status)));
+        }
+        Ok(value)
+    }
+
+    /// Writes one target-supported canonical core register.
+    pub(crate) fn write_register(
+        &mut self,
+        register: CoreRegister,
+        value: u32,
+    ) -> Result<(), JlinkError> {
+        register.ensure_writable()?;
+        let index = self.register_index(register)?;
+        // SAFETY: the register index came from the active target catalog and
+        // the unique gateway serializes the frozen two-argument ABI.
+        let status = unsafe { (self.api.write_reg)(index, value) };
+        if status != 0 {
+            return Err(execution_uncertain_error(format!(
+                "JLINKARM_WriteReg({}, 0x{value:08X}) 返回 {status}，寄存器可能已改变",
+                register.canonical_name()
+            ))
+            .with_detail("register", serde_json::json!(register.canonical_name()))
+            .with_detail("dll_status", serde_json::json!(status)));
+        }
+        Ok(())
+    }
+
     /// Injects a real Cortex-M `HardFault` without modifying target Flash.
     ///
     /// This entry point only exists in test builds. It preserves the current
@@ -863,6 +984,48 @@ impl DllGateway {
             (self.api.go)();
         }
         self.wait_for_stable_state()
+    }
+
+    /// Resets and explicitly leaves the target halted.
+    pub(crate) fn reset_halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        // SAFETY: the target connection is active and calls are serialized.
+        unsafe {
+            (self.api.reset)();
+            (self.api.halt)();
+        }
+        self.wait_until_halted()?;
+        self.observe_target_state()
+    }
+
+    /// Executes exactly one instruction from an already halted target.
+    pub(crate) fn step_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        let before = self.observe_target_state()?;
+        if before != TargetState::Halted {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "step 要求目标已经 halted；请先显式调用 halt",
+                true,
+            )
+            .with_detail("expected", serde_json::json!("halted"))
+            .with_detail("actual", serde_json::json!(before)));
+        }
+        // SAFETY: the target is confirmed halted and the no-argument ABI is
+        // serialized by the unique gateway.
+        let status = unsafe { (self.api.step)() };
+        let after = self.observe_target_state()?;
+        if status != 0 || after != TargetState::Halted {
+            let cleanup = if after == TargetState::Halted {
+                Ok(after)
+            } else {
+                self.halt_and_observe()
+            };
+            return Err(execution_uncertain_error(format!(
+                "JLINKARM_Step 返回 {status}，step 后状态为 {after:?}，安全暂停结果为 {cleanup:?}"
+            ))
+            .with_detail("dll_status", serde_json::json!(status))
+            .with_detail("observed_state", serde_json::json!(after)));
+        }
+        Ok(after)
     }
 
     fn wait_for_stable_state(&self) -> Result<TargetState, JlinkError> {
@@ -1089,7 +1252,10 @@ fn test_injection_error(message: impl Into<String>) -> JlinkError {
 mod tests {
     use std::{env, path::PathBuf};
 
-    use jlink_domain::{FlashRegion, MemoryRange, MemoryRegionKind};
+    use jlink_domain::{
+        CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
+        TargetConnectionSpec, TargetInterface, TargetState,
+    };
 
     use super::{DeviceInfo, DllGateway};
 
@@ -1138,5 +1304,113 @@ mod tests {
                 MemoryRegionKind::Mmio
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the explicitly fingerprinted J-Link 6.98a DLL and S32K144 target"]
+    fn hardware_core_register_and_control_round_trip() -> Result<(), JlinkError> {
+        let path = PathBuf::from(
+            env::var("JLINK_MCP_T_P2_CTL_DLL")
+                .expect("JLINK_MCP_T_P2_CTL_DLL must name the frozen DLL"),
+        );
+        let device = env::var("JLINK_MCP_T_P2_CTL_DEVICE")
+            .expect("JLINK_MCP_T_P2_CTL_DEVICE must name the configured device");
+        let serial = env::var("JLINK_MCP_T_P2_CTL_PROBE")
+            .expect("JLINK_MCP_T_P2_CTL_PROBE must name the configured probe")
+            .parse::<u32>()
+            .expect("probe serial is u32");
+        let spec =
+            TargetConnectionSpec::new(device, TargetInterface::Swd, 4_000, Some(serial), None)
+                .expect("target spec");
+        let mut gateway = DllGateway::load(&path).expect("load frozen DLL");
+        gateway.open_target(&spec)?;
+        let mut original_r0 = None;
+        let result = (|| {
+            if gateway.resume_and_observe()? != TargetState::Running {
+                return Err(hardware_control_error("测试前目标未稳定运行"));
+            }
+            let running_step = gateway
+                .step_and_observe()
+                .expect_err("running step must be rejected before JLINKARM_Step");
+            if running_step.code != ErrorCode::InvalidStateTransition
+                || gateway.observe_target_state()? != TargetState::Running
+            {
+                return Err(hardware_control_error(
+                    "运行中 step 未保持目标运行或错误码不正确",
+                ));
+            }
+
+            let entries = gateway.register_entries()?;
+            for register in CoreRegister::ALL {
+                if !entries.iter().any(|entry| entry.1 == register.jlink_name()) {
+                    return Err(JlinkError::new(
+                        ErrorCode::RegisterNotFound,
+                        format!("S32K144 目录缺少 V1 寄存器 {}", register.canonical_name()),
+                        false,
+                    ));
+                }
+            }
+            if gateway.halt_and_observe()? != TargetState::Halted {
+                return Err(hardware_control_error("halt 未收口到 halted"));
+            }
+
+            let saved_r0 = gateway.read_register(CoreRegister::R0)?;
+            original_r0 = Some(saved_r0);
+            let changed_r0 = saved_r0 ^ 0xA5A5_5A5A;
+            gateway.write_register(CoreRegister::R0, changed_r0)?;
+            if gateway.read_register(CoreRegister::R0)? != changed_r0 {
+                return Err(hardware_control_error("R0 写入后读取不一致"));
+            }
+            gateway.write_register(CoreRegister::R0, saved_r0)?;
+            if gateway.read_register(CoreRegister::R0)? != saved_r0 {
+                return Err(hardware_control_error("R0 原值恢复后读取不一致"));
+            }
+            original_r0 = None;
+
+            let pc_before = gateway.read_register(CoreRegister::Pc)?;
+            if gateway.step_and_observe()? != TargetState::Halted {
+                return Err(hardware_control_error("step 后目标未保持 halted"));
+            }
+            let pc_after = gateway.read_register(CoreRegister::Pc)?;
+            if pc_after == pc_before {
+                return Err(hardware_control_error(format!(
+                    "step 后 PC 未变化：0x{pc_before:08X}"
+                )));
+            }
+            if gateway.reset_halt_and_observe()? != TargetState::Halted {
+                return Err(hardware_control_error("reset after=halt 未收口到 halted"));
+            }
+            if gateway.reset_run_and_observe()? != TargetState::Running {
+                return Err(hardware_control_error("reset after=run 未收口到 running"));
+            }
+            if gateway.halt_and_observe()? != TargetState::Halted
+                || gateway.resume_and_observe()? != TargetState::Running
+            {
+                return Err(hardware_control_error("halt/resume 未完成状态往返"));
+            }
+            Ok(())
+        })();
+        let cleanup = (|| {
+            if let Some(saved_r0) = original_r0 {
+                gateway.halt_and_observe()?;
+                gateway.write_register(CoreRegister::R0, saved_r0)?;
+                if gateway.read_register(CoreRegister::R0)? != saved_r0 {
+                    return Err(hardware_control_error("失败清理未能恢复 R0 原值"));
+                }
+            }
+            if gateway.observe_target_state()? != TargetState::Running
+                && gateway.reset_run_and_observe()? != TargetState::Running
+            {
+                return Err(hardware_control_error("失败清理未能恢复 CPU 运行"));
+            }
+            Ok(())
+        })();
+        gateway.close_target();
+        cleanup?;
+        result
+    }
+
+    fn hardware_control_error(message: impl Into<String>) -> JlinkError {
+        JlinkError::new(ErrorCode::TargetRecoveryFailed, message, false)
     }
 }

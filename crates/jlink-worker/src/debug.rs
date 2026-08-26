@@ -17,15 +17,21 @@ pub(crate) fn execute_debug(
     if let Some(firmware) = request.firmware() {
         ensure_firmware_identity(session, gateway, firmware)?;
     }
-    let memory_map = gateway.device_memory_map(target.device())?;
     match request {
-        DebugRequest::ReadMemory { range } => read_memory(gateway, &memory_map, range),
+        DebugRequest::ReadMemory { range } => {
+            let memory_map = gateway.device_memory_map(target.device())?;
+            read_memory(gateway, &memory_map, range)
+        }
         DebugRequest::WriteMemory {
             address,
             data,
             verify,
-        } => write_memory(gateway, &memory_map, address, &data, verify),
+        } => {
+            let memory_map = gateway.device_memory_map(target.device())?;
+            write_memory(gateway, &memory_map, address, &data, verify)
+        }
         DebugRequest::ReadVariable { plan, .. } => {
+            let memory_map = gateway.device_memory_map(target.device())?;
             let range = MemoryRange::new(plan.address(), plan.byte_size())?;
             memory_map.classify(range)?;
             let length = usize::try_from(plan.byte_size()).map_err(|_| {
@@ -41,6 +47,7 @@ pub(crate) fn execute_debug(
             verify,
             ..
         } => {
+            let memory_map = gateway.device_memory_map(target.device())?;
             let range = MemoryRange::new(plan.address(), plan.byte_size())?;
             memory_map.ensure_ordinary_write(range)?;
             let length = usize::try_from(plan.byte_size()).map_err(|_| {
@@ -50,6 +57,14 @@ pub(crate) fn execute_debug(
             let encoded = encode_typed_value(&plan, &current, &value)?;
             gateway.write_bytes(plan.address(), &encoded)?;
             verify_if_requested(gateway, plan.address(), &encoded, verify)?;
+            Ok(DebugResult::Written)
+        }
+        DebugRequest::ReadRegister { register } => {
+            let value = gateway.read_register(register)?;
+            Ok(DebugResult::Register { value })
+        }
+        DebugRequest::WriteRegister { register, value } => {
+            gateway.write_register(register, value)?;
             Ok(DebugResult::Written)
         }
     }

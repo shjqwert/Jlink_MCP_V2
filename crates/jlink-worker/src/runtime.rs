@@ -7,8 +7,8 @@ use jlink_domain::{
 use serde_json::json;
 
 use crate::{
-    debug::execute_debug, gateway::DllGateway, lease::ProbeLease, pipe::PipeServer,
-    program::execute_program, session::TargetSessionManager,
+    control::execute_control, debug::execute_debug, gateway::DllGateway, lease::ProbeLease,
+    pipe::PipeServer, program::execute_program, session::TargetSessionManager,
 };
 
 /// Immutable startup inputs for one authoritative Worker process.
@@ -104,11 +104,12 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
         | SessionCommand::ReadMemory
         | SessionCommand::WriteMemory
         | SessionCommand::ReadVariable
-        | SessionCommand::WriteVariable => None,
+        | SessionCommand::WriteVariable
+        | SessionCommand::ReadRegister
+        | SessionCommand::WriteRegister
+        | SessionCommand::Control => None,
     };
-    if request.target.is_some()
-        && let Some(message) = unexpected_target_message
-    {
+    if let (Some(_), Some(message)) = (&request.target, unexpected_target_message) {
         return Err(JlinkError::new(ErrorCode::IpcProtocolError, message, false));
     }
     if request.after.is_some() && request.command != SessionCommand::Validate {
@@ -137,7 +138,10 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
                 | SessionCommand::ReadMemory
                 | SessionCommand::WriteMemory
                 | SessionCommand::ReadVariable
-                | SessionCommand::WriteVariable,
+                | SessionCommand::WriteVariable
+                | SessionCommand::ReadRegister
+                | SessionCommand::WriteRegister
+                | SessionCommand::Control,
             None
         )
     );
@@ -163,13 +167,20 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             SessionCommand::WriteVariable,
             Some(jlink_domain::DebugRequest::WriteVariable { .. })
         ) | (
+            SessionCommand::ReadRegister,
+            Some(jlink_domain::DebugRequest::ReadRegister { .. })
+        ) | (
+            SessionCommand::WriteRegister,
+            Some(jlink_domain::DebugRequest::WriteRegister { .. })
+        ) | (
             SessionCommand::Connect
                 | SessionCommand::Disconnect
                 | SessionCommand::Status
                 | SessionCommand::Validate
                 | SessionCommand::Flash
                 | SessionCommand::Erase
-                | SessionCommand::Verify,
+                | SessionCommand::Verify
+                | SessionCommand::Control,
             None
         )
     );
@@ -180,10 +191,72 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             false,
         ));
     }
-    Ok(())
+    validate_control_payload(request)
+}
+
+fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
+    if matches!(
+        (&request.command, &request.control),
+        (SessionCommand::Control, Some(_))
+            | (
+                SessionCommand::Connect
+                    | SessionCommand::Disconnect
+                    | SessionCommand::Status
+                    | SessionCommand::Validate
+                    | SessionCommand::Flash
+                    | SessionCommand::Erase
+                    | SessionCommand::Verify
+                    | SessionCommand::ReadMemory
+                    | SessionCommand::WriteMemory
+                    | SessionCommand::ReadVariable
+                    | SessionCommand::WriteVariable
+                    | SessionCommand::ReadRegister
+                    | SessionCommand::WriteRegister,
+                None
+            )
+    ) {
+        Ok(())
+    } else {
+        Err(JlinkError::new(
+            ErrorCode::IpcProtocolError,
+            "command 与 control 负载不匹配",
+            false,
+        ))
+    }
 }
 
 impl WorkerRuntime {
+    fn handle_control(
+        &mut self,
+        request_id: jlink_domain::RequestId,
+        target: Option<jlink_domain::TargetConnectionSpec>,
+        control: Option<jlink_domain::ControlRequest>,
+    ) -> (IpcResponse, bool) {
+        let result = target.ok_or_else(|| {
+            JlinkError::new(ErrorCode::ConfigInvalid, "目标控制请求缺少目标配置", false)
+        });
+        let result = result.and_then(|target| {
+            let control = control.ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::IpcProtocolError,
+                    "目标控制请求缺少 control 负载",
+                    false,
+                )
+            })?;
+            execute_control(&mut self.session, &mut self.gateway, &target, control)
+        });
+        match result {
+            Ok(()) => (
+                IpcResponse::success(ProtocolVersion::V1, request_id, json!({})),
+                true,
+            ),
+            Err(error) => (
+                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                true,
+            ),
+        }
+    }
+
     fn handle_debug(
         &mut self,
         request_id: jlink_domain::RequestId,
@@ -347,8 +420,13 @@ impl WorkerRuntime {
             SessionCommand::ReadMemory
             | SessionCommand::WriteMemory
             | SessionCommand::ReadVariable
-            | SessionCommand::WriteVariable => {
+            | SessionCommand::WriteVariable
+            | SessionCommand::ReadRegister
+            | SessionCommand::WriteRegister => {
                 self.handle_debug(request_id, request.target, request.debug)
+            }
+            SessionCommand::Control => {
+                self.handle_control(request_id, request.target, request.control)
             }
         }
     }
@@ -395,8 +473,8 @@ mod tests {
     use std::path::PathBuf;
 
     use jlink_domain::{
-        DebugRequest, MemoryRange, ProgramAfter, ProgramRequest, RequestId, TargetConnectionSpec,
-        TargetInterface,
+        ControlRequest, CoreRegister, DebugRequest, MemoryRange, ProgramAfter, ProgramRequest,
+        RequestId, TargetConnectionSpec, TargetInterface,
     };
 
     use super::*;
@@ -473,6 +551,65 @@ mod tests {
         assert_eq!(
             validate_request_contract(&mismatch)
                 .expect_err("write command cannot carry read payload")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+    }
+
+    #[test]
+    fn register_and_control_commands_require_exact_payloads() {
+        let target = TargetConnectionSpec::new(
+            "S32K144",
+            TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let register = DebugRequest::ReadRegister {
+            register: CoreRegister::Pc,
+        };
+        let read = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("register-read").expect("request id"),
+            SessionCommand::ReadRegister,
+        )
+        .with_target(target.clone())
+        .with_debug(register.clone());
+        validate_request_contract(&read).expect("matching register request");
+
+        let mismatch = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("register-mismatch").expect("request id"),
+            SessionCommand::WriteRegister,
+        )
+        .with_target(target.clone())
+        .with_debug(register);
+        assert_eq!(
+            validate_request_contract(&mismatch)
+                .expect_err("write command cannot carry read-register payload")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+
+        let control = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("control").expect("request id"),
+            SessionCommand::Control,
+        )
+        .with_target(target.clone())
+        .with_control(ControlRequest::Halt);
+        validate_request_contract(&control).expect("matching control request");
+
+        let missing = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("control-missing").expect("request id"),
+            SessionCommand::Control,
+        )
+        .with_target(target);
+        assert_eq!(
+            validate_request_contract(&missing)
+                .expect_err("control payload is required")
                 .code,
             ErrorCode::IpcProtocolError
         );

@@ -448,7 +448,7 @@ fn t_p1_mcp_resource_link_template_and_read_share_one_contract() {
 }
 
 #[test]
-fn t_p1_mcp_runtime_keeps_future_actions_unavailable() {
+fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
     let paths = ConfigPaths::new(
         PathBuf::from("unused-project.toml"),
         PathBuf::from("unused-user.toml"),
@@ -464,8 +464,8 @@ fn t_p1_mcp_runtime_keeps_future_actions_unavailable() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "jlink_control",
-                "arguments": { "action": "halt" }
+                "name": "jlink_hss",
+                "arguments": { "action": "status", "capture_id": "future_capture" }
             }
         })],
         &mut runtime,

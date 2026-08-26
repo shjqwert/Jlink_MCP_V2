@@ -24,7 +24,7 @@
 - [x] 3.3 实现位域/union、柔性或动态长度数组的独立显式 `slice {start,count}` 校验与缺失/无效时的 `SLICE_REQUIRED`，以及无损 `TypedValue` 编解码和复合写入全量预校验；路径 `[i]` 不得替代 `slice`，单元素使用 `count:1`，并以主要测试 T-P2-VALUE 覆盖 ART-004、ART-006、DBG-001
 - [x] 3.4 实现 Flash 烧录、整片/范围擦除、默认与独立校验、边界检查及显式 `after`，并以主要测试 T-P2-PRG 覆盖 PRG-001、PRG-002、PRG-003、PRG-004、PRG-005、PRG-006
 - [x] 3.5 实现变量执行与 1–4096 字节原始内存读写、短写检测、RAM/MMIO/Flash 分类、可选读回，以及仅针对无副作用相邻 RAM/静态变量区间的安全读取合并；MMIO、`volatile`、跨区和未对齐访问不得自动合并，并以主要测试 T-P2-MEM 覆盖 DBG-002、DBG-003、DBG-006
-- [ ] 3.6 实现核心寄存器读写和 halt/resume/reset/step 控制，并以主要测试 T-P2-CTL 覆盖 DBG-004、DBG-005
+- [x] 3.6 实现核心寄存器读写和 halt/resume/reset/step 控制，并以主要测试 T-P2-CTL 覆盖 DBG-004、DBG-005
 - [ ] 3.7 运行 P2 受影响测试和一次烧录→校验→变量读写→目标控制 smoke，集成观察活动 HSS 占位状态下的冲突路由，不重复相应主要断言，也不重复 P1 全量回归
 
 ## 4. P3 HSS 采集

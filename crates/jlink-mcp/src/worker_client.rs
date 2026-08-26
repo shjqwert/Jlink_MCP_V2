@@ -16,8 +16,8 @@ use std::{
 };
 
 use jlink_domain::{
-    DebugRequest, DebugResult, DispatchState, ErrorCode, IpcRequest, IpcResponse, JlinkError,
-    ProgramRequest, ProtocolVersion, RequestId, SessionCommand, TargetConnectionSpec,
+    ControlRequest, DebugRequest, DebugResult, DispatchState, ErrorCode, IpcRequest, IpcResponse,
+    JlinkError, ProgramRequest, ProtocolVersion, RequestId, SessionCommand, TargetConnectionSpec,
     ValidationAfter, ValidationReport, WorkerStatus, classify_worker_loss, read_ipc_frame,
     worker_endpoint_name, write_ipc_frame,
 };
@@ -94,7 +94,7 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn status(&self) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Status, None, None, None, None)?;
+        let response = self.request(SessionCommand::Status, None, None, None, None, None)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -113,7 +113,14 @@ impl WorkerClient {
     /// Returns a stable configuration, connection, recovery, validation, or
     /// transport error without selecting a different probe or interface.
     pub fn connect(&self, target: &TargetConnectionSpec) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Connect, Some(target), None, None, None)?;
+        let response = self.request(
+            SessionCommand::Connect,
+            Some(target),
+            None,
+            None,
+            None,
+            None,
+        )?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -136,7 +143,14 @@ impl WorkerClient {
         target: &TargetConnectionSpec,
         after: Option<ValidationAfter>,
     ) -> Result<ValidationReport, JlinkError> {
-        let response = self.request(SessionCommand::Validate, Some(target), after, None, None)?;
+        let response = self.request(
+            SessionCommand::Validate,
+            Some(target),
+            after,
+            None,
+            None,
+            None,
+        )?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -164,8 +178,14 @@ impl WorkerClient {
             ProgramRequest::Erase { .. } => SessionCommand::Erase,
             ProgramRequest::Verify { .. } => SessionCommand::Verify,
         };
-        let value =
-            response_result(self.request(command, Some(target), None, Some(program), None)?)?;
+        let value = response_result(self.request(
+            command,
+            Some(target),
+            None,
+            Some(program),
+            None,
+            None,
+        )?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -192,9 +212,11 @@ impl WorkerClient {
             DebugRequest::WriteMemory { .. } => SessionCommand::WriteMemory,
             DebugRequest::ReadVariable { .. } => SessionCommand::ReadVariable,
             DebugRequest::WriteVariable { .. } => SessionCommand::WriteVariable,
+            DebugRequest::ReadRegister { .. } => SessionCommand::ReadRegister,
+            DebugRequest::WriteRegister { .. } => SessionCommand::WriteRegister,
         };
         let value =
-            response_result(self.request(command, Some(target), None, None, Some(debug))?)?;
+            response_result(self.request(command, Some(target), None, None, Some(debug), None)?)?;
         serde_json::from_value(value).map_err(|error| {
             JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -204,14 +226,49 @@ impl WorkerClient {
         })
     }
 
+    /// Executes one explicit target-control action against the active target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable conflict, state, recovery, transport, or
+    /// execution-uncertain error. Success is always an empty object.
+    pub fn control(
+        &self,
+        target: &TargetConnectionSpec,
+        control: ControlRequest,
+    ) -> Result<(), JlinkError> {
+        let value = response_result(self.request(
+            SessionCommand::Control,
+            Some(target),
+            None,
+            None,
+            None,
+            Some(control),
+        )?)?;
+        if value.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(JlinkError::new(
+                ErrorCode::IpcProtocolError,
+                "Worker 目标控制响应必须是空对象",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     /// Requests a clean Worker exit after its current response is flushed.
     ///
     /// # Errors
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn disconnect(&self) -> Result<(), JlinkError> {
-        let value =
-            response_result(self.request(SessionCommand::Disconnect, None, None, None, None)?)?;
+        let value = response_result(self.request(
+            SessionCommand::Disconnect,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -229,6 +286,7 @@ impl WorkerClient {
         after: Option<ValidationAfter>,
         program: Option<&ProgramRequest>,
         debug: Option<&DebugRequest>,
+        control: Option<ControlRequest>,
     ) -> Result<IpcResponse, JlinkError> {
         let request_id = RequestId::new(format!(
             "{}-{}",
@@ -247,6 +305,9 @@ impl WorkerClient {
         }
         if let Some(debug) = debug {
             request = request.with_debug(debug.clone());
+        }
+        if let Some(control) = control {
+            request = request.with_control(control);
         }
         let mut pipe = open_pipe(&self.endpoint, 100)?;
         write_ipc_frame(&mut pipe, &request)

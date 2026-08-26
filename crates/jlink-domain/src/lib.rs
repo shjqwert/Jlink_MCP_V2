@@ -1,5 +1,6 @@
 //! Pure domain values and validation shared by the J-Link MCP processes.
 
+mod core;
 mod dwarf;
 mod error;
 mod image;
@@ -10,6 +11,7 @@ mod session;
 mod state;
 mod typed_value;
 
+pub use core::{ControlAfter, ControlRequest, CoreRegister};
 pub use dwarf::{
     ACCESS_PLAN_FORMAT_VERSION, AccessLayout, AccessMember, AccessPlan, BitRange, ElementSlice,
     ScalarEncoding, SelectorStep, VariableSelector,

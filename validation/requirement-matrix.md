@@ -62,8 +62,8 @@ public contract and is recorded in the implementation constraints.
 | DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验 + `validation/p2-memory.md` 执行链路；3.7 hardware | F0-A + F0-C |
 | DBG-002 | T-P2-MEM | `validation/p2-memory.md` unit/contract/IAR fixture；3.7 hardware | F0-A |
 | DBG-003 | T-P2-MEM | `validation/p2-memory.md` readback fixture；3.7 hardware | F0-A |
-| DBG-004 | T-P2-CTL | J-Link hardware | F0-A |
-| DBG-005 | T-P2-CTL | J-Link hardware | F0-A |
+| DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware | F0-A |
+| DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware | F0-A |
 | DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；3.7 hardware | F0-A |
 | DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |

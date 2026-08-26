@@ -139,10 +139,10 @@ impl TargetSessionManager {
         request: &DebugRequest,
     ) -> Result<(), JlinkError> {
         request.validate()?;
-        if self.hss_active && !request.is_write() {
+        if self.hss_active && !request.may_interleave_during_hss() {
             return Err(JlinkError::new(
                 ErrorCode::OperationConflict,
-                "活动 HSS 期间不能执行普通读取；请查询采集数据",
+                "活动 HSS 期间不能执行普通读取或核心寄存器访问；请查询采集数据",
                 true,
             ));
         }
@@ -161,6 +161,40 @@ impl TargetSessionManager {
             ));
         }
         Ok(())
+    }
+
+    /// Rejects public target control that conflicts with session or HSS state.
+    pub(crate) fn ensure_control_allowed(
+        &self,
+        spec: &TargetConnectionSpec,
+    ) -> Result<(), JlinkError> {
+        if self.hss_active {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动 HSS 期间不能执行目标运行控制",
+                true,
+            ));
+        }
+        if self.connection_state != ConnectionState::Connected {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "jlink_control 要求已连接且已验证的目标会话",
+                true,
+            ));
+        }
+        if self.active_target.as_ref() != Some(spec) {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动连接与当前目标配置不一致，请先断开并重新连接",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records the target state confirmed after one public control action.
+    pub(crate) const fn record_control_state(&mut self, state: TargetState) {
+        self.target_state = state;
     }
 
     /// Returns whether this connection already proved one symbol ELF identity.
@@ -193,15 +227,18 @@ impl TargetSessionManager {
         }
     }
 
-    /// Marks the active connection untrusted after an indeterminate Flash side effect.
-    pub(crate) fn record_program_uncertain(&mut self) -> Result<(), JlinkError> {
+    /// Marks the active connection untrusted after an indeterminate target side effect.
+    pub(crate) fn record_execution_uncertain(
+        &mut self,
+        reason: ValidationInvalidation,
+    ) -> Result<(), JlinkError> {
         self.connection_state =
             transition_session(self.connection_state, SessionEvent::WorkerLost)?;
         self.target_state = TargetState::Unknown;
         self.target_id = None;
         self.active_target = None;
         self.recovery_notifications.clear();
-        self.invalidate_validation(ValidationInvalidation::FlashModified);
+        self.invalidate_validation(reason);
         Ok(())
     }
 
@@ -639,6 +676,25 @@ mod tests {
         manager
             .ensure_debug_allowed(&spec, &write)
             .expect("HSS accepts validated RAM/MMIO write for serialized scheduling");
+
+        let register_write = DebugRequest::WriteRegister {
+            register: jlink_domain::CoreRegister::R0,
+            value: 1,
+        };
+        assert_eq!(
+            manager
+                .ensure_debug_allowed(&spec, &register_write)
+                .expect_err("HSS rejects core-register writes")
+                .code,
+            ErrorCode::OperationConflict
+        );
+        assert_eq!(
+            manager
+                .ensure_control_allowed(&spec)
+                .expect_err("HSS rejects target control")
+                .code,
+            ErrorCode::OperationConflict
+        );
     }
 
     #[test]
@@ -676,11 +732,53 @@ mod tests {
         uncertain.active_target = Some(spec.clone());
         uncertain.validation_key = Some(spec);
         uncertain
-            .record_program_uncertain()
+            .record_execution_uncertain(ValidationInvalidation::FlashModified)
             .expect("connected session becomes faulted");
         assert_eq!(uncertain.connection_state, ConnectionState::Faulted);
         assert_eq!(uncertain.target_state, TargetState::Unknown);
         assert!(uncertain.validation_key.is_none());
+        assert_eq!(
+            uncertain.last_invalidation,
+            Some(ValidationInvalidation::FlashModified)
+        );
+    }
+
+    #[test]
+    fn uncertain_control_invalidates_the_active_session() {
+        let spec = TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let mut manager = TargetSessionManager::new();
+        manager.connection_state = ConnectionState::Connected;
+        manager.target_state = TargetState::Halted;
+        manager.target_id = Some(1);
+        manager.active_target = Some(spec.clone());
+        manager.validation_key = Some(spec.clone());
+        manager
+            .record_execution_uncertain(ValidationInvalidation::ConnectionLost)
+            .expect("connected session becomes faulted");
+
+        let status = manager.status("probe", true);
+        assert_eq!(status.connection_state, ConnectionState::Faulted);
+        assert_eq!(status.target_state, TargetState::Unknown);
+        assert!(status.target_id.is_none());
+        assert!(!status.validation_cached);
+        assert_eq!(
+            manager.last_invalidation,
+            Some(ValidationInvalidation::ConnectionLost)
+        );
+        assert_eq!(
+            manager
+                .ensure_control_allowed(&spec)
+                .expect_err("faulted control state cannot be reused")
+                .code,
+            ErrorCode::InvalidStateTransition
+        );
     }
 
     #[test]

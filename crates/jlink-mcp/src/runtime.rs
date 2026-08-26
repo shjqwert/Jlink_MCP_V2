@@ -3,10 +3,10 @@
 use std::{fs, path::PathBuf};
 
 use jlink_domain::{
-    AccessPlan, ConnectionState, DebugRequest, DebugResult, ElementSlice, ErrorCode,
-    FirmwareIdentityPlan, FirmwareImage, FlashRange, JlinkError, MemoryRange, ProgramAfter,
-    ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector,
-    WriteVerify,
+    AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
+    DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
+    JlinkError, MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
+    ValidationAfter, VariableSelector, WriteVerify,
 };
 use serde_json::{Map, Value, json};
 
@@ -238,6 +238,7 @@ impl Runtime {
             "symbols" => self.inspect_symbols(arguments),
             "memory" => self.inspect_memory(arguments),
             "variable" => self.inspect_variable(arguments),
+            "register" => self.inspect_register(arguments),
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_inspect.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
@@ -252,10 +253,37 @@ impl Runtime {
         {
             "memory" => self.write_memory(arguments),
             "variable" => self.write_variable(arguments),
+            "register" => self.write_register(arguments),
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_write.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
         }
+    }
+
+    fn call_control(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let request = match arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees control.action")
+        {
+            "halt" => ControlRequest::Halt,
+            "resume" => ControlRequest::Resume,
+            "reset" => ControlRequest::Reset {
+                after: match arguments
+                    .get("after")
+                    .and_then(Value::as_str)
+                    .expect("MCP Schema guarantees reset.after")
+                {
+                    "run" => ControlAfter::Run,
+                    "halt" => ControlAfter::Halt,
+                    _ => unreachable!("MCP Schema guarantees reset.after"),
+                },
+            },
+            "step" => ControlRequest::Step,
+            _ => unreachable!("MCP Schema guarantees control.action"),
+        };
+        self.execute_control(request)?;
+        Ok(ToolCall::success(json!({})))
     }
 
     fn call_program(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -365,9 +393,11 @@ impl Runtime {
             DebugResult::Memory { data } => Ok(ToolCall::success(json!({
                 "data": encode_hex(&data)
             }))),
-            DebugResult::Variable { .. } | DebugResult::Written => Err(debug_response_error(
-                "Worker 对内存读取返回了错误的结果类型",
-            )),
+            DebugResult::Variable { .. } | DebugResult::Register { .. } | DebugResult::Written => {
+                Err(debug_response_error(
+                    "Worker 对内存读取返回了错误的结果类型",
+                ))
+            }
         }
     }
 
@@ -375,9 +405,30 @@ impl Runtime {
         let (plan, firmware) = self.variable_plan(arguments)?;
         match self.execute_debug(&DebugRequest::ReadVariable { plan, firmware })? {
             DebugResult::Variable { value } => Ok(ToolCall::success(json!({ "value": value }))),
-            DebugResult::Memory { .. } | DebugResult::Written => Err(debug_response_error(
-                "Worker 对变量读取返回了错误的结果类型",
-            )),
+            DebugResult::Memory { .. } | DebugResult::Register { .. } | DebugResult::Written => {
+                Err(debug_response_error(
+                    "Worker 对变量读取返回了错误的结果类型",
+                ))
+            }
+        }
+    }
+
+    fn inspect_register(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let register = CoreRegister::from_canonical(
+            arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees register.name"),
+        )?;
+        match self.execute_debug(&DebugRequest::ReadRegister { register })? {
+            DebugResult::Register { value } => Ok(ToolCall::success(json!({
+                "value": format!("0x{value:08X}")
+            }))),
+            DebugResult::Memory { .. } | DebugResult::Variable { .. } | DebugResult::Written => {
+                Err(debug_response_error(
+                    "Worker 对寄存器读取返回了错误的结果类型",
+                ))
+            }
         }
     }
 
@@ -414,6 +465,32 @@ impl Runtime {
                 .clone(),
             verify: write_verify(arguments)?,
         };
+        expect_written(&self.execute_debug(&request)?)
+    }
+
+    fn write_register(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let register = CoreRegister::from_canonical(
+            arguments
+                .get("name")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees register.name"),
+        )?;
+        let parsed = parse_address(
+            arguments
+                .get("value")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees register.value"),
+            "value",
+        )?;
+        let value = u32::try_from(parsed).map_err(|_| {
+            JlinkError::new(
+                ErrorCode::ValueInvalid,
+                "核心寄存器 value 必须是 32 位十六进制值",
+                false,
+            )
+        })?;
+        let request = DebugRequest::WriteRegister { register, value };
+        request.validate()?;
         expect_written(&self.execute_debug(&request)?)
     }
 
@@ -478,6 +555,26 @@ impl Runtime {
         result
     }
 
+    fn execute_control(&mut self, request: ControlRequest) -> Result<(), JlinkError> {
+        let resolved = self.resolve()?;
+        validate_dll_identity(&resolved.jlink)?;
+        self.ensure_attachment(&resolved)?;
+        let target = target_spec(&resolved)?;
+        let result = self
+            .attachment
+            .as_ref()
+            .expect("attachment was established")
+            .client
+            .control(&target, request);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+        {
+            self.attachment = None;
+        }
+        result
+    }
+
     fn ensure_attachment(&mut self, resolved: &ResolvedConfig) -> Result<(), JlinkError> {
         if self.attachment.is_some() {
             return Ok(());
@@ -518,6 +615,7 @@ impl ToolDispatcher for Runtime {
             "jlink_program" => self.call_program(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_inspect" => self.call_inspect(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_write" => self.call_write(arguments).unwrap_or_else(ToolCall::Error),
+            "jlink_control" => self.call_control(arguments).unwrap_or_else(ToolCall::Error),
             _ => ToolCall::Unavailable(format!(
                 "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
             )),
@@ -694,7 +792,9 @@ fn encode_hex(data: &[u8]) -> String {
 fn expect_written(result: &DebugResult) -> Result<ToolCall, JlinkError> {
     match result {
         DebugResult::Written => Ok(ToolCall::success(json!({}))),
-        DebugResult::Memory { .. } | DebugResult::Variable { .. } => Err(debug_response_error(
+        DebugResult::Memory { .. }
+        | DebugResult::Variable { .. }
+        | DebugResult::Register { .. } => Err(debug_response_error(
             "Worker 对写入请求返回了错误的结果类型",
         )),
     }

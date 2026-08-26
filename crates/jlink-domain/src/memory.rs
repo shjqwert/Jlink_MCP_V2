@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError};
+use crate::{AccessPlan, CoreRegister, ErrorCode, FirmwareIdentityPlan, JlinkError};
 
 /// Maximum byte count accepted by one public raw-memory request.
 pub const MAX_RAW_MEMORY_BYTES: u64 = 4_096;
@@ -262,6 +262,18 @@ pub enum DebugRequest {
         /// Optional post-write verification policy.
         verify: WriteVerify,
     },
+    /// Read one canonical register supported by the active Cortex-M target.
+    ReadRegister {
+        /// Canonical V1 register identity.
+        register: CoreRegister,
+    },
+    /// Write one writable canonical register.
+    WriteRegister {
+        /// Canonical V1 register identity.
+        register: CoreRegister,
+        /// Complete 32-bit register value.
+        value: u32,
+    },
 }
 
 impl DebugRequest {
@@ -291,12 +303,23 @@ impl DebugRequest {
                 }
                 MemoryRange::new(plan.address(), plan.byte_size()).map(|_| ())
             }
+            Self::ReadRegister { .. } => Ok(()),
+            Self::WriteRegister { register, .. } => register.ensure_writable(),
         }
     }
 
     /// Returns whether the operation may change target memory.
     #[must_use]
     pub const fn is_write(&self) -> bool {
+        matches!(
+            self,
+            Self::WriteMemory { .. } | Self::WriteVariable { .. } | Self::WriteRegister { .. }
+        )
+    }
+
+    /// Returns whether an active HSS may schedule this request between drains.
+    #[must_use]
+    pub const fn may_interleave_during_hss(&self) -> bool {
         matches!(self, Self::WriteMemory { .. } | Self::WriteVariable { .. })
     }
 
@@ -307,7 +330,10 @@ impl DebugRequest {
             Self::ReadVariable { firmware, .. } | Self::WriteVariable { firmware, .. } => {
                 Some(firmware)
             }
-            Self::ReadMemory { .. } | Self::WriteMemory { .. } => None,
+            Self::ReadMemory { .. }
+            | Self::WriteMemory { .. }
+            | Self::ReadRegister { .. }
+            | Self::WriteRegister { .. } => None,
         }
     }
 }
@@ -325,6 +351,11 @@ pub enum DebugResult {
     Variable {
         /// Decoded value without request or type metadata.
         value: Value,
+    },
+    /// One lossless 32-bit core-register value.
+    Register {
+        /// Complete register bits.
+        value: u32,
     },
     /// A complete ordinary write, including requested readback when present.
     Written,

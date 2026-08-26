@@ -288,6 +288,12 @@ pub enum SessionCommand {
     ReadVariable,
     /// Write one ELF-bound typed variable.
     WriteVariable,
+    /// Read one canonical Cortex-M register.
+    ReadRegister,
+    /// Write one writable canonical Cortex-M register.
+    WriteRegister,
+    /// Execute one explicit target control action.
+    Control,
 }
 
 impl SessionCommand {
@@ -295,16 +301,20 @@ impl SessionCommand {
     #[must_use]
     pub const fn execution_kind(self) -> ExecutionKind {
         match self {
-            Self::Status | Self::Verify | Self::ReadMemory | Self::ReadVariable => {
-                ExecutionKind::ReadOnly
-            }
+            Self::Status
+            | Self::Verify
+            | Self::ReadMemory
+            | Self::ReadVariable
+            | Self::ReadRegister => ExecutionKind::ReadOnly,
             Self::Connect
             | Self::Disconnect
             | Self::Validate
             | Self::Flash
             | Self::Erase
             | Self::WriteMemory
-            | Self::WriteVariable => ExecutionKind::SideEffect,
+            | Self::WriteVariable
+            | Self::WriteRegister
+            | Self::Control => ExecutionKind::SideEffect,
         }
     }
 }
@@ -331,6 +341,9 @@ pub struct IpcRequest {
     /// Typed ordinary debug payload required by memory and variable commands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<crate::DebugRequest>,
+    /// Typed target-control payload required by the control command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<crate::ControlRequest>,
 }
 
 impl IpcRequest {
@@ -349,6 +362,7 @@ impl IpcRequest {
             after: None,
             program: None,
             debug: None,
+            control: None,
         }
     }
 
@@ -377,6 +391,13 @@ impl IpcRequest {
     #[must_use]
     pub fn with_debug(mut self, debug: crate::DebugRequest) -> Self {
         self.debug = Some(debug);
+        self
+    }
+
+    /// Attaches one typed target-control action.
+    #[must_use]
+    pub const fn with_control(mut self, control: crate::ControlRequest) -> Self {
+        self.control = Some(control);
         self
     }
 }

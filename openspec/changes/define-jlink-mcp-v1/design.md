@@ -110,6 +110,10 @@ Flash 边界不得硬编码为当前 S32K144 地址。Worker 先通过冻结 DLL
 
 变量请求携带同一符号 ELF 生成的 `AccessPlan` 与固件身份计划。Worker 在每个连接会话首次变量操作前只读验证目标 Flash，成功后按 SES-005 缓存；变量读取只返回无损 `value`，变量写入先在当前字节副本上完成全部类型和值校验，再执行一次完整写入。`verify` 默认 `none`，不产生写后读回；显式 `readback` 才读取最终字节并只报告首个差异。活动 HSS 期间普通读取被拒绝；变量或 RAM/MMIO 写入只有在不需要新增固件身份读取且满足既定串行交错边界时才可继续。
 
+V1 核心寄存器使用精确规范名称 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`PSP`、`APSR`、`EPSR`、`IPSR`、`PRIMASK`、`BASEPRI`、`FAULTMASK`、`CONTROL`，不接受大小写折叠、`R13/R14/R15` 别名或模糊匹配。Worker 将该集合与活动目标经 `JLINKARM_GetRegisterList/GetRegisterName` 报告的目录取交集；`SP/LR/PC` 分别映射冻结 DLL 的 `R13 (SP)`、`R14`、`R15 (PC)`。DLL 目录中的 FPU、TrustZone 或其他架构扩展不因被列出而自动进入 V1。读取使用带逐项状态的 `JLINKARM_ReadRegs`；目录缺失或读取状态不支持时返回 `REGISTER_NOT_FOUND`。`XPSR`、`EPSR`、`IPSR` 作为只读视图在 `JLINKARM_WriteReg` 前拒绝并报告规范名称，其余已确认集合允许 32 位写入；非零写入状态不得表示为成功。
+
+公共 `halt/resume/reset/step` 复用唯一 gateway 和会话状态。`reset` 只收口到请求的 `run` 或 `halt`；`step` 在调用 `JLINKARM_Step` 前观察当前状态，非 halted 时返回 `TARGET_STATE_INVALID` 且不得隐式 halt，成功后再次确认仍为 halted。控制后的实际状态写回会话；活动 HSS 对所有寄存器访问和公共控制在首次目标动作前返回 `OPERATION_CONFLICT`。
+
 ### 7. Capture Store 采用活动可恢复、完成不可变的模型
 
 Worker 以追加方式写活动临时文件，并周期性提交可校验的块元数据。Stop 与尾排空结束后，Worker 写入终态清单和内容校验，再原子发布不可变资源。MCP 只查询已提交边界；异常退出后可恢复已校验块，未验证尾部不作为有效样本。
