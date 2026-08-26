@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     ptr,
     rc::Rc,
+    sync::Mutex,
     thread,
     time::{Duration, Instant},
 };
@@ -41,8 +42,10 @@ const DEVICE_AREA_COUNT: usize = 32;
 const MAX_REGISTER_COUNT: usize = 256;
 const PROGRAM_CHUNK_BYTES: usize = 64 * 1024;
 const PROGRAM_CHUNK_BYTES_U64: u64 = 64 * 1024;
+const DLL_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
-type OpenFn = unsafe extern "C" fn() -> i32;
+type DllLogFn = unsafe extern "C" fn(*const c_char);
+type OpenExFn = unsafe extern "C" fn(Option<DllLogFn>, Option<DllLogFn>) -> *const c_char;
 type CloseFn = unsafe extern "C" fn();
 type ExecCommandFn = unsafe extern "C" fn(*const c_char, *mut c_char, i32) -> i32;
 type SelectTifFn = unsafe extern "C" fn(i32) -> i32;
@@ -50,14 +53,16 @@ type SetSpeedFn = unsafe extern "C" fn(i32);
 type ConnectFn = unsafe extern "C" fn() -> i32;
 type SelectProbeFn = unsafe extern "C" fn(u32) -> i32;
 type GetU32Fn = unsafe extern "C" fn() -> u32;
-type GetI32Fn = unsafe extern "C" fn() -> i32;
-type VoidFn = unsafe extern "C" fn();
-type GetRegisterListFn = unsafe extern "C" fn(*mut i32, i32) -> i32;
+type GetCharFn = unsafe extern "C" fn() -> i8;
+type HaltFn = unsafe extern "C" fn() -> i8;
+type GoFn = unsafe extern "C" fn();
+type ResetFn = unsafe extern "C" fn() -> i32;
+type GetRegisterListFn = unsafe extern "C" fn(*mut u32, i32) -> i32;
 type GetRegisterNameFn = unsafe extern "C" fn(i32) -> *const c_char;
 type ReadRegFn = unsafe extern "C" fn(i32) -> u32;
-type ReadRegsFn = unsafe extern "C" fn(*const i32, *mut u32, *mut u8, u32) -> i32;
-type WriteRegFn = unsafe extern "C" fn(i32, u32) -> u8;
-type StepFn = unsafe extern "C" fn() -> u8;
+type ReadRegsFn = unsafe extern "C" fn(*const u32, *mut u32, *mut u8, u32) -> i32;
+type WriteRegFn = unsafe extern "C" fn(i32, u32) -> i8;
+type StepFn = unsafe extern "C" fn() -> i8;
 type ReadMemU32Fn = unsafe extern "C" fn(u32, u32, *mut u32, *mut u8) -> i32;
 type ReadMemFn = unsafe extern "C" fn(u32, u32, *mut u8) -> i32;
 type WriteMemFn = unsafe extern "C" fn(u32, u32, *const u8) -> i32;
@@ -69,6 +74,102 @@ type EraseChipFn = unsafe extern "C" fn() -> i32;
 #[cfg(test)]
 type WriteU32Fn = unsafe extern "C" fn(u32, u32) -> i32;
 type HssGetCapsFn = unsafe extern "C" fn(*mut HssCaps) -> i32;
+
+struct DllDiagnosticBuffer {
+    bytes: [u8; DLL_DIAGNOSTIC_BYTES],
+    len: usize,
+    truncated: bool,
+}
+
+impl DllDiagnosticBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; DLL_DIAGNOSTIC_BYTES],
+            len: 0,
+            truncated: false,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+        self.truncated = false;
+    }
+
+    fn append(&mut self, label: &[u8], message: &[u8]) {
+        if message.is_empty() {
+            return;
+        }
+        if self.len != 0 {
+            self.copy_bytes(b"\n");
+        }
+        self.copy_bytes(label);
+        self.copy_bytes(message);
+    }
+
+    fn copy_bytes(&mut self, source: &[u8]) {
+        let remaining = self.bytes.len().saturating_sub(self.len);
+        let count = remaining.min(source.len());
+        self.bytes[self.len..self.len + count].copy_from_slice(&source[..count]);
+        self.len += count;
+        self.truncated |= count != source.len();
+    }
+
+    fn take(&mut self) -> Option<String> {
+        if self.len == 0 && !self.truncated {
+            return None;
+        }
+        let mut output = String::from_utf8_lossy(&self.bytes[..self.len]).into_owned();
+        if self.truncated {
+            output.push_str("\n[diagnostics truncated]");
+        }
+        self.clear();
+        Some(output)
+    }
+}
+
+static DLL_DIAGNOSTICS: Mutex<DllDiagnosticBuffer> = Mutex::new(DllDiagnosticBuffer::new());
+
+unsafe extern "C" fn dll_log_callback(message: *const c_char) {
+    capture_dll_diagnostic(b"log: ", message);
+}
+
+unsafe extern "C" fn dll_error_callback(message: *const c_char) {
+    capture_dll_diagnostic(b"error: ", message);
+}
+
+fn capture_dll_diagnostic(label: &[u8], message: *const c_char) {
+    if message.is_null() {
+        return;
+    }
+    // SAFETY: the frozen callback ABI supplies a NUL-terminated string valid
+    // for the duration of this callback.
+    let message = unsafe { CStr::from_ptr(message) }.to_bytes();
+    DLL_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .append(label, message);
+}
+
+fn reset_dll_diagnostics() {
+    DLL_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+fn take_dll_diagnostics() -> Option<String> {
+    DLL_DIAGNOSTICS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
+fn attach_dll_diagnostics(mut error: JlinkError) -> JlinkError {
+    if let Some(diagnostics) = take_dll_diagnostics() {
+        error = error.with_detail("dll_diagnostics", serde_json::json!(diagnostics));
+    }
+    error
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -124,7 +225,7 @@ impl Default for DeviceInfo {
 }
 
 struct Api {
-    open: OpenFn,
+    open_ex: OpenExFn,
     close: CloseFn,
     exec_command: ExecCommandFn,
     select_tif: SelectTifFn,
@@ -133,12 +234,12 @@ struct Api {
     select_probe: SelectProbeFn,
     get_serial: GetU32Fn,
     get_target_id: GetU32Fn,
-    get_dll_version: GetI32Fn,
-    is_connected: GetI32Fn,
-    is_halted: GetI32Fn,
-    halt: VoidFn,
-    go: VoidFn,
-    reset: VoidFn,
+    get_dll_version: GetU32Fn,
+    is_connected: GetCharFn,
+    is_halted: GetCharFn,
+    halt: HaltFn,
+    go: GoFn,
+    reset: ResetFn,
     get_register_list: GetRegisterListFn,
     get_register_name: GetRegisterNameFn,
     read_reg: ReadRegFn,
@@ -161,7 +262,7 @@ struct Api {
 impl Api {
     fn load(module: HMODULE) -> Result<Self, JlinkError> {
         Ok(Self {
-            open: load_symbol(module, b"JLINKARM_Open\0")?,
+            open_ex: load_symbol(module, b"JLINKARM_OpenEx\0")?,
             close: load_symbol(module, b"JLINKARM_Close\0")?,
             exec_command: load_symbol(module, b"JLINKARM_ExecCommand\0")?,
             select_tif: load_symbol(module, b"JLINKARM_TIF_Select\0")?,
@@ -395,6 +496,12 @@ impl DllGateway {
     /// before invoking this method. Any failure after `BeginDownload` is reported
     /// as execution-uncertain because target side effects may already exist.
     pub(crate) fn program_image(&mut self, image: &FirmwareImage) -> Result<(), JlinkError> {
+        if self.connected_spec.is_none() || !self.is_connected()? {
+            return Err(target_connection_error(
+                "Flash 下载要求同一 DLL 会话已确认具体器件选择和目标连接",
+            ));
+        }
+        reset_dll_diagnostics();
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
@@ -405,13 +512,16 @@ impl DllGateway {
         // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
         let end_result = unsafe { (self.api.end_download)() };
         match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => Ok(()),
-            (Err(error), value) => Err(execution_uncertain_error(format!(
+            (Ok(()), value) if value >= 0 => {
+                let _ = take_dll_diagnostics();
+                Ok(())
+            }
+            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
                 "Flash 写入未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            ))),
-            (Ok(()), value) => Err(execution_uncertain_error(format!(
+            )))),
+            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
                 "JLINKARM_EndDownload 返回 {value}"
-            ))),
+            )))),
         }
     }
 
@@ -553,15 +663,7 @@ impl DllGateway {
     ) -> Result<TargetState, JlinkError> {
         let (actual, expected) = match after {
             ProgramAfter::None => (self.observe_target_state()?, None),
-            ProgramAfter::ResetHalt => {
-                // SAFETY: reset and halt are serialized through the unique gateway.
-                unsafe {
-                    (self.api.reset)();
-                    (self.api.halt)();
-                }
-                self.wait_until_halted()?;
-                (self.observe_target_state()?, Some(TargetState::Halted))
-            }
+            ProgramAfter::ResetHalt => (self.reset_halt_and_observe()?, Some(TargetState::Halted)),
             ProgramAfter::ResetRun => (self.reset_run_and_observe()?, Some(TargetState::Running)),
         };
         if expected.is_some_and(|expected| actual != expected) {
@@ -620,12 +722,18 @@ impl DllGateway {
                 spec.probe_serial()
             )));
         }
-        // SAFETY: the unique gateway serializes calls using the frozen 6.98a ABI.
-        let opened = unsafe { (self.api.open)() };
-        if opened < 0 {
-            return Err(target_connection_error(format!(
-                "JLINKARM_Open 返回 {opened}"
-            )));
+        reset_dll_diagnostics();
+        // SAFETY: both callbacks match the frozen 6.98a callback ABI and only
+        // append bytes to a fixed-capacity diagnostic buffer without DLL reentry.
+        let open_error =
+            unsafe { (self.api.open_ex)(Some(dll_log_callback), Some(dll_error_callback)) };
+        if !open_error.is_null() {
+            // SAFETY: a non-null OpenEx result is a DLL-owned NUL-terminated
+            // error string valid at least until the synchronous call returns.
+            let message = unsafe { CStr::from_ptr(open_error) }.to_string_lossy();
+            return Err(attach_dll_diagnostics(target_connection_error(format!(
+                "JLINKARM_OpenEx 失败：{message}"
+            ))));
         }
         self.opened = true;
         let result = self.configure_open_target(spec);
@@ -737,11 +845,11 @@ impl DllGateway {
     }
 
     /// Returns the register indices and names reported by the active target.
-    pub(crate) fn register_entries(&self) -> Result<Vec<(i32, String)>, JlinkError> {
+    pub(crate) fn register_entries(&self) -> Result<Vec<(u32, String)>, JlinkError> {
         if !self.opened || !self.is_connected()? {
             return Err(target_connection_error("读取寄存器目录要求已建立目标连接"));
         }
-        let mut indices = [0_i32; MAX_REGISTER_COUNT];
+        let mut indices = [0_u32; MAX_REGISTER_COUNT];
         let capacity = i32::try_from(indices.len()).expect("register capacity fits i32");
         // SAFETY: the buffer is writable for `capacity` indices and the active
         // target owns the register catalog for this serialized DLL session.
@@ -762,8 +870,13 @@ impl DllGateway {
             .iter()
             .copied()
             .map(|index| {
+                let name_index = i32::try_from(index).map_err(|_| {
+                    target_connection_error(format!(
+                        "J-Link 寄存器索引 {index} 超出冻结名称接口范围"
+                    ))
+                })?;
                 // SAFETY: `index` came from the active target's register list.
-                let name = unsafe { (self.api.get_register_name)(index) };
+                let name = unsafe { (self.api.get_register_name)(name_index) };
                 if name.is_null() {
                     return Err(target_connection_error(format!(
                         "JLINKARM_GetRegisterName({index}) 返回空指针"
@@ -783,7 +896,7 @@ impl DllGateway {
             .collect()
     }
 
-    fn register_index(&self, register: CoreRegister) -> Result<i32, JlinkError> {
+    fn register_index(&self, register: CoreRegister) -> Result<u32, JlinkError> {
         self.register_entries()?
             .into_iter()
             .find_map(|(index, name)| (name == register.jlink_name()).then_some(index))
@@ -832,9 +945,12 @@ impl DllGateway {
     ) -> Result<(), JlinkError> {
         register.ensure_writable()?;
         let index = self.register_index(register)?;
+        let write_index = i32::try_from(index).map_err(|_| {
+            target_connection_error(format!("J-Link 寄存器索引 {index} 超出冻结写入接口范围"))
+        })?;
         // SAFETY: the register index came from the active target catalog and
         // the unique gateway serializes the frozen two-argument ABI.
-        let status = unsafe { (self.api.write_reg)(index, value) };
+        let status = unsafe { (self.api.write_reg)(write_index, value) };
         if status != 0 {
             return Err(execution_uncertain_error(format!(
                 "JLINKARM_WriteReg({}, 0x{value:08X}) 返回 {status}，寄存器可能已改变",
@@ -899,8 +1015,10 @@ impl DllGateway {
     fn perform_hardfault_injection(&mut self, original_demcr: u32) -> Result<(), JlinkError> {
         // SAFETY: the unique test gateway owns the connected target and the
         // frozen 6.98a no-argument Halt ABI was exercised in F0-A.
-        unsafe { (self.api.halt)() };
-        self.wait_until_halted()?;
+        let halt_status = unsafe { (self.api.halt)() };
+        self.wait_until_halted().map_err(|error| {
+            error.with_detail("dll_halt_status", serde_json::json!(halt_status))
+        })?;
         self.write_test_word(DEMCR, original_demcr | DEMCR_VC_HARDERR)?;
         // SAFETY: the frozen 6.98a export disassembly confirms two 32-bit
         // arguments and a byte return. Register 15 is the Cortex-M PC.
@@ -964,8 +1082,10 @@ impl DllGateway {
     /// Halts the connected target and returns the resulting observed state.
     pub(crate) fn halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
         // SAFETY: the target connection is active and the call is serialized.
-        unsafe { (self.api.halt)() };
-        self.wait_until_halted()?;
+        let halt_status = unsafe { (self.api.halt)() };
+        self.wait_until_halted().map_err(|error| {
+            error.with_detail("dll_halt_status", serde_json::json!(halt_status))
+        })?;
         self.observe_target_state()
     }
 
@@ -978,22 +1098,36 @@ impl DllGateway {
 
     /// Resets and starts the target, then observes the stable final state.
     pub(crate) fn reset_run_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        // SAFETY: the target connection is active and calls are serialized.
-        unsafe {
-            (self.api.reset)();
-            (self.api.go)();
+        reset_dll_diagnostics();
+        // SAFETY: the target connection is active and the reset call is serialized.
+        let reset_status = unsafe { (self.api.reset)() };
+        if reset_status < 0 {
+            return Err(attach_dll_diagnostics(target_recovery_error(format!(
+                "JLINKARM_Reset 返回 {reset_status}"
+            ))));
         }
+        // SAFETY: the successful reset left the uniquely owned target ready to run.
+        unsafe { (self.api.go)() };
         self.wait_for_stable_state()
     }
 
     /// Resets and explicitly leaves the target halted.
     pub(crate) fn reset_halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        // SAFETY: the target connection is active and calls are serialized.
-        unsafe {
-            (self.api.reset)();
-            (self.api.halt)();
+        reset_dll_diagnostics();
+        // SAFETY: the target connection is active and the reset call is serialized.
+        let reset_status = unsafe { (self.api.reset)() };
+        if reset_status < 0 {
+            return Err(attach_dll_diagnostics(target_recovery_error(format!(
+                "JLINKARM_Reset 返回 {reset_status}"
+            ))));
         }
-        self.wait_until_halted()?;
+        // SAFETY: the successful reset and halt are serialized through the gateway.
+        let halt_status = unsafe { (self.api.halt)() };
+        self.wait_until_halted().map_err(|error| {
+            error
+                .with_detail("dll_reset_status", serde_json::json!(reset_status))
+                .with_detail("dll_halt_status", serde_json::json!(halt_status))
+        })?;
         self.observe_target_state()
     }
 
@@ -1165,24 +1299,28 @@ impl DllGateway {
         Ok(value)
     }
 
-    fn exec_command(&self, command: &str) -> Result<String, JlinkError> {
+    fn exec_command(&self, command: &str) -> Result<(), JlinkError> {
         let command = CString::new(command).map_err(|_| {
             JlinkError::new(ErrorCode::ConfigInvalid, "J-Link 命令包含 NUL 字符", false)
         })?;
         let mut output = [0_i8; 512];
-        let output_len = i32::try_from(output.len()).expect("fixed output buffer fits i32");
-        // SAFETY: pointers remain valid and the zeroed output buffer is fully sized.
+        let output_len = i32::try_from(output.len() - 1).expect("fixed output buffer fits i32");
+        reset_dll_diagnostics();
+        // SAFETY: pointers remain valid and one trailing zero byte is withheld so
+        // the returned error output is always NUL-terminated for local parsing.
         let result =
             unsafe { (self.api.exec_command)(command.as_ptr(), output.as_mut_ptr(), output_len) };
-        if result < 0 {
-            return Err(target_connection_error(format!(
-                "JLINKARM_ExecCommand 返回 {result}"
-            )));
+        // SAFETY: the final byte remains zero even if the DLL fills its declared buffer.
+        let output = unsafe { CStr::from_ptr(output.as_ptr()) }.to_string_lossy();
+        let validation =
+            validate_exec_command_result(command.to_string_lossy().as_ref(), result, &output);
+        match validation {
+            Ok(()) => {
+                let _ = take_dll_diagnostics();
+                Ok(())
+            }
+            Err(error) => Err(attach_dll_diagnostics(error)),
         }
-        // SAFETY: the output buffer was zeroed and supplied with its full length.
-        Ok(unsafe { CStr::from_ptr(output.as_ptr()) }
-            .to_string_lossy()
-            .into_owned())
     }
 }
 
@@ -1235,6 +1373,23 @@ fn target_connection_error(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::TargetConnectFailed, message, true)
 }
 
+fn validate_exec_command_result(
+    command: &str,
+    result: i32,
+    error_output: &str,
+) -> Result<(), JlinkError> {
+    let error_output = error_output.trim();
+    if result >= 0 && error_output.is_empty() {
+        return Ok(());
+    }
+    let mut error =
+        target_connection_error(format!("JLINKARM_ExecCommand({command}) 返回 {result}"));
+    if !error_output.is_empty() {
+        error = error.with_detail("dll_error_output", serde_json::json!(error_output));
+    }
+    Err(error)
+}
+
 fn target_recovery_error(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::TargetRecoveryFailed, message, false)
 }
@@ -1257,11 +1412,49 @@ mod tests {
         TargetConnectionSpec, TargetInterface, TargetState,
     };
 
-    use super::{DeviceInfo, DllGateway};
+    use super::{
+        DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway,
+        validate_exec_command_result,
+    };
 
     #[test]
     fn frozen_x64_device_info_prefix_is_568_bytes() {
         assert_eq!(std::mem::size_of::<DeviceInfo>(), 568);
+    }
+
+    #[test]
+    fn exec_command_requires_empty_error_output() {
+        validate_exec_command_result("device = S32K144", 0, "")
+            .expect("empty error output is accepted");
+
+        let rejected =
+            validate_exec_command_result("device = MissingDevice", 0, "Unknown device selected.")
+                .expect_err("DLL error output must reject the command");
+        assert_eq!(rejected.code, ErrorCode::TargetConnectFailed);
+        assert_eq!(
+            rejected
+                .details
+                .as_ref()
+                .and_then(|details| details.get("dll_error_output")),
+            Some(&serde_json::json!("Unknown device selected."))
+        );
+
+        let failed = validate_exec_command_result("device = S32K144", -1, "")
+            .expect_err("negative return code must reject the command");
+        assert_eq!(failed.code, ErrorCode::TargetConnectFailed);
+    }
+
+    #[test]
+    fn dll_diagnostics_are_bounded_and_cleared_after_take() {
+        let mut diagnostics = DllDiagnosticBuffer::new();
+        diagnostics.append(b"error: ", &vec![b'x'; DLL_DIAGNOSTIC_BYTES * 2]);
+        assert_eq!(diagnostics.len, DLL_DIAGNOSTIC_BYTES);
+        assert!(diagnostics.truncated);
+
+        let output = diagnostics.take().expect("bounded diagnostic output");
+        assert!(output.ends_with("[diagnostics truncated]"));
+        assert_eq!(diagnostics.len, 0);
+        assert!(!diagnostics.truncated);
     }
 
     #[test]

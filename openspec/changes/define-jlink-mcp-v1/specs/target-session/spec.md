@@ -12,7 +12,11 @@
 - **THEN** 连接返回 `CONFIG_INVALID` 或明确的探针选择诊断，不得任意选择
 
 ### Requirement: SES-002 连接与首次验证
-`jlink_target.connect` MUST 使用有效配置建立连接，并在当前目标连接会话第一次需要设备能力时验证 DLL 身份、必要导出、探针、目标、接口及后台访问能力。验证成功 MUST 在同一连接会话内复用。
+`jlink_target.connect` MUST 使用有效配置建立连接，并在当前目标连接会话第一次需要设备能力时验证 DLL 身份、必要导出、探针、目标、接口及后台访问能力。具体器件选择命令 MUST 在同一 DLL 会话内得到确定接受，命令返回码及冻结 API 定义的错误输出都 MUST 被检查；通用 Cortex-M 连接或静态器件数据库查询 MUST NOT 单独证明具体器件已选择。验证成功 MUST 在同一连接会话内复用。
+
+#### Scenario: 具体器件命令被拒绝
+- **WHEN** `device = <configured-device>` 返回失败或产生冻结 API 定义的错误输出
+- **THEN** 连接返回 `TARGET_CONNECT_FAILED`，不得建立活动会话或继续到任何 Flash 副作用
 
 #### Scenario: 同一连接内连续读取
 - **WHEN** 首次连接验证已成功且配置及设备身份未变化

@@ -40,7 +40,11 @@ Worker 崩溃 MUST NOT 终止 MCP 主进程。主进程 MUST 将会话标记为 
 - **THEN** 结果为 `EXECUTION_UNCERTAIN`，后续请求不得复用旧连接状态
 
 ### Requirement: RUN-006 最小动态 FFI
-Worker MUST 仅动态解析 V1 实际使用的 J-Link 导出，启动时 MUST 报告缺失的必要导出；系统 MUST NOT 复制或绑定整套 J-Link SDK。
+Worker MUST 仅动态解析 V1 实际使用的 J-Link 导出，且每个实际调用的函数指针 MUST 逐项匹配冻结 J-Link 6.98a SDK 的参数、返回类型和 Windows x64 调用约定；启动时 MUST 报告缺失的必要导出，系统 MUST NOT 复制或绑定整套 J-Link SDK。DLL 打开入口 MUST 提供有界日志与错误回调作为本地失败诊断，回调 MUST NOT 重入 DLL、拥有业务状态或改变普通 MCP 成功结果。
+
+#### Scenario: ABI 声明与冻结 SDK 不一致
+- **WHEN** 任一已解析导出的函数指针声明不能证明与冻结 J-Link 6.98a SDK ABI 精确一致
+- **THEN** 该导出不得进入生产调用路径，验证必须失败而不是依赖简化的 `i32` 或 `void` 声明解释结果
 
 #### Scenario: HSS 导出缺失
 - **WHEN** 普通调试导出完整但候选 DLL 缺少必要 HSS 导出
