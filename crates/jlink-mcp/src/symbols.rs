@@ -63,6 +63,7 @@ impl SymbolIndex {
         .map_err(|error| value_invalid(format!("无法加载 DWARF section：{error}")))?;
         let dwarf = sections.borrow(|section| EndianSlice::new(section, endian));
         let mut index = index_dwarf(&dwarf)?;
+        validate_dwarf_versions(&index.versions)?;
         let dwarf_versions = std::mem::take(&mut index.versions);
         let producers = std::mem::take(&mut index.producers);
         let direct_paths = collect_direct_paths(&index);
@@ -318,6 +319,16 @@ struct Member {
     storage_size: Option<u64>,
     bit_size: Option<u64>,
     dwarf_bit_offset: Option<u64>,
+    data_bit_offset: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NormalizedMember {
+    byte_offset: u64,
+    storage_size: Option<u64>,
+    dwarf_bit_offset: Option<u64>,
+    bit_size: Option<u64>,
+    bit_range: Option<BitRange>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -611,6 +622,11 @@ fn record_member<R: Reader>(
             entry,
             gimli::DW_AT_bit_offset,
             "DW_AT_bit_offset",
+        )?),
+        data_bit_offset: attr_udata(attribute(
+            entry,
+            gimli::DW_AT_data_bit_offset,
+            "DW_AT_data_bit_offset",
         )?),
     };
     match index.types.get_mut(&owner_id) {
@@ -935,29 +951,15 @@ fn apply_member_step(
     if matches.next().is_some() {
         return Err(symbol_ambiguous(selector.path(), 2));
     }
-    let byte_offset = member
-        .byte_offset
-        .ok_or_else(|| dynamic_location(format!("{}.{}", selector.root(), member.name)))?;
+    let member_type_id = member.type_id;
+    let member = normalize_member(index, member)?;
     resolved.address = resolved
         .address
-        .checked_add(byte_offset)
+        .checked_add(member.byte_offset)
         .ok_or_else(|| type_unsupported("成员地址计算溢出"))?;
-    resolved.type_id = member.type_id;
-    if let (Some(width), Some(dwarf_offset), Some(storage_size)) = (
-        member.bit_size,
-        member.dwarf_bit_offset,
-        member.storage_size,
-    ) {
-        let storage_bits = storage_size
-            .checked_mul(8)
-            .ok_or_else(|| type_unsupported("位域 storage size 溢出"))?;
-        let lsb = storage_bits
-            .checked_sub(dwarf_offset)
-            .and_then(|value| value.checked_sub(width))
-            .ok_or_else(|| type_unsupported("DWARF v4 位域 offset 无效"))?;
-        resolved.selected_storage_size = Some(storage_size);
-        resolved.bit_range = Some(BitRange::new(lsb, width));
-    }
+    resolved.type_id = member_type_id;
+    resolved.selected_storage_size = member.storage_size;
+    resolved.bit_range = member.bit_range;
     Ok(())
 }
 
@@ -1097,6 +1099,96 @@ fn type_size(index: &DwarfIndex, type_id: TypeId) -> Result<u64, JlinkError> {
     }
 }
 
+fn normalize_member(index: &DwarfIndex, member: &Member) -> Result<NormalizedMember, JlinkError> {
+    if member.data_bit_offset.is_some() && member.dwarf_bit_offset.is_some() {
+        return Err(type_unsupported(format!(
+            "成员 {} 同时包含 DW_AT_data_bit_offset 和 DW_AT_bit_offset",
+            member.name
+        )));
+    }
+
+    match (
+        member.data_bit_offset,
+        member.dwarf_bit_offset,
+        member.bit_size,
+    ) {
+        (None, None, None) => Ok(NormalizedMember {
+            byte_offset: member
+                .byte_offset
+                .ok_or_else(|| dynamic_location(&member.name))?,
+            storage_size: None,
+            dwarf_bit_offset: None,
+            bit_size: None,
+            bit_range: None,
+        }),
+        (Some(data_bit_offset), None, Some(width)) => {
+            if width == 0 {
+                return Err(type_unsupported(format!("成员 {} 的位宽为 0", member.name)));
+            }
+            let byte_offset = data_bit_offset / 8;
+            if member
+                .byte_offset
+                .is_some_and(|declared| declared != byte_offset)
+            {
+                return Err(type_unsupported(format!(
+                    "成员 {} 的 byte offset 与 DW_AT_data_bit_offset 冲突",
+                    member.name
+                )));
+            }
+            let lsb = data_bit_offset % 8;
+            let bit_end = lsb
+                .checked_add(width)
+                .ok_or_else(|| type_unsupported("DW_AT_data_bit_offset 位域范围溢出"))?;
+            let storage_size = bit_end
+                .checked_add(7)
+                .map(|bits| bits / 8)
+                .ok_or_else(|| type_unsupported("DW_AT_data_bit_offset storage size 溢出"))?;
+            let storage_bits = storage_size
+                .checked_mul(8)
+                .ok_or_else(|| type_unsupported("位域 storage size 溢出"))?;
+            let dwarf_bit_offset = storage_bits
+                .checked_sub(bit_end)
+                .ok_or_else(|| type_unsupported("DW_AT_data_bit_offset 位域范围无效"))?;
+            Ok(NormalizedMember {
+                byte_offset,
+                storage_size: Some(storage_size),
+                dwarf_bit_offset: Some(dwarf_bit_offset),
+                bit_size: Some(width),
+                bit_range: Some(BitRange::new(lsb, width)),
+            })
+        }
+        (None, Some(dwarf_bit_offset), Some(width)) => {
+            if width == 0 {
+                return Err(type_unsupported(format!("成员 {} 的位宽为 0", member.name)));
+            }
+            let byte_offset = member
+                .byte_offset
+                .ok_or_else(|| dynamic_location(&member.name))?;
+            let storage_size = member
+                .storage_size
+                .map_or_else(|| type_size(index, member.type_id), Ok)?;
+            let storage_bits = storage_size
+                .checked_mul(8)
+                .ok_or_else(|| type_unsupported("位域 storage size 溢出"))?;
+            let lsb = storage_bits
+                .checked_sub(dwarf_bit_offset)
+                .and_then(|value| value.checked_sub(width))
+                .ok_or_else(|| type_unsupported("DWARF v3/v4 位域 offset 无效"))?;
+            Ok(NormalizedMember {
+                byte_offset,
+                storage_size: Some(storage_size),
+                dwarf_bit_offset: Some(dwarf_bit_offset),
+                bit_size: Some(width),
+                bit_range: Some(BitRange::new(lsb, width)),
+            })
+        }
+        _ => Err(type_unsupported(format!(
+            "成员 {} 的位域元数据不完整",
+            member.name
+        ))),
+    }
+}
+
 fn layout_from_type(
     index: &DwarfIndex,
     type_id: TypeId,
@@ -1152,14 +1244,13 @@ fn layout_members(
     members
         .iter()
         .map(|member| {
+            let normalized = normalize_member(index, member)?;
             Ok(AccessMember::new(
                 member.name.clone(),
-                member
-                    .byte_offset
-                    .ok_or_else(|| dynamic_location(&member.name))?,
-                member.storage_size,
-                member.dwarf_bit_offset,
-                member.bit_size,
+                normalized.byte_offset,
+                normalized.storage_size,
+                normalized.dwarf_bit_offset,
+                normalized.bit_size,
                 layout_from_type(index, member.type_id, visiting)?,
             ))
         })
@@ -1254,6 +1345,15 @@ fn dynamic_location(path: impl AsRef<str>) -> JlinkError {
 
 fn type_unsupported(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::TypeUnsupported, message, false)
+}
+
+fn validate_dwarf_versions(versions: &BTreeSet<u16>) -> Result<(), JlinkError> {
+    if let Some(version) = versions.iter().find(|version| !matches!(version, 3 | 4)) {
+        return Err(type_unsupported(format!(
+            "DWARF {version} 未通过 V1 fixture 验证；当前只支持 DWARF 3/4"
+        )));
+    }
+    Ok(())
 }
 
 fn value_invalid(message: impl Into<String>) -> JlinkError {
@@ -1367,5 +1467,58 @@ mod tests {
         let error = resolve_access_plan(&index, &"0".repeat(64), &member)
             .expect_err("pointer traversal must be rejected");
         assert_eq!(error.code(), ErrorCode::TypeUnsupported);
+    }
+
+    #[test]
+    fn t_p2_dwarf_rejects_unverified_dwarf_versions() {
+        let error = validate_dwarf_versions(&BTreeSet::from([5]))
+            .expect_err("DWARF 5 has no accepted V1 fixture");
+        assert_eq!(error.code(), ErrorCode::TypeUnsupported);
+        validate_dwarf_versions(&BTreeSet::from([3, 4])).expect("verified versions");
+    }
+
+    #[test]
+    fn t_p2_dwarf_normalizes_data_bit_offset() {
+        let index = DwarfIndex {
+            types: BTreeMap::from([
+                (
+                    1,
+                    TypeNode::Base {
+                        name: "int8_t".to_owned(),
+                        byte_size: 1,
+                        encoding: ScalarEncoding::Signed,
+                    },
+                ),
+                (
+                    2,
+                    TypeNode::Structure {
+                        byte_size: 1,
+                        members: vec![Member {
+                            name: "field".to_owned(),
+                            type_id: 1,
+                            byte_offset: None,
+                            storage_size: None,
+                            bit_size: Some(3),
+                            dwarf_bit_offset: None,
+                            data_bit_offset: Some(0),
+                        }],
+                    },
+                ),
+            ]),
+            variables: BTreeMap::from([(
+                "value".to_owned(),
+                vec![Variable {
+                    type_id: 2,
+                    location: VariableLocation::Static(0x2000_0000),
+                    declaration: false,
+                }],
+            )]),
+            ..DwarfIndex::default()
+        };
+        let selector = VariableSelector::new("value.field", None).expect("selector");
+        let plan = resolve_access_plan(&index, &"0".repeat(64), &selector).expect("access plan");
+        assert_eq!(plan.address(), 0x2000_0000);
+        assert_eq!(plan.byte_size(), 1);
+        assert_eq!(plan.bit_range(), Some(BitRange::new(0, 3)));
     }
 }
