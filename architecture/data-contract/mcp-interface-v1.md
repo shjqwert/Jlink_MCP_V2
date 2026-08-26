@@ -100,7 +100,7 @@ MCP 包装层：
 | 位域 | 解码后的 `boolean` 或 `number` |
 | union | 未指定成员时返回 `{ "$union": { "memberA": ..., "memberB": ... } }` |
 
-写入结构体或数组时必须提供完整选中对象；局部写入通过成员或元素路径完成。写 union 时必须定位具体成员，或在 `$union` 中只提供一个成员。柔性数组必须提供 `slice`。
+写入结构体或数组时必须提供完整选中对象；局部写入通过成员或元素路径完成。写 union 时必须定位具体成员，或在 `$union` 中只提供一个成员。柔性或动态长度数组必须独立提供 `slice {start,count}`；路径中的 `[i]` 不能替代 `slice`，只选择一个元素时也使用 `count:1`。
 
 ## 3. 工具总表
 
@@ -442,7 +442,7 @@ V1 单次长度范围为 `1..4096` 字节。结果仅包含按内存地址顺序
 
 - 每次采集最多 10 个顶层 selector。
 - `path` 可以选择标量、结构体成员、完整结构体、固定数组或多维数组。
-- 固定数组维度来自 DWARF；柔性数组必须提供 `slice`。
+- 固定数组维度来自 DWARF；柔性或动态长度数组必须独立提供 `slice {start,count}`，路径中的 `[i]` 不能替代它，单元素使用 `count:1`。
 - 不自动跟随指针。
 
 ### 9.2 ThresholdRule
@@ -761,6 +761,7 @@ V1 不依赖 `JLink_x64.dll` 对同一连接的并发安全。所有 DLL 调用�
 | `SYMBOL_NOT_FOUND` | DWARF 路径不存在 | false |
 | `SYMBOL_AMBIGUOUS` | 路径不能唯一解析 | false |
 | `TYPE_UNSUPPORTED` | 类型无法按 V1 规则编码 | false |
+| `DYNAMIC_LOCATION_UNSUPPORTED` | 变量无法归一为单一静态 DWARF 地址 | false |
 | `SLICE_REQUIRED` | 柔性数组缺少有效 slice | false |
 | `VALUE_INVALID` | 写入值不符合类型或范围 | false |
 | `ADDRESS_OUT_OF_RANGE` | 地址或区间不属于允许的目标地址空间 | false |

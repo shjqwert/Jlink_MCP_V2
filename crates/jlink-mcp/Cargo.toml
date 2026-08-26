@@ -7,9 +7,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+gimli.workspace = true
 jlink-capture = { path = "../jlink-capture" }
 jlink-domain = { path = "../jlink-domain" }
 jsonschema.workspace = true
+object.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -34,7 +34,7 @@
 - **THEN** 系统解析唯一静态地址、大小和类型，普通读取与 HSS 使用相同计划
 
 ### Requirement: ART-004 位域、union 与柔性数组
-系统 MUST 按 DWARF 位范围解码和编码位域；读取 union MUST 在未指定成员时提供所有可解释成员但不得推断 active member；写 union MUST 指定唯一成员。柔性或动态长度数组 MUST 要求显式 count 或 slice。
+系统 MUST 按 DWARF 位范围解码和编码位域；读取 union MUST 在未指定成员时提供所有可解释成员但不得推断 active member；写 union MUST 指定唯一成员。柔性或动态长度数组 MUST 独立提供 `slice {start,count}`；路径中的 `[i]` 不得替代 `slice`，只选择一个元素时也 MUST 使用 `count:1`。
 
 #### Scenario: 柔性数组没有 slice
 - **WHEN** Agent 读取或采集柔性数组且没有提供有效元素范围

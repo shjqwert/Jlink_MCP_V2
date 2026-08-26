@@ -49,6 +49,14 @@ pub enum ErrorCode {
     FirmwareIdentityUnknown,
     /// The target Flash was read successfully and differs from the symbol ELF.
     FirmwareElfMismatch,
+    /// The requested DWARF path does not exist in the selected symbol artifact.
+    SymbolNotFound,
+    /// The requested DWARF path resolves to more than one variable.
+    SymbolAmbiguous,
+    /// The selected DWARF type or path operation is outside the V1 type contract.
+    TypeUnsupported,
+    /// The selected variable requires a location expression that cannot be fixed statically.
+    DynamicLocationUnsupported,
 }
 
 impl ErrorCode {
@@ -77,6 +85,10 @@ impl ErrorCode {
             Self::ValueInvalid => "VALUE_INVALID",
             Self::FirmwareIdentityUnknown => "FIRMWARE_IDENTITY_UNKNOWN",
             Self::FirmwareElfMismatch => "FIRMWARE_ELF_MISMATCH",
+            Self::SymbolNotFound => "SYMBOL_NOT_FOUND",
+            Self::SymbolAmbiguous => "SYMBOL_AMBIGUOUS",
+            Self::TypeUnsupported => "TYPE_UNSUPPORTED",
+            Self::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
         }
     }
 }

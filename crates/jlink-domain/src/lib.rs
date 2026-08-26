@@ -1,11 +1,16 @@
 //! Pure domain values and validation shared by the J-Link MCP processes.
 
+mod dwarf;
 mod error;
 mod image;
 mod ipc;
 mod session;
 mod state;
 
+pub use dwarf::{
+    ACCESS_PLAN_FORMAT_VERSION, AccessLayout, AccessMember, AccessPlan, BitRange, ElementSlice,
+    ScalarEncoding, SelectorStep, VariableSelector,
+};
 pub use error::{ErrorCode, JlinkError};
 pub use image::{
     FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,

@@ -20,8 +20,8 @@
 ## 3. P2 静态调试
 
 - [x] 3.1 实现 ELF/AXF/OUT、HEX、SREC、BIN 输入，补齐 `flash/verify` 的 BIN `base_address` Schema、`VALUE_INVALID` 及固件身份稳定错误，并实现 ELF/目标固件身份计划；以主要测试 T-P2-IMG 覆盖 ART-001、ART-002，同时回归 T-P1-MCP/T-P1-DOM
-- [ ] 3.2 实现唯一 DWARF 路径解析、`symbols` 搜索、按 ELF SHA-256/选择器/解析器版本缓存的不可变 `AccessPlan`，覆盖静态成员、数组、柔性切片与动态位置拒绝，并以主要测试 T-P2-DWARF 覆盖 ART-003、ART-005、ART-007、DBG-008
-- [ ] 3.3 实现位域/union 与无损 `TypedValue` 编解码和复合写入全量预校验，并以主要测试 T-P2-VALUE 覆盖 ART-004、ART-006、DBG-001
+- [x] 3.2 实现唯一 DWARF 路径解析、`symbols` 搜索、按 ELF SHA-256/选择器/解析器版本缓存的不可变 `AccessPlan`，覆盖静态成员、固定数组、显式柔性 `slice` 的路径/偏移/大小计划及动态位置拒绝；本任务只验证显式切片解析机制，不重复 ART-004/`SLICE_REQUIRED`，并以主要测试 T-P2-DWARF 覆盖 ART-003、ART-005、ART-007、DBG-008
+- [ ] 3.3 实现位域/union、柔性或动态长度数组的独立显式 `slice {start,count}` 校验与缺失/无效时的 `SLICE_REQUIRED`，以及无损 `TypedValue` 编解码和复合写入全量预校验；路径 `[i]` 不得替代 `slice`，单元素使用 `count:1`，并以主要测试 T-P2-VALUE 覆盖 ART-004、ART-006、DBG-001
 - [ ] 3.4 实现 Flash 烧录、整片/范围擦除、默认与独立校验、边界检查及显式 `after`，并以主要测试 T-P2-PRG 覆盖 PRG-001、PRG-002、PRG-003、PRG-004、PRG-005、PRG-006
 - [ ] 3.5 实现变量执行与 1–4096 字节原始内存读写、短写检测、RAM/MMIO/Flash 分类、可选读回，以及仅针对无副作用相邻 RAM/静态变量区间的安全读取合并；MMIO、`volatile`、跨区和未对齐访问不得自动合并，并以主要测试 T-P2-MEM 覆盖 DBG-002、DBG-003、DBG-006
 - [ ] 3.6 实现核心寄存器读写和 halt/resume/reset/step 控制，并以主要测试 T-P2-CTL 覆盖 DBG-004、DBG-005

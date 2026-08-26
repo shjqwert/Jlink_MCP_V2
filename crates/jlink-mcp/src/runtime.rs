@@ -14,6 +14,7 @@ use crate::{
         resolve_config, validate_dll_identity,
     },
     mcp::{ToolCall, ToolDispatcher},
+    symbols::SymbolCache,
     worker_client::{WorkerAttachment, WorkerLaunchSpec, attach_or_spawn},
 };
 
@@ -23,6 +24,7 @@ pub struct Runtime {
     worker_executable: PathBuf,
     lease_root: PathBuf,
     attachment: Option<WorkerAttachment>,
+    symbol_cache: SymbolCache,
 }
 
 impl Runtime {
@@ -38,6 +40,7 @@ impl Runtime {
             worker_executable,
             lease_root,
             attachment: None,
+            symbol_cache: SymbolCache::new(),
         }
     }
 
@@ -223,6 +226,52 @@ impl Runtime {
         )
     }
 
+    fn call_inspect(&mut self, arguments: &Value) -> ToolCall {
+        match arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees inspect.action")
+        {
+            "symbols" => self
+                .inspect_symbols(arguments)
+                .unwrap_or_else(ToolCall::Error),
+            action => ToolCall::Unavailable(format!(
+                "jlink_inspect.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
+            )),
+        }
+    }
+
+    fn inspect_symbols(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let resolved = self.resolve()?;
+        let elf_path = resolved.symbols.elf.ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "symbols.elf 未配置，无法建立 DWARF 索引",
+                false,
+            )
+        })?;
+        let query = arguments
+            .get("query")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees symbols.query");
+        let limit =
+            arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(Ok(20_usize), |value| {
+                    usize::try_from(value).map_err(|_| {
+                        JlinkError::new(
+                            ErrorCode::ValueInvalid,
+                            "symbols.limit 超出平台 usize 范围",
+                            false,
+                        )
+                    })
+                })?;
+        let index = self.symbol_cache.load_path(&elf_path.value)?;
+        let symbols = index.search(query, limit)?;
+        Ok(ToolCall::success(json!({ "symbols": symbols })))
+    }
+
     fn ensure_attachment(&mut self, resolved: &ResolvedConfig) -> Result<(), JlinkError> {
         if self.attachment.is_some() {
             return Ok(());
@@ -258,12 +307,13 @@ impl Runtime {
 
 impl ToolDispatcher for Runtime {
     fn call(&mut self, name: &str, arguments: &Value) -> ToolCall {
-        if name == "jlink_target" {
-            return self.call_target(arguments).unwrap_or_else(ToolCall::Error);
+        match name {
+            "jlink_target" => self.call_target(arguments).unwrap_or_else(ToolCall::Error),
+            "jlink_inspect" => self.call_inspect(arguments),
+            _ => ToolCall::Unavailable(format!(
+                "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
+            )),
         }
-        ToolCall::Unavailable(format!(
-            "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
-        ))
     }
 
     fn read_resource(&mut self, uri: &str) -> ToolCall {

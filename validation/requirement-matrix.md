@@ -48,11 +48,11 @@ public contract and is recorded in the implementation constraints.
 | SES-006 | T-P1-SES | `validation/p1-ses.md` hardware diagnostics | F0-A |
 | ART-001 | T-P2-IMG | Image-format fixture | F0-C ELF fixture |
 | ART-002 | T-P2-IMG | ELF fixture + target Flash | F0-A + F0-C |
-| ART-003 | T-P2-DWARF | IAR DWARF fixture | F0-C |
+| ART-003 | T-P2-DWARF | `validation/p2-dwarf.md` IAR AccessPlan fixture | F0-C |
 | ART-004 | T-P2-VALUE | IAR DWARF/value fixture | F0-C |
-| ART-005 | T-P2-DWARF | DWARF rejection fixture | F0-C |
+| ART-005 | T-P2-DWARF | `validation/p2-dwarf.md` dynamic/pointer rejection | F0-C |
 | ART-006 | T-P2-VALUE | Value round-trip fixture | F0-C |
-| ART-007 | T-P2-DWARF | Compiler compatibility fixture | F0-C |
+| ART-007 | T-P2-DWARF | `validation/p2-dwarf.md` IAR compatibility evidence | F0-C |
 | PRG-001 | T-P2-PRG | J-Link hardware | F0-A |
 | PRG-002 | T-P2-PRG | Contract + J-Link hardware | F0-A |
 | PRG-003 | T-P2-PRG | J-Link hardware | F0-A |
@@ -66,7 +66,7 @@ public contract and is recorded in the implementation constraints.
 | DBG-005 | T-P2-CTL | J-Link hardware | F0-A |
 | DBG-006 | T-P2-MEM | Contract + J-Link hardware | F0-A |
 | DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
-| DBG-008 | T-P2-DWARF | IAR DWARF fixture | F0-C |
+| DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
 | HSSA-001 | T-P3-START | Contract + J-Link hardware | F0-A |
 | HSSA-002 | T-P3-START | IAR fixture + J-Link hardware | F0-A + F0-C |
 | HSSA-003 | T-P3-START | J-Link hardware diagnostics | F0-A |

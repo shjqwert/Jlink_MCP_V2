@@ -253,6 +253,10 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::ValueInvalid => "VALUE_INVALID",
         ErrorCode::FirmwareIdentityUnknown => "FIRMWARE_IDENTITY_UNKNOWN",
         ErrorCode::FirmwareElfMismatch => "FIRMWARE_ELF_MISMATCH",
+        ErrorCode::SymbolNotFound => "SYMBOL_NOT_FOUND",
+        ErrorCode::SymbolAmbiguous => "SYMBOL_AMBIGUOUS",
+        ErrorCode::TypeUnsupported => "TYPE_UNSUPPORTED",
+        ErrorCode::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
