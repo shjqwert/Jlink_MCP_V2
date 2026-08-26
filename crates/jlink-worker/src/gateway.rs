@@ -11,8 +11,9 @@ use std::{
 };
 
 use jlink_domain::{
-    ErrorCode, FaultDiagnostics, JlinkError, TargetConnectionSpec, TargetInterface, TargetState,
-    ValidationCheck, ValidationCheckKind, ValidationReport,
+    ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion, JlinkError, ProgramAfter,
+    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckKind,
+    ValidationReport,
 };
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, GetLastError, HMODULE},
@@ -35,6 +36,9 @@ const DEMCR: u32 = 0xE000_EDFC;
 const DEMCR_VC_HARDERR: u32 = 1 << 10;
 #[cfg(test)]
 const TEST_HARDFAULT_PC: u32 = 0xE000_0000;
+const DEVICE_AREA_COUNT: usize = 32;
+const PROGRAM_CHUNK_BYTES: usize = 64 * 1024;
+const PROGRAM_CHUNK_BYTES_U64: u64 = 64 * 1024;
 
 type OpenFn = unsafe extern "C" fn() -> i32;
 type CloseFn = unsafe extern "C" fn();
@@ -48,6 +52,13 @@ type GetI32Fn = unsafe extern "C" fn() -> i32;
 type VoidFn = unsafe extern "C" fn();
 type ReadRegFn = unsafe extern "C" fn(i32) -> u32;
 type ReadMemU32Fn = unsafe extern "C" fn(u32, u32, *mut u32, *mut u8) -> i32;
+type ReadMemFn = unsafe extern "C" fn(u32, u32, *mut u8) -> i32;
+type WriteMemFn = unsafe extern "C" fn(u32, u32, *const u8) -> i32;
+type DeviceGetIndexFn = unsafe extern "C" fn(*const c_char) -> i32;
+type DeviceGetInfoFn = unsafe extern "C" fn(i32, *mut DeviceInfo) -> i32;
+type BeginDownloadFn = unsafe extern "C" fn(u32);
+type EndDownloadFn = unsafe extern "C" fn() -> i32;
+type EraseChipFn = unsafe extern "C" fn() -> i32;
 #[cfg(test)]
 type WriteRegFn = unsafe extern "C" fn(i32, u32) -> u8;
 #[cfg(test)]
@@ -61,6 +72,50 @@ struct HssCaps {
     max_frequency_hz: u32,
     flags: u32,
     reserved: [u32; 5],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DeviceArea {
+    address: u32,
+    size: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct DeviceInfo {
+    size_of_struct: u32,
+    name: *const c_char,
+    core_id: u32,
+    flash_address: u32,
+    ram_address: u32,
+    endian_mode: u8,
+    flash_size: u32,
+    ram_size: u32,
+    manufacturer: *const c_char,
+    flash_areas: [DeviceArea; DEVICE_AREA_COUNT],
+    ram_areas: [DeviceArea; DEVICE_AREA_COUNT],
+    core: u32,
+}
+
+impl Default for DeviceInfo {
+    fn default() -> Self {
+        Self {
+            size_of_struct: u32::try_from(mem::size_of::<Self>())
+                .expect("J-Link device info ABI fits u32"),
+            name: ptr::null(),
+            core_id: 0,
+            flash_address: 0,
+            ram_address: 0,
+            endian_mode: 0,
+            flash_size: 0,
+            ram_size: 0,
+            manufacturer: ptr::null(),
+            flash_areas: [DeviceArea::default(); DEVICE_AREA_COUNT],
+            ram_areas: [DeviceArea::default(); DEVICE_AREA_COUNT],
+            core: 0,
+        }
+    }
 }
 
 struct Api {
@@ -80,7 +135,14 @@ struct Api {
     go: VoidFn,
     reset: VoidFn,
     read_reg: ReadRegFn,
+    read_mem: ReadMemFn,
     read_mem_u32: ReadMemU32Fn,
+    write_mem: WriteMemFn,
+    device_get_index: DeviceGetIndexFn,
+    device_get_info: DeviceGetInfoFn,
+    begin_download: BeginDownloadFn,
+    end_download: EndDownloadFn,
+    erase_chip: EraseChipFn,
     #[cfg(test)]
     write_reg: WriteRegFn,
     #[cfg(test)]
@@ -107,7 +169,14 @@ impl Api {
             go: load_symbol(module, b"JLINKARM_Go\0")?,
             reset: load_symbol(module, b"JLINKARM_Reset\0")?,
             read_reg: load_symbol(module, b"JLINKARM_ReadReg\0")?,
+            read_mem: load_symbol(module, b"JLINKARM_ReadMem\0")?,
             read_mem_u32: load_symbol(module, b"JLINKARM_ReadMemU32\0")?,
+            write_mem: load_symbol(module, b"JLINKARM_WriteMem\0")?,
+            device_get_index: load_symbol(module, b"JLINKARM_DEVICE_GetIndex\0")?,
+            device_get_info: load_symbol(module, b"JLINKARM_DEVICE_GetInfo\0")?,
+            begin_download: load_symbol(module, b"JLINKARM_BeginDownload\0")?,
+            end_download: load_symbol(module, b"JLINKARM_EndDownload\0")?,
+            erase_chip: load_symbol(module, b"JLINK_EraseChip\0")?,
             #[cfg(test)]
             write_reg: load_symbol(module, b"JLINKARM_WriteReg\0")?,
             #[cfg(test)]
@@ -200,6 +269,229 @@ impl DllGateway {
     /// Reports whether this gateway currently owns a loaded module.
     pub(crate) const fn is_loaded(&self) -> bool {
         !self.module.is_null()
+    }
+
+    /// Reads authoritative Flash regions from the loaded J-Link device database.
+    ///
+    /// This call does not open a probe or access the target. The returned ranges
+    /// are therefore suitable for completing all boundary checks before a Flash
+    /// side effect begins.
+    pub(crate) fn device_flash_regions(
+        &mut self,
+        device: &str,
+    ) -> Result<Vec<FlashRegion>, JlinkError> {
+        let device = CString::new(device).map_err(|_| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "target.device 包含 NUL 字符",
+                false,
+            )
+        })?;
+        // SAFETY: `device` is NUL-terminated and this no-target DLL call is
+        // serialized by the unique gateway.
+        let index = unsafe { (self.api.device_get_index)(device.as_ptr()) };
+        if index < 0 {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "J-Link 设备数据库中不存在配置的 target.device",
+                false,
+            ));
+        }
+        let mut info = DeviceInfo::default();
+        // SAFETY: the size-versioned structure matches the frozen x64 ABI and
+        // remains writable for the synchronous call.
+        let result = unsafe { (self.api.device_get_info)(index, &raw mut info) };
+        if result != 0 {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                format!("JLINKARM_DEVICE_GetInfo 返回 {result}"),
+                false,
+            ));
+        }
+        let regions = info
+            .flash_areas
+            .iter()
+            .take_while(|area| area.size != 0)
+            .map(|area| FlashRegion::new(u64::from(area.address), u64::from(area.size)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if regions.is_empty() {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "J-Link 设备数据库没有提供可验证的 Flash 区域",
+                false,
+            ));
+        }
+        Ok(regions)
+    }
+
+    /// Programs every normalized image segment through J-Link's device algorithm.
+    ///
+    /// The caller must validate all segments against [`Self::device_flash_regions`]
+    /// before invoking this method. Any failure after `BeginDownload` is reported
+    /// as execution-uncertain because target side effects may already exist.
+    pub(crate) fn program_image(&mut self, image: &FirmwareImage) -> Result<(), JlinkError> {
+        // SAFETY: the connected target is uniquely owned and flags=0 selects the
+        // frozen default download behavior.
+        unsafe { (self.api.begin_download)(0) };
+        let write_result = image
+            .segments()
+            .iter()
+            .try_for_each(|segment| self.write_download_bytes(segment.address(), segment.data()));
+        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
+        let end_result = unsafe { (self.api.end_download)() };
+        match (write_result, end_result) {
+            (Ok(()), value) if value >= 0 => Ok(()),
+            (Err(error), value) => Err(execution_uncertain_error(format!(
+                "Flash 写入未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
+            ))),
+            (Ok(()), value) => Err(execution_uncertain_error(format!(
+                "JLINKARM_EndDownload 返回 {value}"
+            ))),
+        }
+    }
+
+    /// Erases all always-present device Flash banks through the J-Link algorithm.
+    pub(crate) fn erase_chip(&mut self) -> Result<(), JlinkError> {
+        // SAFETY: the connected target is uniquely owned by this gateway.
+        let result = unsafe { (self.api.erase_chip)() };
+        if result < 0 {
+            return Err(execution_uncertain_error(format!(
+                "JLINK_EraseChip 返回 {result}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Erases one validated byte range using J-Link's Flash read-modify-write path.
+    ///
+    /// Writing erased bytes within a download transaction delegates sector erase
+    /// and preservation of bytes outside the requested range to the selected
+    /// device algorithm. Hardware evidence must confirm this behavior for each
+    /// frozen DLL/device fingerprint before release.
+    pub(crate) fn erase_range(&mut self, address: u64, length: u64) -> Result<(), JlinkError> {
+        // SAFETY: the connected target is uniquely owned and flags=0 selects the
+        // frozen default download behavior.
+        unsafe { (self.api.begin_download)(0) };
+        let erased = vec![0xff_u8; PROGRAM_CHUNK_BYTES];
+        let mut remaining = length;
+        let mut current = address;
+        let write_result: Result<(), JlinkError> = (|| {
+            while remaining > 0 {
+                let count = usize::try_from(remaining.min(PROGRAM_CHUNK_BYTES_U64))
+                    .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 usize"))?;
+                self.write_download_bytes(current, &erased[..count])?;
+                let count = u64::try_from(count)
+                    .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 u64"))?;
+                current = current
+                    .checked_add(count)
+                    .ok_or_else(|| execution_uncertain_error("范围擦除地址溢出"))?;
+                remaining -= count;
+            }
+            Ok(())
+        })();
+        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
+        let end_result = unsafe { (self.api.end_download)() };
+        match (write_result, end_result) {
+            (Ok(()), value) if value >= 0 => Ok(()),
+            (Err(error), value) => Err(execution_uncertain_error(format!(
+                "范围擦除未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
+            ))),
+            (Ok(()), value) => Err(execution_uncertain_error(format!(
+                "范围擦除的 JLINKARM_EndDownload 返回 {value}"
+            ))),
+        }
+    }
+
+    /// Reads one complete target range for verification without truncation.
+    pub(crate) fn read_bytes(
+        &mut self,
+        address: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, JlinkError> {
+        let mut output = vec![0_u8; length];
+        let mut offset = 0_usize;
+        while offset < length {
+            let count = (length - offset).min(PROGRAM_CHUNK_BYTES);
+            let offset_u64 = u64::try_from(offset).map_err(|_| {
+                JlinkError::new(ErrorCode::ValueInvalid, "校验读取偏移无法表示", false)
+            })?;
+            let current = address.checked_add(offset_u64).ok_or_else(|| {
+                JlinkError::new(ErrorCode::ValueInvalid, "校验读取地址溢出", false)
+            })?;
+            let current = u32::try_from(current).map_err(|_| {
+                JlinkError::new(
+                    ErrorCode::FlashRangeInvalid,
+                    "校验读取地址超出 Cortex-M 地址范围",
+                    false,
+                )
+            })?;
+            let count_u32 = u32::try_from(count).expect("fixed read chunk fits u32");
+            // SAFETY: the output slice is writable for `count` bytes and the
+            // connected target is uniquely owned by this gateway.
+            let result =
+                unsafe { (self.api.read_mem)(current, count_u32, output[offset..].as_mut_ptr()) };
+            if result != i32::try_from(count).expect("fixed read chunk fits i32") {
+                return Err(JlinkError::new(
+                    ErrorCode::TargetConnectFailed,
+                    format!("JLINKARM_ReadMem(0x{current:08X}, {count}) 返回 {result}"),
+                    true,
+                ));
+            }
+            offset += count;
+        }
+        Ok(output)
+    }
+
+    /// Applies the explicit successful post-program target state.
+    pub(crate) fn apply_program_after(
+        &mut self,
+        after: ProgramAfter,
+    ) -> Result<TargetState, JlinkError> {
+        let (actual, expected) = match after {
+            ProgramAfter::None => (self.observe_target_state()?, None),
+            ProgramAfter::ResetHalt => {
+                // SAFETY: reset and halt are serialized through the unique gateway.
+                unsafe {
+                    (self.api.reset)();
+                    (self.api.halt)();
+                }
+                self.wait_until_halted()?;
+                (self.observe_target_state()?, Some(TargetState::Halted))
+            }
+            ProgramAfter::ResetRun => (self.reset_run_and_observe()?, Some(TargetState::Running)),
+        };
+        if expected.is_some_and(|expected| actual != expected) {
+            return Err(target_recovery_error(format!(
+                "烧录后状态不符合请求：after={after:?}，实际={actual:?}"
+            )));
+        }
+        Ok(actual)
+    }
+
+    fn write_download_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
+            let offset_u64 = u64::try_from(offset)
+                .map_err(|_| execution_uncertain_error("Flash 写入偏移无法表示"))?;
+            let current = address
+                .checked_add(offset_u64)
+                .ok_or_else(|| execution_uncertain_error("Flash 写入地址溢出"))?;
+            let current = u32::try_from(current)
+                .map_err(|_| execution_uncertain_error("Flash 写入地址超出 u32"))?;
+            let count_u32 = u32::try_from(count).expect("fixed write chunk fits u32");
+            // SAFETY: the input slice is readable for `count` bytes and the
+            // download transaction is uniquely owned by this gateway.
+            let result =
+                unsafe { (self.api.write_mem)(current, count_u32, bytes[offset..].as_ptr()) };
+            if result != i32::try_from(count).expect("fixed write chunk fits i32") {
+                return Err(execution_uncertain_error(format!(
+                    "JLINKARM_WriteMem(0x{current:08X}, {count}) 返回 {result}"
+                )));
+            }
+            offset += count;
+        }
+        Ok(())
     }
 
     /// Opens the configured probe and target without applying recovery policy.
@@ -691,7 +983,52 @@ fn target_recovery_error(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::TargetRecoveryFailed, message, false)
 }
 
+fn execution_uncertain_error(message: impl Into<String>) -> JlinkError {
+    JlinkError::new(ErrorCode::ExecutionUncertain, message, false)
+}
+
 #[cfg(test)]
 fn test_injection_error(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::TargetRecoveryFailed, message, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{env, path::PathBuf};
+
+    use jlink_domain::FlashRegion;
+
+    use super::{DeviceInfo, DllGateway};
+
+    #[test]
+    fn frozen_x64_device_info_prefix_is_568_bytes() {
+        assert_eq!(std::mem::size_of::<DeviceInfo>(), 568);
+    }
+
+    #[test]
+    #[ignore = "requires the explicitly fingerprinted J-Link 6.98a DLL"]
+    fn frozen_dll_reports_non_empty_device_flash_regions() {
+        let path = PathBuf::from(
+            env::var("JLINK_MCP_T_P2_PRG_DLL")
+                .expect("JLINK_MCP_T_P2_PRG_DLL must name the frozen DLL"),
+        );
+        let device = env::var("JLINK_MCP_T_P2_PRG_DEVICE")
+            .expect("JLINK_MCP_T_P2_PRG_DEVICE must name the configured device");
+        let mut gateway = DllGateway::load(&path).expect("load frozen DLL");
+        let regions = gateway
+            .device_flash_regions(&device)
+            .expect("device Flash regions");
+        println!("device={device}; regions={regions:?}");
+        assert!(!regions.is_empty());
+        assert!(regions.iter().all(|region| region.length() > 0));
+        if device == "S32K144" {
+            assert_eq!(
+                regions,
+                [
+                    FlashRegion::new(0x0000_0000, 0x0008_0000).expect("program Flash"),
+                    FlashRegion::new(0x1000_0000, 0x0001_0000).expect("data Flash"),
+                ]
+            );
+        }
+    }
 }

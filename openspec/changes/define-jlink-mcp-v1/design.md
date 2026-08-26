@@ -92,6 +92,8 @@ Worker 使用探针身份派生的跨进程租约和可发现端点。MCP 启动
 
 断开状态的显式 validate 无法根据器件初始化后的状态可靠恢复建连前的运行意图，因此必须要求 `after: run | halt`。临时会话先复用 SES-003 的唯一恢复流程，再显式收口到请求状态，并报告最终状态和恢复通知；不得建立第二套恢复规则。活动连接中的 validate 不接受 `after`，只观察当前会话且不改变状态。两种模式都不得把临时建连后的 halted 状态表述为建连前事实。
 
+Flash 边界不得硬编码为当前 S32K144 地址。Worker 先通过冻结 DLL 的 `JLINKARM_DEVICE_GetIndex/GetInfo` 读取器件数据库 Flash 区域，镜像段和范围擦除请求必须在首个目标副作用前完整通过 `jlink-domain` 的统一半开区间校验；器件不存在、区域为空或跨区时停止，不从 IAR 文件名、芯片常识或测试地址兜底。整片擦除使用 `JLINK_EraseChip`；范围擦除使用同一器件算法的 `BeginDownload → WriteMem(0xFF) → EndDownload` read-modify-write 路线，只允许在 3.7 真机证明请求区间擦除、相邻字节保留和目标最终状态后形成硬件能力证据，失败时不得改用普通 RAM 写入或 Commander fallback。只有完整写入、所请求的校验和显式 `after` 全部成功才返回空成功；失败路径不隐式 reset/run。Flash 修改只使固件/验证缓存失效，不丢失持续到 disconnect 的活动目标配置身份，因此同一连接仍可执行后续独立 verify 或再次烧录。
+
 ### 6. 符号解析生成不可变访问计划
 
 `jlink-mcp` 在设备操作前加载 ELF/DWARF，通过 `jlink-domain` 生成包含 ELF 身份、静态地址、大小、类型、成员偏移、位域和数组布局的 `AccessPlan`。Worker 验证计划指纹和当前目标固件身份后执行，不自行重新解释变量名。

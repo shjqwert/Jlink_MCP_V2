@@ -63,6 +63,7 @@ pub(crate) struct TargetSessionManager {
     target_state: TargetState,
     target_id: Option<u32>,
     hss_active: bool,
+    active_target: Option<TargetConnectionSpec>,
     validation_key: Option<TargetConnectionSpec>,
     validation_runs: u64,
     recovery_notifications: Vec<RecoveryNotification>,
@@ -76,6 +77,7 @@ impl TargetSessionManager {
             target_state: TargetState::Unknown,
             target_id: None,
             hss_active: false,
+            active_target: None,
             validation_key: None,
             validation_runs: 0,
             recovery_notifications: Vec::new(),
@@ -96,6 +98,55 @@ impl TargetSessionManager {
             validation_runs: self.validation_runs,
             recovery_notifications: self.recovery_notifications.clone(),
         }
+    }
+
+    /// Rejects programming before any file, DLL, or target operation is attempted.
+    pub(crate) fn ensure_program_allowed(
+        &self,
+        spec: &TargetConnectionSpec,
+    ) -> Result<(), JlinkError> {
+        if self.hss_active {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动 HSS 期间不能执行 flash、erase 或 verify",
+                true,
+            ));
+        }
+        if self.connection_state != ConnectionState::Connected {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "jlink_program 要求已连接且已验证的目标会话",
+                true,
+            ));
+        }
+        if self.active_target.as_ref() != Some(spec) {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动连接与当前目标配置不一致，请先断开并重新连接",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records the actual final target state and invalidates Flash-derived caches.
+    pub(crate) fn record_program_result(&mut self, state: TargetState, flash_modified: bool) {
+        self.target_state = state;
+        if flash_modified {
+            self.invalidate_validation(ValidationInvalidation::FlashModified);
+        }
+    }
+
+    /// Marks the active connection untrusted after an indeterminate Flash side effect.
+    pub(crate) fn record_program_uncertain(&mut self) -> Result<(), JlinkError> {
+        self.connection_state =
+            transition_session(self.connection_state, SessionEvent::WorkerLost)?;
+        self.target_state = TargetState::Unknown;
+        self.target_id = None;
+        self.active_target = None;
+        self.recovery_notifications.clear();
+        self.invalidate_validation(ValidationInvalidation::FlashModified);
+        Ok(())
     }
 
     pub(crate) fn connect(
@@ -150,6 +201,7 @@ impl TargetSessionManager {
         }
         self.target_state = report.target_state;
         self.target_id = Some(observation.target_id);
+        self.active_target = Some(spec.clone());
         self.validation_key = Some(spec.clone());
         self.last_invalidation = None;
         self.connection_state = transition_session(self.connection_state, SessionEvent::Connected)?;
@@ -173,7 +225,7 @@ impl TargetSessionManager {
         }
         match validation_mode(self.connection_state, after)? {
             ValidationMode::Observe => {
-                if self.validation_key.as_ref() != Some(spec) {
+                if self.active_target.as_ref() != Some(spec) {
                     return Err(JlinkError::new(
                         ErrorCode::OperationConflict,
                         "活动连接的配置与显式验证请求不同，请先断开",
@@ -253,13 +305,17 @@ impl TargetSessionManager {
 
     pub(crate) fn disconnect(&mut self, gateway: &mut DllGateway) -> Result<(), JlinkError> {
         ensure_disconnect_allowed(self.hss_active)?;
-        if self.connection_state == ConnectionState::Connected {
+        if matches!(
+            self.connection_state,
+            ConnectionState::Connected | ConnectionState::Faulted
+        ) {
             self.connection_state =
                 transition_session(self.connection_state, SessionEvent::DisconnectRequested)?;
         }
         gateway.close_target();
         self.target_state = TargetState::Unknown;
         self.target_id = None;
+        self.active_target = None;
         self.recovery_notifications.clear();
         self.invalidate_validation(ValidationInvalidation::ConnectionLost);
         Ok(())
@@ -471,6 +527,65 @@ mod tests {
                 .code,
             ErrorCode::OperationConflict
         );
+    }
+
+    #[test]
+    fn active_hss_rejects_programming_before_other_session_checks() {
+        let spec = TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let mut manager = TargetSessionManager::new();
+        manager.hss_active = true;
+        let error = manager
+            .ensure_program_allowed(&spec)
+            .expect_err("HSS conflict is immediate even while disconnected");
+        assert_eq!(error.code, ErrorCode::OperationConflict);
+        assert!(manager.hss_active);
+    }
+
+    #[test]
+    fn flash_result_invalidates_validation_and_uncertain_result_faults_session() {
+        let spec = TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let mut completed = TargetSessionManager::new();
+        completed.connection_state = ConnectionState::Connected;
+        completed.active_target = Some(spec.clone());
+        completed.validation_key = Some(spec.clone());
+        completed
+            .ensure_program_allowed(&spec)
+            .expect("connected validated session");
+        completed.record_program_result(TargetState::Halted, true);
+        assert_eq!(completed.target_state, TargetState::Halted);
+        assert!(completed.validation_key.is_none());
+        assert_eq!(
+            completed.last_invalidation,
+            Some(ValidationInvalidation::FlashModified)
+        );
+        completed
+            .ensure_program_allowed(&spec)
+            .expect("Flash invalidates cache without losing active target identity");
+
+        let mut uncertain = TargetSessionManager::new();
+        uncertain.connection_state = ConnectionState::Connected;
+        uncertain.active_target = Some(spec.clone());
+        uncertain.validation_key = Some(spec);
+        uncertain
+            .record_program_uncertain()
+            .expect("connected session becomes faulted");
+        assert_eq!(uncertain.connection_state, ConnectionState::Faulted);
+        assert_eq!(uncertain.target_state, TargetState::Unknown);
+        assert!(uncertain.validation_key.is_none());
     }
 
     #[test]

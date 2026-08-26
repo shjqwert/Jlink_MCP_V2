@@ -4,6 +4,7 @@ mod dwarf;
 mod error;
 mod image;
 mod ipc;
+mod program;
 mod session;
 mod state;
 mod typed_value;
@@ -20,6 +21,10 @@ pub use image::{
 pub use ipc::{
     IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, ProtocolVersion, RequestId, SessionCommand,
     WorkerStatus, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+};
+pub use program::{
+    FlashRange, FlashRegion, ProgramAfter, ProgramRequest, VerifyMismatch,
+    VerifyMismatchAccumulator, validate_flash_range, validate_image_flash_ranges,
 };
 pub use session::{
     FaultDiagnostics, RecoveryAction, RecoveryNotification, TargetConnectionSpec, ValidationAfter,

@@ -59,6 +59,10 @@ pub enum ErrorCode {
     DynamicLocationUnsupported,
     /// A flexible or dynamic-length array lacks one valid independent element slice.
     SliceRequired,
+    /// A Flash operation is empty, overflowing, or outside known device regions.
+    FlashRangeInvalid,
+    /// Target Flash readback differs from the requested image.
+    VerifyFailed,
 }
 
 impl ErrorCode {
@@ -92,6 +96,8 @@ impl ErrorCode {
             Self::TypeUnsupported => "TYPE_UNSUPPORTED",
             Self::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
             Self::SliceRequired => "SLICE_REQUIRED",
+            Self::FlashRangeInvalid => "FLASH_RANGE_INVALID",
+            Self::VerifyFailed => "VERIFY_FAILED",
         }
     }
 }

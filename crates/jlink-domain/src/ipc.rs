@@ -274,6 +274,12 @@ pub enum SessionCommand {
     Status,
     /// Perform an observational or explicitly finalized validation pass.
     Validate,
+    /// Program one image through the selected device Flash algorithm.
+    Flash,
+    /// Erase the whole device or one checked Flash range.
+    Erase,
+    /// Compare an image with target Flash without modifying it.
+    Verify,
 }
 
 impl SessionCommand {
@@ -281,8 +287,10 @@ impl SessionCommand {
     #[must_use]
     pub const fn execution_kind(self) -> ExecutionKind {
         match self {
-            Self::Status => ExecutionKind::ReadOnly,
-            Self::Connect | Self::Disconnect | Self::Validate => ExecutionKind::SideEffect,
+            Self::Status | Self::Verify => ExecutionKind::ReadOnly,
+            Self::Connect | Self::Disconnect | Self::Validate | Self::Flash | Self::Erase => {
+                ExecutionKind::SideEffect
+            }
         }
     }
 }
@@ -303,6 +311,9 @@ pub struct IpcRequest {
     /// Required final state for disconnected validation and forbidden otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<crate::ValidationAfter>,
+    /// Typed Flash operation payload required by flash, erase, and verify.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<crate::ProgramRequest>,
 }
 
 impl IpcRequest {
@@ -319,6 +330,7 @@ impl IpcRequest {
             command,
             target: None,
             after: None,
+            program: None,
         }
     }
 
@@ -333,6 +345,13 @@ impl IpcRequest {
     #[must_use]
     pub const fn with_validation_after(mut self, after: crate::ValidationAfter) -> Self {
         self.after = Some(after);
+        self
+    }
+
+    /// Attaches the typed Flash operation payload.
+    #[must_use]
+    pub fn with_program(mut self, program: crate::ProgramRequest) -> Self {
+        self.program = Some(program);
         self
     }
 }

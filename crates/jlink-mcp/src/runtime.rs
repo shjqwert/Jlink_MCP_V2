@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use jlink_domain::{
-    ConnectionState, ErrorCode, JlinkError, TargetConnectionSpec, TargetInterface, ValidationAfter,
+    ConnectionState, ErrorCode, FlashRange, JlinkError, ProgramAfter, ProgramRequest,
+    TargetConnectionSpec, TargetInterface, ValidationAfter,
 };
 use serde_json::{Map, Value, json};
 
@@ -241,6 +242,63 @@ impl Runtime {
         }
     }
 
+    fn call_program(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let resolved = self.resolve()?;
+        validate_dll_identity(&resolved.jlink)?;
+        self.ensure_attachment(&resolved)?;
+        let target = target_spec(&resolved)?;
+        let action = arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees program.action");
+        let request = match action {
+            "flash" => ProgramRequest::Flash {
+                image: program_image_path(arguments, &resolved)?,
+                base_address: optional_address(arguments, "base_address")?,
+                verify: arguments
+                    .get("verify")
+                    .is_none_or(|value| value.as_bool().expect("Schema boolean")),
+                after: program_after(arguments)?,
+            },
+            "erase" => ProgramRequest::Erase {
+                range: arguments
+                    .get("address")
+                    .map(|value| {
+                        let address = parse_address(
+                            value.as_str().expect("MCP Schema guarantees erase.address"),
+                            "address",
+                        )?;
+                        let length = arguments
+                            .get("length")
+                            .and_then(Value::as_u64)
+                            .expect("MCP Schema pairs erase.address and length");
+                        FlashRange::new(address, length)
+                    })
+                    .transpose()?,
+                after: program_after(arguments)?,
+            },
+            "verify" => ProgramRequest::Verify {
+                image: program_image_path(arguments, &resolved)?,
+                base_address: optional_address(arguments, "base_address")?,
+            },
+            _ => unreachable!("program action was validated against the closed catalog"),
+        };
+        let result = self
+            .attachment
+            .as_ref()
+            .expect("attachment was established")
+            .client
+            .program(&target, &request);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+        {
+            self.attachment = None;
+        }
+        result?;
+        Ok(ToolCall::success(json!({})))
+    }
+
     fn inspect_symbols(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let resolved = self.resolve()?;
         let elf_path = resolved.symbols.elf.ok_or_else(|| {
@@ -309,6 +367,7 @@ impl ToolDispatcher for Runtime {
     fn call(&mut self, name: &str, arguments: &Value) -> ToolCall {
         match name {
             "jlink_target" => self.call_target(arguments).unwrap_or_else(ToolCall::Error),
+            "jlink_program" => self.call_program(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_inspect" => self.call_inspect(arguments),
             _ => ToolCall::Unavailable(format!(
                 "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
@@ -339,6 +398,83 @@ fn target_spec(config: &ResolvedConfig) -> Result<TargetConnectionSpec, JlinkErr
         config.probe.serial.as_ref().map(|serial| serial.value),
         None,
     )
+}
+
+fn program_image_path(arguments: &Value, config: &ResolvedConfig) -> Result<PathBuf, JlinkError> {
+    let path = arguments
+        .get("image")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            config
+                .firmware
+                .image
+                .as_ref()
+                .map(|field| field.value.clone())
+        })
+        .ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "请求未提供 image，且 firmware.image 未配置",
+                false,
+            )
+        })?;
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    std::env::current_dir()
+        .map(|directory| directory.join(path))
+        .map_err(|error| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                format!("无法把固件镜像路径解析为绝对路径：{error}"),
+                false,
+            )
+        })
+}
+
+fn program_after(arguments: &Value) -> Result<ProgramAfter, JlinkError> {
+    match arguments.get("after").and_then(Value::as_str) {
+        Some("none") => Ok(ProgramAfter::None),
+        Some("reset_halt") => Ok(ProgramAfter::ResetHalt),
+        Some("reset_run") => Ok(ProgramAfter::ResetRun),
+        _ => Err(JlinkError::new(
+            ErrorCode::ValueInvalid,
+            "after 必须是 none、reset_halt 或 reset_run",
+            false,
+        )),
+    }
+}
+
+fn optional_address(arguments: &Value, name: &str) -> Result<Option<u64>, JlinkError> {
+    arguments
+        .get(name)
+        .map(|value| {
+            parse_address(
+                value
+                    .as_str()
+                    .expect("MCP Schema guarantees hexadecimal address"),
+                name,
+            )
+        })
+        .transpose()
+}
+
+fn parse_address(value: &str, name: &str) -> Result<u64, JlinkError> {
+    let digits = value.strip_prefix("0x").ok_or_else(|| {
+        JlinkError::new(
+            ErrorCode::ValueInvalid,
+            format!("{name} 必须是 0x 十六进制地址"),
+            false,
+        )
+    })?;
+    u64::from_str_radix(digits, 16).map_err(|_| {
+        JlinkError::new(
+            ErrorCode::ValueInvalid,
+            format!("{name} 超出 u64 地址范围"),
+            false,
+        )
+    })
 }
 
 fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {

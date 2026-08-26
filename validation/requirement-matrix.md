@@ -53,12 +53,12 @@ public contract and is recorded in the implementation constraints.
 | ART-005 | T-P2-DWARF | `validation/p2-dwarf.md` dynamic/pointer rejection | F0-C |
 | ART-006 | T-P2-VALUE | `validation/p2-value.md` 无损 Value round-trip fixture | F0-C |
 | ART-007 | T-P2-DWARF | `validation/p2-dwarf.md` IAR compatibility evidence | F0-C |
-| PRG-001 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-002 | T-P2-PRG | Contract + J-Link hardware | F0-A |
-| PRG-003 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-004 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-005 | T-P2-PRG | Contract + J-Link hardware | F0-A |
-| PRG-006 | T-P2-PRG | Active-capture hardware | F0-A |
+| PRG-001 | T-P2-PRG | `validation/p2-program.md` image/region unit + frozen DLL；3.7 hardware | F0-A |
+| PRG-002 | T-P2-PRG | `validation/p2-program.md` strict Schema/state fixture；3.7 hardware | F0-A |
+| PRG-003 | T-P2-PRG | `validation/p2-program.md` range/device-algorithm implementation；3.7 erase/preservation hardware | F0-A |
+| PRG-004 | T-P2-PRG | `validation/p2-program.md` compact mismatch fixture；3.7 readback hardware | F0-A |
+| PRG-005 | T-P2-PRG | `validation/p2-program.md` closed Schema/no-token contract；3.7 hardware | F0-A |
+| PRG-006 | T-P2-PRG | `validation/p2-program.md` HSS-first state fixture；3.7 active-capture hardware | F0-A |
 | DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验；3.5/3.7 增补 J-Link 执行证据 | F0-A + F0-C |
 | DBG-002 | T-P2-MEM | J-Link hardware | F0-A |
 | DBG-003 | T-P2-MEM | J-Link hardware | F0-A |

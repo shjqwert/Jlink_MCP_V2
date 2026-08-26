@@ -50,6 +50,17 @@ impl ToolDispatcher for ContractFixture {
             ("jlink_inspect", Some("symbols")) => {
                 ToolCall::success(json!({ "symbols": ["motor", "motor.speed"] }))
             }
+            ("jlink_program", Some("verify")) => ToolCall::Error(
+                JlinkError::new(ErrorCode::VerifyFailed, "target differs", false)
+                    .with_detail("first_address", json!("0x1000"))
+                    .with_detail("first_length", json!(4))
+                    .with_detail("total_regions", json!(2)),
+            ),
+            ("jlink_program", Some("flash")) => ToolCall::Error(JlinkError::new(
+                ErrorCode::FlashRangeInvalid,
+                "outside device Flash",
+                false,
+            )),
             ("jlink_hss", Some("query")) => ToolCall::with_raw_capture(
                 json!({
                     "capture_id": "cap_t_p1_mcp",
@@ -134,25 +145,6 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         })
     ));
 
-    let program = catalog
-        .iter()
-        .find(|tool| tool["name"] == "jlink_program")
-        .expect("program tool");
-    for request in [
-        json!({ "action": "flash", "image": "firmware.bin", "base_address": "0x0", "after": "reset_run" }),
-        json!({ "action": "verify", "image": "firmware.bin", "base_address": "0x10000" }),
-    ] {
-        assert!(jsonschema::is_valid(&program["inputSchema"], &request));
-    }
-    assert!(!jsonschema::is_valid(
-        &program["inputSchema"],
-        &json!({ "action": "erase", "base_address": "0x0", "after": "none" })
-    ));
-    assert!(!jsonschema::is_valid(
-        &program["inputSchema"],
-        &json!({ "action": "flash", "base_address": "0", "after": "none" })
-    ));
-
     let hss = catalog
         .iter()
         .find(|tool| tool["name"] == "jlink_hss")
@@ -176,6 +168,34 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         &hss["inputSchema"],
         &window_with_points
     ));
+}
+
+#[test]
+fn t_p2_prg_schema_requires_after_and_paired_erase_range() {
+    let catalog = tool_catalog();
+    let program = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_program")
+        .expect("program tool");
+    for request in [
+        json!({ "action": "flash", "image": "firmware.bin", "base_address": "0x0", "after": "reset_run" }),
+        json!({ "action": "verify", "image": "firmware.bin", "base_address": "0x10000" }),
+        json!({ "action": "erase", "after": "none" }),
+        json!({ "action": "erase", "address": "0x10000000", "length": 4096, "after": "reset_halt" }),
+    ] {
+        assert!(jsonschema::is_valid(&program["inputSchema"], &request));
+    }
+    for request in [
+        json!({ "action": "erase", "base_address": "0x0", "after": "none" }),
+        json!({ "action": "erase", "address": "0x10000000", "after": "none" }),
+        json!({ "action": "erase", "length": 4096, "after": "none" }),
+        json!({ "action": "flash", "image": "firmware.elf" }),
+        json!({ "action": "erase" }),
+        json!({ "action": "flash", "base_address": "0", "after": "none" }),
+        json!({ "action": "erase", "after": "none", "authorization": "bypass" }),
+    ] {
+        assert!(!jsonschema::is_valid(&program["inputSchema"], &request));
+    }
 }
 
 #[test]
@@ -263,6 +283,45 @@ fn t_p1_mcp_stdio_returns_minimal_results_and_public_errors() {
     assert_eq!(
         fixture.calls, 2,
         "invalid arguments must not reach dispatch"
+    );
+}
+
+#[test]
+fn t_p2_prg_returns_stable_boundary_and_compact_verify_errors() {
+    let requests = [
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "jlink_program",
+                "arguments": { "action": "flash", "image": "outside.elf", "after": "none" }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "jlink_program",
+                "arguments": { "action": "verify", "image": "mismatch.elf" }
+            }
+        }),
+    ];
+    let mut fixture = ContractFixture::default();
+    let responses = exchange(&requests, &mut fixture);
+    assert_eq!(
+        responses[0]["result"]["structuredContent"]["error"]["code"],
+        "FLASH_RANGE_INVALID"
+    );
+    let verify = &responses[1]["result"]["structuredContent"]["error"];
+    assert_eq!(verify["code"], "VERIFY_FAILED");
+    assert_eq!(verify["details"]["first_address"], "0x1000");
+    assert_eq!(verify["details"]["first_length"], 4);
+    assert_eq!(verify["details"]["total_regions"], 2);
+    assert_eq!(
+        verify["details"].as_object().map(serde_json::Map::len),
+        Some(3)
     );
 }
 
@@ -405,8 +464,8 @@ fn t_p1_mcp_runtime_keeps_future_actions_unavailable() {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "jlink_program",
-                "arguments": { "action": "flash", "after": "none" }
+                "name": "jlink_control",
+                "arguments": { "action": "halt" }
             }
         })],
         &mut runtime,

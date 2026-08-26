@@ -16,10 +16,11 @@ use std::{
 };
 
 use jlink_domain::{
-    ErrorCode, IpcRequest, IpcResponse, JlinkError, ProtocolVersion, RequestId, SessionCommand,
-    TargetConnectionSpec, ValidationAfter, ValidationReport, WorkerStatus, read_ipc_frame,
-    worker_endpoint_name, write_ipc_frame,
+    DispatchState, ErrorCode, IpcRequest, IpcResponse, JlinkError, ProgramRequest, ProtocolVersion,
+    RequestId, SessionCommand, TargetConnectionSpec, ValidationAfter, ValidationReport,
+    WorkerStatus, classify_worker_loss, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
 };
+use serde_json::json;
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{CreateFileW, OPEN_EXISTING},
@@ -92,7 +93,7 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn status(&self) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Status, None, None)?;
+        let response = self.request(SessionCommand::Status, None, None, None)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -111,7 +112,7 @@ impl WorkerClient {
     /// Returns a stable configuration, connection, recovery, validation, or
     /// transport error without selecting a different probe or interface.
     pub fn connect(&self, target: &TargetConnectionSpec) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Connect, Some(target), None)?;
+        let response = self.request(SessionCommand::Connect, Some(target), None, None)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -134,7 +135,7 @@ impl WorkerClient {
         target: &TargetConnectionSpec,
         after: Option<ValidationAfter>,
     ) -> Result<ValidationReport, JlinkError> {
-        let response = self.request(SessionCommand::Validate, Some(target), after)?;
+        let response = self.request(SessionCommand::Validate, Some(target), after, None)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -146,13 +147,40 @@ impl WorkerClient {
         })
     }
 
+    /// Executes one typed Flash request against the already connected target.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable boundary, conflict, target, verification, transport, or
+    /// execution-uncertain error. A successful response must be an empty object.
+    pub fn program(
+        &self,
+        target: &TargetConnectionSpec,
+        program: &ProgramRequest,
+    ) -> Result<(), JlinkError> {
+        let command = match program {
+            ProgramRequest::Flash { .. } => SessionCommand::Flash,
+            ProgramRequest::Erase { .. } => SessionCommand::Erase,
+            ProgramRequest::Verify { .. } => SessionCommand::Verify,
+        };
+        let value = response_result(self.request(command, Some(target), None, Some(program))?)?;
+        if value.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(JlinkError::new(
+                ErrorCode::IpcProtocolError,
+                "Worker 烧录响应必须是空对象",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     /// Requests a clean Worker exit after its current response is flushed.
     ///
     /// # Errors
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn disconnect(&self) -> Result<(), JlinkError> {
-        let value = response_result(self.request(SessionCommand::Disconnect, None, None)?)?;
+        let value = response_result(self.request(SessionCommand::Disconnect, None, None, None)?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -168,6 +196,7 @@ impl WorkerClient {
         command: SessionCommand,
         target: Option<&TargetConnectionSpec>,
         after: Option<ValidationAfter>,
+        program: Option<&ProgramRequest>,
     ) -> Result<IpcResponse, JlinkError> {
         let request_id = RequestId::new(format!(
             "{}-{}",
@@ -181,16 +210,24 @@ impl WorkerClient {
         if let Some(after) = after {
             request = request.with_validation_after(after);
         }
+        if let Some(program) = program {
+            request = request.with_program(program.clone());
+        }
         let mut pipe = open_pipe(&self.endpoint, 100)?;
-        write_ipc_frame(&mut pipe, &request)?;
-        let response: IpcResponse = read_ipc_frame(&mut pipe)?;
-        response.validate()?;
+        write_ipc_frame(&mut pipe, &request)
+            .map_err(|error| dispatched_request_error(command, &error))?;
+        let response: IpcResponse =
+            read_ipc_frame(&mut pipe).map_err(|error| dispatched_request_error(command, &error))?;
+        response
+            .validate()
+            .map_err(|error| dispatched_request_error(command, &error))?;
         if response.protocol_version != ProtocolVersion::V1 || response.request_id != request_id {
-            return Err(JlinkError::new(
+            let error = JlinkError::new(
                 ErrorCode::IpcProtocolError,
                 "Worker 响应版本或 request_id 与请求不一致",
                 false,
-            ));
+            );
+            return Err(dispatched_request_error(command, &error));
         }
         Ok(response)
     }
@@ -371,9 +408,17 @@ fn last_worker_error(context: &str) -> JlinkError {
     )
 }
 
+fn dispatched_request_error(command: SessionCommand, error: &JlinkError) -> JlinkError {
+    classify_worker_loss(command.execution_kind(), DispatchState::Dispatched)
+        .expect("dispatched operation has a stable worker-loss classification")
+        .with_detail("transport_error", json!(error.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::WorkerClient;
+    use jlink_domain::{ErrorCode, JlinkError, SessionCommand};
+
+    use super::{WorkerClient, dispatched_request_error};
 
     #[test]
     fn endpoint_is_stable_without_exposing_probe_identity() {
@@ -382,5 +427,16 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.endpoint().starts_with(r"\\.\pipe\jlink-mcp-v1-"));
         assert!(!first.endpoint().contains("260106173"));
+    }
+
+    #[test]
+    fn dispatched_side_effect_is_uncertain_but_verify_remains_retryable() {
+        let transport = || JlinkError::new(ErrorCode::IpcProtocolError, "pipe closed", false);
+        let flash = dispatched_request_error(SessionCommand::Flash, &transport());
+        assert_eq!(flash.code, ErrorCode::ExecutionUncertain);
+        assert!(!flash.retryable);
+        let verify = dispatched_request_error(SessionCommand::Verify, &transport());
+        assert_eq!(verify.code, ErrorCode::WorkerUnavailable);
+        assert!(verify.retryable);
     }
 }
