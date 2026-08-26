@@ -31,6 +31,12 @@ pub enum ErrorCode {
     DllVersionMismatch,
     /// The configured J-Link DLL has an unexpected SHA-256 digest.
     DllHashMismatch,
+    /// A local IPC frame is malformed or exceeds the frozen transport limit.
+    IpcProtocolError,
+    /// Another Worker currently owns the requested probe lease.
+    ProbeBusy,
+    /// Windows could not load the validated J-Link DLL into the Worker.
+    DllLoadFailed,
 }
 
 impl ErrorCode {
@@ -50,6 +56,9 @@ impl ErrorCode {
             Self::DllArchitectureMismatch => "DLL_ARCHITECTURE_MISMATCH",
             Self::DllVersionMismatch => "DLL_VERSION_MISMATCH",
             Self::DllHashMismatch => "DLL_HASH_MISMATCH",
+            Self::IpcProtocolError => "IPC_PROTOCOL_ERROR",
+            Self::ProbeBusy => "PROBE_BUSY",
+            Self::DllLoadFailed => "DLL_LOAD_FAILED",
         }
     }
 }

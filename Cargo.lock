@@ -135,6 +135,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -144,6 +145,7 @@ dependencies = [
  "jlink-capture",
  "jlink-domain",
  "serde",
+ "serde_json",
  "sha2",
  "tempfile",
  "toml",
@@ -156,6 +158,8 @@ version = "0.1.0"
 dependencies = [
  "jlink-capture",
  "jlink-domain",
+ "serde_json",
+ "windows-sys",
 ]
 
 [[package]]

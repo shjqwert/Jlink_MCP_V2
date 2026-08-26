@@ -9,6 +9,8 @@ version.workspace = true
 [dependencies]
 jlink-capture = { path = "../jlink-capture" }
 jlink-domain = { path = "../jlink-domain" }
+serde_json.workspace = true
+windows-sys.workspace = true
 
 [lints]
 workspace = true

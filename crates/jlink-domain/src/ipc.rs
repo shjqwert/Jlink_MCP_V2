@@ -1,10 +1,109 @@
-use std::{fmt, str::FromStr};
+use std::{
+    fmt,
+    io::{Read, Write},
+    str::FromStr,
+};
 
+use serde::de::DeserializeOwned;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{JlinkError, state::ExecutionKind};
+
+/// Maximum UTF-8 JSON payload carried by one local IPC frame.
+pub const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Returns the stable SHA-256 identity used by Worker endpoints and lease files.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCode::ConfigInvalid`] when the probe identity is blank.
+pub fn probe_identity_hash(identity: &str) -> Result<String, JlinkError> {
+    if identity.trim().is_empty() {
+        return Err(JlinkError::new(
+            crate::ErrorCode::ConfigInvalid,
+            "探针身份不能为空",
+            false,
+        ));
+    }
+    let digest = Sha256::digest(identity.as_bytes());
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    Ok(output)
+}
+
+/// Returns the stable local named-pipe endpoint for one probe identity.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCode::ConfigInvalid`] when the probe identity is blank.
+pub fn worker_endpoint_name(identity: &str) -> Result<String, JlinkError> {
+    Ok(format!(
+        r"\\.\pipe\jlink-mcp-v1-{}",
+        probe_identity_hash(identity)?
+    ))
+}
+
+/// Writes one length-prefixed UTF-8 JSON message to a byte-mode transport.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCode::IpcProtocolError`] when serialization fails, the
+/// payload exceeds [`MAX_IPC_FRAME_BYTES`], or the transport cannot accept the
+/// complete frame.
+pub fn write_ipc_frame<W: Write, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+) -> Result<(), JlinkError> {
+    let payload = serde_json::to_vec(message).map_err(ipc_protocol_error)?;
+    if payload.len() > MAX_IPC_FRAME_BYTES {
+        return Err(ipc_protocol_error(format!(
+            "IPC 负载超过 {MAX_IPC_FRAME_BYTES} 字节"
+        )));
+    }
+    let length = u32::try_from(payload.len())
+        .map_err(|_| ipc_protocol_error("IPC 负载长度无法表示为 u32"))?;
+    writer
+        .write_all(&length.to_le_bytes())
+        .and_then(|()| writer.write_all(&payload))
+        .map_err(ipc_protocol_error)
+}
+
+/// Reads one complete length-prefixed UTF-8 JSON message from a byte-mode transport.
+///
+/// # Errors
+///
+/// Returns [`crate::ErrorCode::IpcProtocolError`] for truncated, oversized,
+/// malformed, unknown-field, or unsupported-version messages.
+pub fn read_ipc_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, JlinkError> {
+    let mut prefix = [0_u8; 4];
+    reader.read_exact(&mut prefix).map_err(ipc_protocol_error)?;
+    let length = usize::try_from(u32::from_le_bytes(prefix))
+        .map_err(|_| ipc_protocol_error("IPC 负载长度不受支持"))?;
+    if length > MAX_IPC_FRAME_BYTES {
+        return Err(ipc_protocol_error(format!(
+            "IPC 负载超过 {MAX_IPC_FRAME_BYTES} 字节"
+        )));
+    }
+    let mut payload = vec![0_u8; length];
+    reader
+        .read_exact(&mut payload)
+        .map_err(ipc_protocol_error)?;
+    serde_json::from_slice(&payload).map_err(ipc_protocol_error)
+}
+
+fn ipc_protocol_error(error: impl fmt::Display) -> JlinkError {
+    JlinkError::new(
+        crate::ErrorCode::IpcProtocolError,
+        format!("无效 IPC 帧：{error}"),
+        false,
+    )
+}
 
 /// The only wire protocol version accepted by the V1 worker contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -230,6 +329,18 @@ pub struct IpcResponse {
     /// Stable command error, when present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<JlinkError>,
+}
+
+/// Read-only process identity returned by the Worker status command.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerStatus {
+    /// Operating-system process identifier of the authoritative Worker.
+    pub worker_pid: u32,
+    /// Stable hash used by the endpoint and probe lease without exposing the serial.
+    pub probe_identity_hash: String,
+    /// Whether the validated DLL is currently held by the unique gateway.
+    pub dll_loaded: bool,
 }
 
 impl IpcResponse {
