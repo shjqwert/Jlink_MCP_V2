@@ -27,21 +27,21 @@ public contract and is recorded in the implementation constraints.
 | MCP-001 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
 | MCP-002 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
 | MCP-003 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
-| MCP-004 | T-P1-DOM | Unit/contract fixture | None |
+| MCP-004 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | None |
 | MCP-005 | T-P1-MCP | `validation/p1-mcp.md` + Windows Codex | F0-D |
-| CFG-001 | T-P1-CFG | Local integration | None |
-| CFG-002 | T-P1-CFG | Local integration | None |
-| CFG-003 | T-P1-CFG | Local integration | None |
-| CFG-004 | T-P1-CFG | DLL identity fixture | F0-A identity |
-| CFG-005 | T-P1-CFG | Repository/config fixture | None |
-| RUN-001 | T-P1-IPC | Windows process integration | F0-B |
+| CFG-001 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-002 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-003 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-004 | T-P1-CFG | `validation/p1-stage.md` DLL identity fixture | F0-A identity |
+| CFG-005 | T-P1-CFG | `validation/p1-stage.md` repository/config fixture | None |
+| RUN-001 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
 | RUN-002 | T-P3-RUN | J-Link hardware timeline | F0-A |
-| RUN-003 | T-P1-IPC | Windows process integration | F0-B |
+| RUN-003 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
 | RUN-004 | T-P3-RECOVER | Windows process integration | F0-B |
-| RUN-005 | T-P1-DOM | Unit/contract fixture | F0-B fault model |
+| RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
 | RUN-006 | T-P3-ABI | J-Link hardware/DLL exports | F0-A |
-| SES-001 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A identity |
-| SES-002 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
+| SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A identity |
+| SES-002 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A |
 | SES-003 | T-P1-SES | `validation/p1-ses.md` hardware state recovery | F0-A |
 | SES-004 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
 | SES-005 | T-P1-SES | `validation/p1-ses.md` hardware + identity fixture | F0-A |

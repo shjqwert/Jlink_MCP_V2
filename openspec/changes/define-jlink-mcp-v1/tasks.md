@@ -15,7 +15,7 @@
 - [x] 2.4 实现 Windows 命名管道、Worker 启动/附着、探针租约和唯一 DLL gateway，并以主要测试 T-P1-IPC 覆盖 RUN-001、RUN-003
 - [x] 2.5 实现单活动目标的 connect/status/disconnect/validate、首次验证缓存和 halted/HardFault 恢复；断开态 validate 必须显式提供 `after: run | halt` 并复用唯一恢复流程后收口到请求状态，活动连接 validate 必须拒绝 `after` 且只观察当前会话；T-P1-SES 必须区分首次建连后的可观察状态与同一 Worker 会话内的真实 HardFault，并使用仅测试编译、无生产 IPC/MCP 入口且不修改 Flash/OUT 的注入器验证生产恢复状态机，覆盖 SES-001、SES-002、SES-003、SES-004、SES-005、SES-006
 - [x] 2.6 实现六工具目录、严格 action Schema、最小成功结果、结构化错误与资源占位合同，并以主要测试 T-P1-MCP 覆盖 MCP-001、MCP-002、MCP-003、MCP-005；稳定错误合同复用 T-P1-DOM 的主要断言
-- [ ] 2.7 运行 P1 受影响测试和一个 connect→status→disconnect smoke，更新验收矩阵证据，不重复运行 F0 客户端或硬件实验
+- [x] 2.7 运行 P1 受影响测试和一个 connect→status→disconnect smoke，更新验收矩阵证据，不重复运行 F0 客户端或硬件实验
 
 ## 3. P2 静态调试
 
