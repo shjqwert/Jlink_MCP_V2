@@ -1,0 +1,14 @@
+[package]
+name = "jlink-mcp"
+description = "Local stdio MCP server for J-Link MCP V2"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+jlink-capture = { path = "../jlink-capture" }
+jlink-domain = { path = "../jlink-domain" }
+
+[lints]
+workspace = true
