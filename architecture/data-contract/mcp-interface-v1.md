@@ -140,7 +140,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 或：
 
 ```json
-{ "notices": ["reset_after_resume_failure"] }
+{ "notices": ["reset_after_fault"] }
 ```
 
 ### 4.2 `disconnect`

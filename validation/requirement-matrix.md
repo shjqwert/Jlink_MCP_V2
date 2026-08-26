@@ -24,11 +24,11 @@ public contract and is recorded in the implementation constraints.
 
 | Requirement | Primary test | Evidence route | Phase 0 prerequisite |
 |---|---|---|---|
-| MCP-001 | T-P1-MCP | Local integration + target client | F0-D |
-| MCP-002 | T-P1-MCP | Local integration + target client | F0-D |
-| MCP-003 | T-P1-MCP | Local integration + target client | F0-D |
+| MCP-001 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
+| MCP-002 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
+| MCP-003 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
 | MCP-004 | T-P1-DOM | Unit/contract fixture | None |
-| MCP-005 | T-P1-MCP | Windows Codex | F0-D |
+| MCP-005 | T-P1-MCP | `validation/p1-mcp.md` + Windows Codex | F0-D |
 | CFG-001 | T-P1-CFG | Local integration | None |
 | CFG-002 | T-P1-CFG | Local integration | None |
 | CFG-003 | T-P1-CFG | Local integration | None |
