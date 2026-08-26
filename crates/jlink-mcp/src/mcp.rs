@@ -257,6 +257,7 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::SymbolAmbiguous => "SYMBOL_AMBIGUOUS",
         ErrorCode::TypeUnsupported => "TYPE_UNSUPPORTED",
         ErrorCode::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
+        ErrorCode::SliceRequired => "SLICE_REQUIRED",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
@@ -428,6 +429,7 @@ fn write_tool() -> Value {
             "variable",
             vec![
                 ("path", non_empty_string()),
+                ("slice", slice_schema()),
                 ("value", typed_value_schema()),
                 ("verify", verify.clone()),
             ],

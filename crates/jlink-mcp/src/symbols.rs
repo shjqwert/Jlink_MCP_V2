@@ -857,10 +857,17 @@ fn resolve_access_plan(
         (slice.layout, slice.byte_size)
     } else {
         let layout = layout_from_type(index, resolved.type_id, &mut BTreeSet::new())?;
-        let byte_size = resolved
+        let Some(byte_size) = resolved
             .selected_storage_size
             .or_else(|| layout.byte_size())
-            .ok_or_else(|| type_unsupported("柔性数组需要独立显式 slice"))?;
+        else {
+            if matches!(layout, AccessLayout::Array { count: None, .. }) {
+                return Err(slice_required("柔性数组需要独立显式 slice"));
+            }
+            return Err(type_unsupported(
+                "选中 aggregate 包含无界成员；请直接选择柔性数组成员并提供 slice",
+            ));
+        };
         (layout, byte_size)
     };
     Ok(AccessPlan::new(
@@ -973,7 +980,7 @@ fn apply_index_step(
         _ => return Err(type_unsupported("数组索引只能应用于数组")),
     };
     let Some(count) = count else {
-        return Err(type_unsupported("柔性数组不能用路径 [i] 替代独立 slice"));
+        return Err(slice_required("柔性数组不能用路径 [i] 替代独立 slice"));
     };
     if element_index >= count {
         return Err(value_invalid(format!(
@@ -1022,15 +1029,15 @@ fn resolve_slice(
     let byte_offset = slice
         .start()
         .checked_mul(element_size)
-        .ok_or_else(|| type_unsupported("slice offset 溢出"))?;
+        .ok_or_else(|| slice_range_error(bound, "slice offset 溢出"))?;
     let byte_size = slice
         .count()
         .checked_mul(element_size)
-        .ok_or_else(|| type_unsupported("slice byte size 溢出"))?;
+        .ok_or_else(|| slice_range_error(bound, "slice byte size 溢出"))?;
     Ok(ResolvedSlice {
         address: address
             .checked_add(byte_offset)
-            .ok_or_else(|| type_unsupported("slice 地址溢出"))?,
+            .ok_or_else(|| slice_range_error(bound, "slice 地址溢出"))?,
         byte_size,
         layout: AccessLayout::Array {
             element: Box::new(element_layout),
@@ -1092,7 +1099,7 @@ fn type_size(index: &DwarfIndex, type_id: TypeId) -> Result<u64, JlinkError> {
             .checked_mul(type_size(index, *element)?)
             .ok_or_else(|| type_unsupported("数组 byte size 溢出")),
         Some(TypeNode::Array { count: None, .. }) => {
-            Err(type_unsupported("柔性数组需要独立显式 slice"))
+            Err(slice_required("柔性数组需要独立显式 slice"))
         }
         Some(TypeNode::Typedef { .. } | TypeNode::Qualifier { .. }) => unreachable!(),
         None => Err(type_unsupported(format!("DWARF type {type_id:#x} 不存在"))),
@@ -1356,6 +1363,18 @@ fn validate_dwarf_versions(versions: &BTreeSet<u16>) -> Result<(), JlinkError> {
     Ok(())
 }
 
+fn slice_required(message: impl Into<String>) -> JlinkError {
+    JlinkError::new(ErrorCode::SliceRequired, message, false)
+}
+
+fn slice_range_error(bound: Option<u64>, message: impl Into<String>) -> JlinkError {
+    if bound.is_none() {
+        slice_required(message)
+    } else {
+        value_invalid(message)
+    }
+}
+
 fn value_invalid(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::ValueInvalid, message, false)
 }
@@ -1520,5 +1539,34 @@ mod tests {
         assert_eq!(plan.address(), 0x2000_0000);
         assert_eq!(plan.byte_size(), 1);
         assert_eq!(plan.bit_range(), Some(BitRange::new(0, 3)));
+    }
+
+    #[test]
+    fn t_p2_value_reports_unbounded_slice_byte_overflow() {
+        let index = DwarfIndex {
+            types: BTreeMap::from([
+                (
+                    1,
+                    TypeNode::Base {
+                        name: "uint16_t".to_owned(),
+                        byte_size: 2,
+                        encoding: ScalarEncoding::Unsigned,
+                    },
+                ),
+                (
+                    2,
+                    TypeNode::Array {
+                        element: 1,
+                        count: None,
+                    },
+                ),
+            ]),
+            ..DwarfIndex::default()
+        };
+        let slice = ElementSlice::new(0, 1_u64 << 63).expect("valid element range");
+        let error = resolve_slice(&index, 2, 0x2000_0000, slice)
+            .err()
+            .expect("byte range overflows even though element range is valid");
+        assert_eq!(error.code(), ErrorCode::SliceRequired);
     }
 }

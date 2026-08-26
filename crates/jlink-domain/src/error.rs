@@ -57,6 +57,8 @@ pub enum ErrorCode {
     TypeUnsupported,
     /// The selected variable requires a location expression that cannot be fixed statically.
     DynamicLocationUnsupported,
+    /// A flexible or dynamic-length array lacks one valid independent element slice.
+    SliceRequired,
 }
 
 impl ErrorCode {
@@ -89,6 +91,7 @@ impl ErrorCode {
             Self::SymbolAmbiguous => "SYMBOL_AMBIGUOUS",
             Self::TypeUnsupported => "TYPE_UNSUPPORTED",
             Self::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
+            Self::SliceRequired => "SLICE_REQUIRED",
         }
     }
 }

@@ -18,14 +18,14 @@ impl ElementSlice {
     ///
     /// # Errors
     ///
-    /// Returns [`ErrorCode::ValueInvalid`] when `count` is zero or the range overflows.
+    /// Returns [`ErrorCode::SliceRequired`] when `count` is zero or the range overflows.
     pub fn new(start: u64, count: u64) -> Result<Self, JlinkError> {
         if count == 0 {
-            return Err(value_invalid("slice.count 必须大于 0"));
+            return Err(slice_required("slice.count 必须大于 0"));
         }
         start
             .checked_add(count)
-            .ok_or_else(|| value_invalid("slice 的元素范围溢出"))?;
+            .ok_or_else(|| slice_required("slice 的元素范围溢出"))?;
         Ok(Self { start, count })
     }
 
@@ -194,6 +194,24 @@ impl AccessMember {
     #[must_use]
     pub const fn layout(&self) -> &AccessLayout {
         &self.layout
+    }
+
+    /// Returns the DWARF storage-unit size used by a bit-field member.
+    #[must_use]
+    pub const fn storage_size(&self) -> Option<u64> {
+        self.storage_size
+    }
+
+    /// Returns the DWARF v4 most-significant-bit offset for a bit-field member.
+    #[must_use]
+    pub const fn dwarf_bit_offset(&self) -> Option<u64> {
+        self.dwarf_bit_offset
+    }
+
+    /// Returns the logical bit width for a bit-field member.
+    #[must_use]
+    pub const fn bit_size(&self) -> Option<u64> {
+        self.bit_size
     }
 }
 
@@ -431,4 +449,8 @@ fn parse_identifier(path: &str, start: usize) -> Result<(String, usize), JlinkEr
 
 fn value_invalid(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::ValueInvalid, message, false)
+}
+
+fn slice_required(message: impl Into<String>) -> JlinkError {
+    JlinkError::new(ErrorCode::SliceRequired, message, false)
 }

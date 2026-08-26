@@ -6,6 +6,7 @@ mod image;
 mod ipc;
 mod session;
 mod state;
+mod typed_value;
 
 pub use dwarf::{
     ACCESS_PLAN_FORMAT_VERSION, AccessLayout, AccessMember, AccessPlan, BitRange, ElementSlice,
@@ -29,3 +30,4 @@ pub use state::{
     ConnectionState, DispatchState, ExecutionKind, SessionEvent, TargetInterface, TargetState,
     classify_worker_loss, transition_session,
 };
+pub use typed_value::{decode_typed_value, encode_typed_value};
