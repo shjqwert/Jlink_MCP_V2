@@ -19,6 +19,18 @@ pub enum ErrorCode {
     ExecutionUncertain,
     /// A response contains an invalid combination of result and error fields.
     InvalidResponse,
+    /// Configuration data is missing, malformed, or outside the supported range.
+    ConfigInvalid,
+    /// The requested configuration change conflicts with active session state.
+    OperationConflict,
+    /// The configured J-Link DLL does not exist.
+    DllNotFound,
+    /// The configured J-Link DLL is not a Windows x64 PE image.
+    DllArchitectureMismatch,
+    /// The configured J-Link DLL has an unexpected file version.
+    DllVersionMismatch,
+    /// The configured J-Link DLL has an unexpected SHA-256 digest.
+    DllHashMismatch,
 }
 
 impl ErrorCode {
@@ -32,6 +44,12 @@ impl ErrorCode {
             Self::WorkerUnavailable => "WORKER_UNAVAILABLE",
             Self::ExecutionUncertain => "EXECUTION_UNCERTAIN",
             Self::InvalidResponse => "INVALID_RESPONSE",
+            Self::ConfigInvalid => "CONFIG_INVALID",
+            Self::OperationConflict => "OPERATION_CONFLICT",
+            Self::DllNotFound => "DLL_NOT_FOUND",
+            Self::DllArchitectureMismatch => "DLL_ARCHITECTURE_MISMATCH",
+            Self::DllVersionMismatch => "DLL_VERSION_MISMATCH",
+            Self::DllHashMismatch => "DLL_HASH_MISMATCH",
         }
     }
 }

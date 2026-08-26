@@ -1,0 +1,22 @@
+# Portable project configuration example. Replace every placeholder before use.
+[target]
+device = "<concrete-device>"
+interface = "swd"
+speed_khz = 4000
+
+[symbols]
+elf = "<path-to-symbols-elf>"
+
+# [firmware]
+# image = "<optional-firmware-image>"
+
+[jlink]
+dll_path = "<path-to-JLink_x64.dll>"
+version = "<dll-file-version>"
+sha256 = "<dll-sha256>"
+
+# [probe]
+# serial = <probe-serial>
+
+[capture]
+max_bytes = 536870912
