@@ -1,10 +1,12 @@
 //! Process-owned configuration and Worker orchestration behind the MCP boundary.
 
-use std::path::PathBuf;
+use std::{fs, path::PathBuf};
 
 use jlink_domain::{
-    ConnectionState, ErrorCode, FlashRange, JlinkError, ProgramAfter, ProgramRequest,
-    TargetConnectionSpec, TargetInterface, ValidationAfter,
+    AccessPlan, ConnectionState, DebugRequest, DebugResult, ElementSlice, ErrorCode,
+    FirmwareIdentityPlan, FirmwareImage, FlashRange, JlinkError, MemoryRange, ProgramAfter,
+    ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector,
+    WriteVerify,
 };
 use serde_json::{Map, Value, json};
 
@@ -227,18 +229,32 @@ impl Runtime {
         )
     }
 
-    fn call_inspect(&mut self, arguments: &Value) -> ToolCall {
+    fn call_inspect(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         match arguments
             .get("action")
             .and_then(Value::as_str)
             .expect("MCP Schema guarantees inspect.action")
         {
-            "symbols" => self
-                .inspect_symbols(arguments)
-                .unwrap_or_else(ToolCall::Error),
-            action => ToolCall::Unavailable(format!(
+            "symbols" => self.inspect_symbols(arguments),
+            "memory" => self.inspect_memory(arguments),
+            "variable" => self.inspect_variable(arguments),
+            action => Ok(ToolCall::Unavailable(format!(
                 "jlink_inspect.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
-            )),
+            ))),
+        }
+    }
+
+    fn call_write(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        match arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees write.action")
+        {
+            "memory" => self.write_memory(arguments),
+            "variable" => self.write_variable(arguments),
+            action => Ok(ToolCall::Unavailable(format!(
+                "jlink_write.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
+            ))),
         }
     }
 
@@ -330,6 +346,138 @@ impl Runtime {
         Ok(ToolCall::success(json!({ "symbols": symbols })))
     }
 
+    fn inspect_memory(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let address = parse_address(
+            arguments
+                .get("address")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees memory.address"),
+            "address",
+        )?;
+        let length = arguments
+            .get("length")
+            .and_then(Value::as_u64)
+            .expect("MCP Schema guarantees memory.length");
+        let request = DebugRequest::ReadMemory {
+            range: MemoryRange::raw(address, length)?,
+        };
+        match self.execute_debug(&request)? {
+            DebugResult::Memory { data } => Ok(ToolCall::success(json!({
+                "data": encode_hex(&data)
+            }))),
+            DebugResult::Variable { .. } | DebugResult::Written => Err(debug_response_error(
+                "Worker 对内存读取返回了错误的结果类型",
+            )),
+        }
+    }
+
+    fn inspect_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let (plan, firmware) = self.variable_plan(arguments)?;
+        match self.execute_debug(&DebugRequest::ReadVariable { plan, firmware })? {
+            DebugResult::Variable { value } => Ok(ToolCall::success(json!({ "value": value }))),
+            DebugResult::Memory { .. } | DebugResult::Written => Err(debug_response_error(
+                "Worker 对变量读取返回了错误的结果类型",
+            )),
+        }
+    }
+
+    fn write_memory(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let address = parse_address(
+            arguments
+                .get("address")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees memory.address"),
+            "address",
+        )?;
+        let data = decode_hex(
+            arguments
+                .get("data")
+                .and_then(Value::as_str)
+                .expect("MCP Schema guarantees memory.data"),
+        )?;
+        let request = DebugRequest::WriteMemory {
+            address,
+            data,
+            verify: write_verify(arguments)?,
+        };
+        expect_written(&self.execute_debug(&request)?)
+    }
+
+    fn write_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let (plan, firmware) = self.variable_plan(arguments)?;
+        let request = DebugRequest::WriteVariable {
+            plan,
+            firmware,
+            value: arguments
+                .get("value")
+                .expect("MCP Schema guarantees variable.value")
+                .clone(),
+            verify: write_verify(arguments)?,
+        };
+        expect_written(&self.execute_debug(&request)?)
+    }
+
+    fn variable_plan(
+        &mut self,
+        arguments: &Value,
+    ) -> Result<(AccessPlan, FirmwareIdentityPlan), JlinkError> {
+        let resolved = self.resolve()?;
+        let elf_path = resolved.symbols.elf.ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "symbols.elf 未配置，无法执行变量操作",
+                false,
+            )
+        })?;
+        let data = fs::read(&elf_path.value).map_err(|error| {
+            JlinkError::new(
+                ErrorCode::ValueInvalid,
+                format!("无法读取符号 ELF {}：{error}", elf_path.value.display()),
+                false,
+            )
+        })?;
+        let file_name = elf_path
+            .value
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ValueInvalid,
+                    "symbols.elf 文件名必须是有效 Unicode",
+                    false,
+                )
+            })?;
+        let firmware = FirmwareImage::parse(file_name, &data, None)?.symbol_identity_plan()?;
+        let index = self.symbol_cache.load_bytes(&data)?;
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees variable.path");
+        let selector = VariableSelector::new(path, element_slice(arguments)?)?;
+        let plan = self.symbol_cache.access_plan(&index, &selector)?;
+        Ok((plan, firmware))
+    }
+
+    fn execute_debug(&mut self, request: &DebugRequest) -> Result<DebugResult, JlinkError> {
+        let resolved = self.resolve()?;
+        validate_dll_identity(&resolved.jlink)?;
+        self.ensure_attachment(&resolved)?;
+        let target = target_spec(&resolved)?;
+        let result = self
+            .attachment
+            .as_ref()
+            .expect("attachment was established")
+            .client
+            .debug(&target, request);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+        {
+            self.attachment = None;
+        }
+        result
+    }
+
     fn ensure_attachment(&mut self, resolved: &ResolvedConfig) -> Result<(), JlinkError> {
         if self.attachment.is_some() {
             return Ok(());
@@ -368,7 +516,8 @@ impl ToolDispatcher for Runtime {
         match name {
             "jlink_target" => self.call_target(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_program" => self.call_program(arguments).unwrap_or_else(ToolCall::Error),
-            "jlink_inspect" => self.call_inspect(arguments),
+            "jlink_inspect" => self.call_inspect(arguments).unwrap_or_else(ToolCall::Error),
+            "jlink_write" => self.call_write(arguments).unwrap_or_else(ToolCall::Error),
             _ => ToolCall::Unavailable(format!(
                 "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
             )),
@@ -475,6 +624,84 @@ fn parse_address(value: &str, name: &str) -> Result<u64, JlinkError> {
             false,
         )
     })
+}
+
+fn element_slice(arguments: &Value) -> Result<Option<ElementSlice>, JlinkError> {
+    arguments
+        .get("slice")
+        .map(|slice| {
+            let start = slice
+                .get("start")
+                .and_then(Value::as_u64)
+                .expect("MCP Schema guarantees slice.start");
+            let count = slice
+                .get("count")
+                .and_then(Value::as_u64)
+                .expect("MCP Schema guarantees slice.count");
+            ElementSlice::new(start, count)
+        })
+        .transpose()
+}
+
+fn write_verify(arguments: &Value) -> Result<WriteVerify, JlinkError> {
+    match arguments.get("verify").and_then(Value::as_str) {
+        None | Some("none") => Ok(WriteVerify::None),
+        Some("readback") => Ok(WriteVerify::Readback),
+        Some(_) => Err(JlinkError::new(
+            ErrorCode::ValueInvalid,
+            "verify 必须是 none 或 readback",
+            false,
+        )),
+    }
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, JlinkError> {
+    if value.is_empty() || value.len() > 8_192 || !value.len().is_multiple_of(2) {
+        return Err(JlinkError::new(
+            ErrorCode::ValueInvalid,
+            "memory.data 必须包含 1 到 4096 字节的偶数长度十六进制数据",
+            false,
+        ));
+    }
+    value
+        .as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).expect("hex pair is ASCII-compatible");
+            u8::from_str_radix(text, 16).map_err(|_| {
+                JlinkError::new(
+                    ErrorCode::ValueInvalid,
+                    "memory.data 包含非十六进制字符",
+                    false,
+                )
+            })
+        })
+        .collect()
+}
+
+fn encode_hex(data: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(data.len() * 2);
+    for byte in data {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+fn expect_written(result: &DebugResult) -> Result<ToolCall, JlinkError> {
+    match result {
+        DebugResult::Written => Ok(ToolCall::success(json!({}))),
+        DebugResult::Memory { .. } | DebugResult::Variable { .. } => Err(debug_response_error(
+            "Worker 对写入请求返回了错误的结果类型",
+        )),
+    }
+}
+
+fn debug_response_error(message: &str) -> JlinkError {
+    JlinkError::new(ErrorCode::IpcProtocolError, message, false)
 }
 
 fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {

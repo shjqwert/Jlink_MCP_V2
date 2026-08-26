@@ -59,12 +59,12 @@ public contract and is recorded in the implementation constraints.
 | PRG-004 | T-P2-PRG | `validation/p2-program.md` compact mismatch fixture；3.7 readback hardware | F0-A |
 | PRG-005 | T-P2-PRG | `validation/p2-program.md` closed Schema/no-token contract；3.7 hardware | F0-A |
 | PRG-006 | T-P2-PRG | `validation/p2-program.md` HSS-first state fixture；3.7 active-capture hardware | F0-A |
-| DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验；3.5/3.7 增补 J-Link 执行证据 | F0-A + F0-C |
-| DBG-002 | T-P2-MEM | J-Link hardware | F0-A |
-| DBG-003 | T-P2-MEM | J-Link hardware | F0-A |
+| DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验 + `validation/p2-memory.md` 执行链路；3.7 hardware | F0-A + F0-C |
+| DBG-002 | T-P2-MEM | `validation/p2-memory.md` unit/contract/IAR fixture；3.7 hardware | F0-A |
+| DBG-003 | T-P2-MEM | `validation/p2-memory.md` readback fixture；3.7 hardware | F0-A |
 | DBG-004 | T-P2-CTL | J-Link hardware | F0-A |
 | DBG-005 | T-P2-CTL | J-Link hardware | F0-A |
-| DBG-006 | T-P2-MEM | Contract + J-Link hardware | F0-A |
+| DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；3.7 hardware | F0-A |
 | DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
 | HSSA-001 | T-P3-START | Contract + J-Link hardware | F0-A |

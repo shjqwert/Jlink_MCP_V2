@@ -21,20 +21,20 @@
 |---|---|
 | IAR fixture 源 | `8C305EE9242DA9CECB5FA21863FB4755C2DE2068639774191033D3343749317A` |
 | IAR fixture OUT | `0AD89204DE9382C06F2D1605A4CD53B284C62BC58E980C9BC61086EB43577909` |
-| 实际 T26 OUT | `3EB79013870DBB6F9B6ADC929C3B43D8D30C4FF35D69A4D2D39A78643526EFEF` |
+| 实际 T26 OUT | `9CA4B80CE028F03BDE56082C20BFEDFA65FAE6264B33FB3190FD87FC7DA5CCE2`；3.5 目标夹具构建后刷新 |
 | 实际 producer | `IAR ANSI C/C++ Compiler V8.32.3.193/W32 for ARM`；`IAR Assembler V8.32.3.193/W32 for ARM` |
 | 解析器格式版本 | `1` |
 
 ## 实际 T26 OUT 结果
 
 - DWARF 版本：3、4。
-- `.debug_info` compile units：2960。
+- `.debug_info` compile units：2963。
 - `.debug_types` type units：35。
 - 已解析 `DW_FORM_ref_sig8` 引用：93。
-- 类型定义：7174。
-- 非 declaration 变量定义：3535。
-- 可供 `symbols` 返回的稳定精确路径：3556。
-- 实际 OUT 只读解析成功；没有修改或重新构建 SVN 工程。
+- 类型定义：7177。
+- 非 declaration 变量定义：3538。
+- 可供 `symbols` 返回的稳定精确路径：3563。
+- 实际 OUT 在 3.5 仅因计划内 `AppUserDesc.c` 夹具重新构建；T-P2-DWARF 对新指纹完成只读解析，旧 F0-C/P2-3.2 指纹仍保留在其历史证据中，不被改写为当前产物。
 
 ## 自动验证
 
@@ -46,10 +46,10 @@ cargo clippy -p jlink-domain -p jlink-mcp --all-targets -- -D warnings
 结果：通过
 
 cargo run -p jlink-mcp --example t_p2_dwarf -- <T26_DCU_APP_NXP.out>
-结果：DWARF 3/4、35 个 type unit、7174 个类型均完成索引
+结果：DWARF 3/4、35 个 type unit、7177 个类型均完成索引
 ```
 
-T-P2-DWARF 覆盖二维固定数组地址/步长、有效显式柔性 slice、含无界成员的外层 aggregate 拒绝、volatile 传播、规范化选择器缓存、ELF 内容变化失效、稳定 symbols 搜索、实际运行时路由和公共错误码；同一主要测试筛选还覆盖同名歧义、declaration 去重、动态位置拒绝、指针不跟随、未验证 DWARF 版本拒绝、`DW_AT_data_bit_offset` 归一化，以及实际 T26 OUT 的 DWARF 3/4、35 个 type unit 和 93 个 `DW_FORM_ref_sig8` 引用。缺失或无效 slice 及 `SLICE_REQUIRED` 不在本任务重复断言。
+T-P2-DWARF 覆盖二维固定数组地址/步长、有效显式柔性 slice、含无界成员的外层 aggregate 拒绝、volatile 传播、规范化选择器缓存、ELF 内容变化失效、稳定 symbols 搜索、实际运行时路由和公共错误码；同一主要测试筛选还覆盖同名歧义、declaration 去重、动态位置拒绝、指针不跟随、未验证 DWARF 版本拒绝、`DW_AT_data_bit_offset` 归一化，以及当前实际 T26 OUT 的 DWARF 3/4、35 个 type unit 和 93 个 `DW_FORM_ref_sig8` 引用。缺失或无效 slice 及 `SLICE_REQUIRED` 不在本任务重复断言。
 
 该主要测试显式依赖本机冻结的 F0-C fixture 和用户指定的 `D:\SVN\DCU\T26_DCU\trunk\03_code\T26_DCU_APP_NXP` 实际 OUT；路径或指纹缺失时测试明确失败，不静默跳过。
 

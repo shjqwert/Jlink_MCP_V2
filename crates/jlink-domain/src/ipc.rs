@@ -264,7 +264,7 @@ impl<'de> Deserialize<'de> for RequestId {
 
 /// The closed set of session commands carried by V1 IPC.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SessionCommand {
     /// Request a new worker connection.
     Connect,
@@ -280,6 +280,14 @@ pub enum SessionCommand {
     Erase,
     /// Compare an image with target Flash without modifying it.
     Verify,
+    /// Read one exact raw-memory range.
+    ReadMemory,
+    /// Write one exact raw-memory range.
+    WriteMemory,
+    /// Read one ELF-bound typed variable.
+    ReadVariable,
+    /// Write one ELF-bound typed variable.
+    WriteVariable,
 }
 
 impl SessionCommand {
@@ -287,10 +295,16 @@ impl SessionCommand {
     #[must_use]
     pub const fn execution_kind(self) -> ExecutionKind {
         match self {
-            Self::Status | Self::Verify => ExecutionKind::ReadOnly,
-            Self::Connect | Self::Disconnect | Self::Validate | Self::Flash | Self::Erase => {
-                ExecutionKind::SideEffect
+            Self::Status | Self::Verify | Self::ReadMemory | Self::ReadVariable => {
+                ExecutionKind::ReadOnly
             }
+            Self::Connect
+            | Self::Disconnect
+            | Self::Validate
+            | Self::Flash
+            | Self::Erase
+            | Self::WriteMemory
+            | Self::WriteVariable => ExecutionKind::SideEffect,
         }
     }
 }
@@ -314,6 +328,9 @@ pub struct IpcRequest {
     /// Typed Flash operation payload required by flash, erase, and verify.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub program: Option<crate::ProgramRequest>,
+    /// Typed ordinary debug payload required by memory and variable commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub debug: Option<crate::DebugRequest>,
 }
 
 impl IpcRequest {
@@ -331,6 +348,7 @@ impl IpcRequest {
             target: None,
             after: None,
             program: None,
+            debug: None,
         }
     }
 
@@ -352,6 +370,13 @@ impl IpcRequest {
     #[must_use]
     pub fn with_program(mut self, program: crate::ProgramRequest) -> Self {
         self.program = Some(program);
+        self
+    }
+
+    /// Attaches one typed ordinary memory or variable operation.
+    #[must_use]
+    pub fn with_debug(mut self, debug: crate::DebugRequest) -> Self {
+        self.debug = Some(debug);
         self
     }
 }

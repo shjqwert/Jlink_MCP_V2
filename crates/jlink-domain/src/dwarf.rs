@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{ErrorCode, JlinkError};
 
@@ -6,7 +6,7 @@ use crate::{ErrorCode, JlinkError};
 pub const ACCESS_PLAN_FORMAT_VERSION: u32 = 1;
 
 /// An explicit element range applied after resolving a variable path.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ElementSlice {
     start: u64,
@@ -52,7 +52,7 @@ pub enum SelectorStep {
 }
 
 /// A validated variable path and its independent optional element slice.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct VariableSelector {
     path: String,
@@ -130,7 +130,7 @@ impl VariableSelector {
 }
 
 /// Scalar encoding retained from DWARF for lossless typed-value processing.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ScalarEncoding {
     /// A two's-complement signed integer.
@@ -146,7 +146,7 @@ pub enum ScalarEncoding {
 }
 
 /// A member of a structure or union layout.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessMember {
     name: String,
@@ -216,7 +216,7 @@ impl AccessMember {
 }
 
 /// Recursive, address-independent DWARF value layout retained by an access plan.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AccessLayout {
     /// A base scalar value.
@@ -276,7 +276,7 @@ impl AccessLayout {
 }
 
 /// A bit-field range within the plan's selected storage bytes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BitRange {
     lsb: u64,
@@ -304,7 +304,7 @@ impl BitRange {
 }
 
 /// An immutable, target-independent plan for one exact DWARF selector.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessPlan {
     elf_sha256: String,
@@ -387,6 +387,55 @@ impl AccessPlan {
     #[must_use]
     pub const fn layout(&self) -> &AccessLayout {
         &self.layout
+    }
+
+    /// Revalidates an access plan after crossing the local IPC boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable value or type error when the selector, identity, range,
+    /// parser version, or retained layout is inconsistent.
+    pub fn validate_for_execution(&self) -> Result<(), JlinkError> {
+        if self.parser_format_version != ACCESS_PLAN_FORMAT_VERSION {
+            return Err(value_invalid("AccessPlan parser format version 不受支持"));
+        }
+        if self.elf_sha256.len() != 64
+            || !self.elf_sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(value_invalid("AccessPlan ELF SHA-256 无效"));
+        }
+        let normalized = VariableSelector::new(self.selector.path(), self.selector.slice())?;
+        if normalized != self.selector {
+            return Err(value_invalid("AccessPlan selector 未规范化"));
+        }
+        if self.byte_size == 0 || self.layout.byte_size() != Some(self.byte_size) {
+            return Err(JlinkError::new(
+                ErrorCode::TypeUnsupported,
+                "AccessPlan layout 与 byte_size 不一致",
+                false,
+            ));
+        }
+        let end = self
+            .address
+            .checked_add(self.byte_size)
+            .ok_or_else(|| value_invalid("AccessPlan 地址范围溢出"))?;
+        if end > (1_u64 << 32) {
+            return Err(value_invalid("AccessPlan 超出 32 位 Cortex-M 地址空间"));
+        }
+        if let Some(bits) = self.bit_range {
+            let storage_bits = self
+                .byte_size
+                .checked_mul(8)
+                .ok_or_else(|| value_invalid("AccessPlan bit storage 溢出"))?;
+            let bit_end = bits
+                .lsb()
+                .checked_add(bits.width())
+                .ok_or_else(|| value_invalid("AccessPlan bit range 溢出"))?;
+            if bits.width() == 0 || bit_end > storage_bits {
+                return Err(value_invalid("AccessPlan bit range 超出存储范围"));
+            }
+        }
+        Ok(())
     }
 }
 

@@ -11,9 +11,9 @@ use std::{
 };
 
 use jlink_domain::{
-    ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion, JlinkError, ProgramAfter,
-    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckKind,
-    ValidationReport,
+    DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion, JlinkError,
+    MemoryRegion, MemoryRegionKind, ProgramAfter, TargetConnectionSpec, TargetInterface,
+    TargetState, ValidationCheck, ValidationCheckKind, ValidationReport, validate_write_count,
 };
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, GetLastError, HMODULE},
@@ -280,6 +280,73 @@ impl DllGateway {
         &mut self,
         device: &str,
     ) -> Result<Vec<FlashRegion>, JlinkError> {
+        let info = self.device_info(device)?;
+        let regions = info
+            .flash_areas
+            .iter()
+            .take_while(|area| area.size != 0)
+            .map(|area| FlashRegion::new(u64::from(area.address), u64::from(area.size)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if regions.is_empty() {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "J-Link 设备数据库没有提供可验证的 Flash 区域",
+                false,
+            ));
+        }
+        Ok(regions)
+    }
+
+    /// Reads authoritative Flash and RAM regions for ordinary access classification.
+    pub(crate) fn device_memory_map(
+        &mut self,
+        device: &str,
+    ) -> Result<DeviceMemoryMap, JlinkError> {
+        let info = self.device_info(device)?;
+        let mut regions = Vec::new();
+        regions.extend(
+            info.flash_areas
+                .iter()
+                .take_while(|area| area.size != 0)
+                .map(|area| {
+                    MemoryRegion::new(
+                        u64::from(area.address),
+                        u64::from(area.size),
+                        MemoryRegionKind::Flash,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        regions.extend(
+            info.ram_areas
+                .iter()
+                .take_while(|area| area.size != 0)
+                .map(|area| {
+                    MemoryRegion::new(
+                        u64::from(area.address),
+                        u64::from(area.size),
+                        MemoryRegionKind::Ram,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        if !regions
+            .iter()
+            .any(|region| region.kind() == MemoryRegionKind::Flash)
+            || !regions
+                .iter()
+                .any(|region| region.kind() == MemoryRegionKind::Ram)
+        {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "J-Link 设备数据库没有同时提供 Flash 和 RAM 区域",
+                false,
+            ));
+        }
+        DeviceMemoryMap::new(regions)
+    }
+
+    fn device_info(&mut self, device: &str) -> Result<DeviceInfo, JlinkError> {
         let device = CString::new(device).map_err(|_| {
             JlinkError::new(
                 ErrorCode::ConfigInvalid,
@@ -308,20 +375,7 @@ impl DllGateway {
                 false,
             ));
         }
-        let regions = info
-            .flash_areas
-            .iter()
-            .take_while(|area| area.size != 0)
-            .map(|area| FlashRegion::new(u64::from(area.address), u64::from(area.size)))
-            .collect::<Result<Vec<_>, _>>()?;
-        if regions.is_empty() {
-            return Err(JlinkError::new(
-                ErrorCode::ConfigInvalid,
-                "J-Link 设备数据库没有提供可验证的 Flash 区域",
-                false,
-            ));
-        }
-        Ok(regions)
+        Ok(info)
     }
 
     /// Programs every normalized image segment through J-Link's device algorithm.
@@ -402,7 +456,7 @@ impl DllGateway {
         }
     }
 
-    /// Reads one complete target range for verification without truncation.
+    /// Reads one complete target range without truncation.
     pub(crate) fn read_bytes(
         &mut self,
         address: u64,
@@ -413,15 +467,15 @@ impl DllGateway {
         while offset < length {
             let count = (length - offset).min(PROGRAM_CHUNK_BYTES);
             let offset_u64 = u64::try_from(offset).map_err(|_| {
-                JlinkError::new(ErrorCode::ValueInvalid, "校验读取偏移无法表示", false)
+                JlinkError::new(ErrorCode::ValueInvalid, "目标读取偏移无法表示", false)
             })?;
             let current = address.checked_add(offset_u64).ok_or_else(|| {
-                JlinkError::new(ErrorCode::ValueInvalid, "校验读取地址溢出", false)
+                JlinkError::new(ErrorCode::AddressOutOfRange, "目标读取地址溢出", false)
             })?;
             let current = u32::try_from(current).map_err(|_| {
                 JlinkError::new(
-                    ErrorCode::FlashRangeInvalid,
-                    "校验读取地址超出 Cortex-M 地址范围",
+                    ErrorCode::AddressOutOfRange,
+                    "目标读取地址超出 Cortex-M 地址范围",
                     false,
                 )
             })?;
@@ -435,11 +489,50 @@ impl DllGateway {
                     ErrorCode::TargetConnectFailed,
                     format!("JLINKARM_ReadMem(0x{current:08X}, {count}) 返回 {result}"),
                     true,
-                ));
+                )
+                .with_detail("address", serde_json::json!(format!("0x{current:08X}")))
+                .with_detail("requested_length", serde_json::json!(count))
+                .with_detail("actual_length", serde_json::json!(result)));
             }
             offset += count;
         }
         Ok(output)
+    }
+
+    /// Writes one complete ordinary RAM or MMIO range and rejects short writes.
+    pub(crate) fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
+            let offset_u64 = u64::try_from(offset).map_err(|_| {
+                JlinkError::new(ErrorCode::ValueInvalid, "内存写入偏移无法表示", false)
+            })?;
+            let current = address.checked_add(offset_u64).ok_or_else(|| {
+                JlinkError::new(ErrorCode::AddressOutOfRange, "内存写入地址溢出", false)
+            })?;
+            let current_u32 = u32::try_from(current).map_err(|_| {
+                JlinkError::new(
+                    ErrorCode::AddressOutOfRange,
+                    "内存写入地址超出 Cortex-M 地址范围",
+                    false,
+                )
+            })?;
+            let count_u32 = u32::try_from(count).expect("fixed write chunk fits u32");
+            // SAFETY: the input slice is readable for `count` bytes and the
+            // connected target is uniquely owned by this gateway.
+            let result =
+                unsafe { (self.api.write_mem)(current_u32, count_u32, bytes[offset..].as_ptr()) };
+            if let Err(mut error) = validate_write_count(current, count, result) {
+                let actual_in_chunk = usize::try_from(result.max(0)).unwrap_or(0).min(count);
+                let actual_total = offset.saturating_add(actual_in_chunk);
+                error = error
+                    .with_detail("requested_length", serde_json::json!(bytes.len()))
+                    .with_detail("actual_length", serde_json::json!(actual_total));
+                return Err(error);
+            }
+            offset += count;
+        }
+        Ok(())
     }
 
     /// Applies the explicit successful post-program target state.
@@ -996,7 +1089,7 @@ fn test_injection_error(message: impl Into<String>) -> JlinkError {
 mod tests {
     use std::{env, path::PathBuf};
 
-    use jlink_domain::FlashRegion;
+    use jlink_domain::{FlashRegion, MemoryRange, MemoryRegionKind};
 
     use super::{DeviceInfo, DllGateway};
 
@@ -1028,6 +1121,21 @@ mod tests {
                     FlashRegion::new(0x0000_0000, 0x0008_0000).expect("program Flash"),
                     FlashRegion::new(0x1000_0000, 0x0001_0000).expect("data Flash"),
                 ]
+            );
+            let memory_map = gateway
+                .device_memory_map(&device)
+                .expect("device Flash/RAM memory map");
+            assert_eq!(
+                memory_map
+                    .classify(MemoryRange::raw(0x2000_0000, 4).expect("SRAM range"))
+                    .expect("classified SRAM"),
+                MemoryRegionKind::Ram
+            );
+            assert_eq!(
+                memory_map
+                    .classify(MemoryRange::raw(0x4000_0000, 4).expect("MMIO range"))
+                    .expect("classified MMIO"),
+                MemoryRegionKind::Mmio
             );
         }
     }

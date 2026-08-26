@@ -1,7 +1,8 @@
 use jlink_domain::{
-    ConnectionState, ErrorCode, FaultDiagnostics, JlinkError, RecoveryAction, RecoveryNotification,
-    SessionEvent, TargetConnectionSpec, TargetState, ValidationAfter, ValidationInvalidation,
-    ValidationReport, WorkerStatus, ensure_disconnect_allowed, transition_session,
+    ConnectionState, DebugRequest, ErrorCode, FaultDiagnostics, JlinkError, RecoveryAction,
+    RecoveryNotification, SessionEvent, TargetConnectionSpec, TargetState, ValidationAfter,
+    ValidationInvalidation, ValidationReport, WorkerStatus, ensure_disconnect_allowed,
+    transition_session,
 };
 use serde_json::json;
 
@@ -65,6 +66,7 @@ pub(crate) struct TargetSessionManager {
     hss_active: bool,
     active_target: Option<TargetConnectionSpec>,
     validation_key: Option<TargetConnectionSpec>,
+    firmware_identity: Option<String>,
     validation_runs: u64,
     recovery_notifications: Vec<RecoveryNotification>,
     last_invalidation: Option<ValidationInvalidation>,
@@ -79,6 +81,7 @@ impl TargetSessionManager {
             hss_active: false,
             active_target: None,
             validation_key: None,
+            firmware_identity: None,
             validation_runs: 0,
             recovery_notifications: Vec::new(),
             last_invalidation: None,
@@ -127,6 +130,59 @@ impl TargetSessionManager {
             ));
         }
         Ok(())
+    }
+
+    /// Rejects ordinary debug requests that conflict with session or HSS state.
+    pub(crate) fn ensure_debug_allowed(
+        &self,
+        spec: &TargetConnectionSpec,
+        request: &DebugRequest,
+    ) -> Result<(), JlinkError> {
+        request.validate()?;
+        if self.hss_active && !request.is_write() {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动 HSS 期间不能执行普通读取；请查询采集数据",
+                true,
+            ));
+        }
+        if self.connection_state != ConnectionState::Connected {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "变量和内存操作要求已连接且已验证的目标会话",
+                true,
+            ));
+        }
+        if self.active_target.as_ref() != Some(spec) {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动连接与当前目标配置不一致，请先断开并重新连接",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns whether this connection already proved one symbol ELF identity.
+    pub(crate) fn firmware_identity_cached(&self, elf_sha256: &str) -> bool {
+        self.firmware_identity.as_deref() == Some(elf_sha256)
+    }
+
+    /// Rejects a first-time symbol identity Flash read while HSS owns the gateway.
+    pub(crate) fn ensure_firmware_identity_read_allowed(&self) -> Result<(), JlinkError> {
+        if self.hss_active {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动 HSS 期间不能首次验证符号 ELF；请在采集开始前完成变量访问",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Caches a successfully verified symbol ELF for this connection only.
+    pub(crate) fn record_firmware_identity(&mut self, elf_sha256: &str) {
+        self.firmware_identity = Some(elf_sha256.to_owned());
     }
 
     /// Records the actual final target state and invalidates Flash-derived caches.
@@ -323,6 +379,7 @@ impl TargetSessionManager {
 
     fn invalidate_validation(&mut self, reason: ValidationInvalidation) {
         self.validation_key = None;
+        self.firmware_identity = None;
         self.last_invalidation = Some(reason);
     }
 }
@@ -549,6 +606,42 @@ mod tests {
     }
 
     #[test]
+    fn active_hss_rejects_reads_but_accepts_validated_memory_writes() {
+        let spec = TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let mut manager = TargetSessionManager::new();
+        manager.connection_state = ConnectionState::Connected;
+        manager.active_target = Some(spec.clone());
+        manager.hss_active = true;
+
+        let read = DebugRequest::ReadMemory {
+            range: jlink_domain::MemoryRange::raw(0x2000_0000, 4).expect("read range"),
+        };
+        assert_eq!(
+            manager
+                .ensure_debug_allowed(&spec, &read)
+                .expect_err("ordinary read conflicts with HSS")
+                .code,
+            ErrorCode::OperationConflict
+        );
+
+        let write = DebugRequest::WriteMemory {
+            address: 0x2000_0000,
+            data: vec![1, 2, 3, 4],
+            verify: jlink_domain::WriteVerify::None,
+        };
+        manager
+            .ensure_debug_allowed(&spec, &write)
+            .expect("HSS accepts validated RAM/MMIO write for serialized scheduling");
+    }
+
+    #[test]
     fn flash_result_invalidates_validation_and_uncertain_result_faults_session() {
         let spec = TargetConnectionSpec::new(
             "S32K144",
@@ -562,12 +655,14 @@ mod tests {
         completed.connection_state = ConnectionState::Connected;
         completed.active_target = Some(spec.clone());
         completed.validation_key = Some(spec.clone());
+        completed.record_firmware_identity(&"a".repeat(64));
         completed
             .ensure_program_allowed(&spec)
             .expect("connected validated session");
         completed.record_program_result(TargetState::Halted, true);
         assert_eq!(completed.target_state, TargetState::Halted);
         assert!(completed.validation_key.is_none());
+        assert!(!completed.firmware_identity_cached(&"a".repeat(64)));
         assert_eq!(
             completed.last_invalidation,
             Some(ValidationInvalidation::FlashModified)

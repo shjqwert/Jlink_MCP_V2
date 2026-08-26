@@ -258,6 +258,7 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::TypeUnsupported => "TYPE_UNSUPPORTED",
         ErrorCode::DynamicLocationUnsupported => "DYNAMIC_LOCATION_UNSUPPORTED",
         ErrorCode::SliceRequired => "SLICE_REQUIRED",
+        ErrorCode::AddressOutOfRange => "ADDRESS_OUT_OF_RANGE",
         ErrorCode::FlashRangeInvalid => "FLASH_RANGE_INVALID",
         ErrorCode::VerifyFailed => "VERIFY_FAILED",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",

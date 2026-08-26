@@ -183,11 +183,11 @@ fn t_p2_dwarf_indexes_frozen_actual_t26_ref_sig8_artifact() {
     });
     assert_eq!(
         index.elf_sha256(),
-        "3eb79013870dbb6f9b6adc929c3b43d8d30c4ff35d69a4d2d39a78643526efef"
+        "9ca4b80ce028f03bde56082c20bfedfa65fae6264b33fb3190fd87fc7da5cce2"
     );
     assert_eq!(index.dwarf_versions(), vec![3, 4]);
     assert_eq!(index.type_unit_count(), 35);
-    assert_eq!(index.type_count(), 7_174);
+    assert_eq!(index.type_count(), 7_177);
     assert!(index.signature_reference_count() > 0);
     assert!(
         index

@@ -4,6 +4,7 @@ mod dwarf;
 mod error;
 mod image;
 mod ipc;
+mod memory;
 mod program;
 mod session;
 mod state;
@@ -21,6 +22,12 @@ pub use image::{
 pub use ipc::{
     IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, ProtocolVersion, RequestId, SessionCommand,
     WorkerStatus, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+};
+pub use memory::{
+    DebugRequest, DebugResult, DeviceMemoryMap, MAX_RAW_MEMORY_BYTES, MemoryRange,
+    MemoryReadOrigin, MemoryReadPart, MemoryReadPlan, MemoryRegion, MemoryRegionKind,
+    MergedMemoryRead, WriteVerify, merge_safe_memory_reads, validate_write_count,
+    verify_memory_readback,
 };
 pub use program::{
     FlashRange, FlashRegion, ProgramAfter, ProgramRequest, VerifyMismatch,

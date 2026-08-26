@@ -7,8 +7,8 @@ use jlink_domain::{
 use serde_json::json;
 
 use crate::{
-    gateway::DllGateway, lease::ProbeLease, pipe::PipeServer, program::execute_program,
-    session::TargetSessionManager,
+    debug::execute_debug, gateway::DllGateway, lease::ProbeLease, pipe::PipeServer,
+    program::execute_program, session::TargetSessionManager,
 };
 
 /// Immutable startup inputs for one authoritative Worker process.
@@ -100,7 +100,11 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
         | SessionCommand::Validate
         | SessionCommand::Flash
         | SessionCommand::Erase
-        | SessionCommand::Verify => None,
+        | SessionCommand::Verify
+        | SessionCommand::ReadMemory
+        | SessionCommand::WriteMemory
+        | SessionCommand::ReadVariable
+        | SessionCommand::WriteVariable => None,
     };
     if request.target.is_some()
         && let Some(message) = unexpected_target_message
@@ -129,7 +133,11 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             SessionCommand::Connect
                 | SessionCommand::Disconnect
                 | SessionCommand::Status
-                | SessionCommand::Validate,
+                | SessionCommand::Validate
+                | SessionCommand::ReadMemory
+                | SessionCommand::WriteMemory
+                | SessionCommand::ReadVariable
+                | SessionCommand::WriteVariable,
             None
         )
     );
@@ -140,10 +148,81 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             false,
         ));
     }
+    let debug_matches_command = matches!(
+        (&request.command, &request.debug),
+        (
+            SessionCommand::ReadMemory,
+            Some(jlink_domain::DebugRequest::ReadMemory { .. })
+        ) | (
+            SessionCommand::WriteMemory,
+            Some(jlink_domain::DebugRequest::WriteMemory { .. })
+        ) | (
+            SessionCommand::ReadVariable,
+            Some(jlink_domain::DebugRequest::ReadVariable { .. })
+        ) | (
+            SessionCommand::WriteVariable,
+            Some(jlink_domain::DebugRequest::WriteVariable { .. })
+        ) | (
+            SessionCommand::Connect
+                | SessionCommand::Disconnect
+                | SessionCommand::Status
+                | SessionCommand::Validate
+                | SessionCommand::Flash
+                | SessionCommand::Erase
+                | SessionCommand::Verify,
+            None
+        )
+    );
+    if !debug_matches_command {
+        return Err(JlinkError::new(
+            ErrorCode::IpcProtocolError,
+            "command 与 debug 负载不匹配",
+            false,
+        ));
+    }
     Ok(())
 }
 
 impl WorkerRuntime {
+    fn handle_debug(
+        &mut self,
+        request_id: jlink_domain::RequestId,
+        target: Option<jlink_domain::TargetConnectionSpec>,
+        debug: Option<jlink_domain::DebugRequest>,
+    ) -> (IpcResponse, bool) {
+        let result = target.ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "变量或内存请求缺少目标配置",
+                false,
+            )
+        });
+        let result = result.and_then(|target| {
+            let debug = debug.ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::IpcProtocolError,
+                    "变量或内存请求缺少 debug 负载",
+                    false,
+                )
+            })?;
+            execute_debug(&mut self.session, &mut self.gateway, &target, debug)
+        });
+        match result {
+            Ok(result) => (
+                IpcResponse::success(
+                    ProtocolVersion::V1,
+                    request_id,
+                    serde_json::to_value(result).expect("DebugResult is serializable"),
+                ),
+                true,
+            ),
+            Err(error) => (
+                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                true,
+            ),
+        }
+    }
+
     fn handle_program(
         &mut self,
         request_id: jlink_domain::RequestId,
@@ -265,6 +344,12 @@ impl WorkerRuntime {
             SessionCommand::Flash | SessionCommand::Erase | SessionCommand::Verify => {
                 self.handle_program(request_id, request.target, request.program)
             }
+            SessionCommand::ReadMemory
+            | SessionCommand::WriteMemory
+            | SessionCommand::ReadVariable
+            | SessionCommand::WriteVariable => {
+                self.handle_debug(request_id, request.target, request.debug)
+            }
         }
     }
 }
@@ -310,7 +395,8 @@ mod tests {
     use std::path::PathBuf;
 
     use jlink_domain::{
-        ProgramAfter, ProgramRequest, RequestId, TargetConnectionSpec, TargetInterface,
+        DebugRequest, MemoryRange, ProgramAfter, ProgramRequest, RequestId, TargetConnectionSpec,
+        TargetInterface,
     };
 
     use super::*;
@@ -350,6 +436,43 @@ mod tests {
         assert_eq!(
             validate_request_contract(&mismatch)
                 .expect_err("verify cannot carry flash")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+    }
+
+    #[test]
+    fn debug_command_and_payload_must_match_exactly() {
+        let target = TargetConnectionSpec::new(
+            "S32K144",
+            TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let read = DebugRequest::ReadMemory {
+            range: MemoryRange::raw(0x2000_0000, 4).expect("raw range"),
+        };
+        let valid = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("debug-valid").expect("request id"),
+            SessionCommand::ReadMemory,
+        )
+        .with_target(target.clone())
+        .with_debug(read.clone());
+        validate_request_contract(&valid).expect("matching debug request");
+
+        let mismatch = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("debug-mismatch").expect("request id"),
+            SessionCommand::WriteMemory,
+        )
+        .with_target(target)
+        .with_debug(read);
+        assert_eq!(
+            validate_request_contract(&mismatch)
+                .expect_err("write command cannot carry read payload")
                 .code,
             ErrorCode::IpcProtocolError
         );

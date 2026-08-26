@@ -247,6 +247,20 @@ impl FirmwareIdentityPlan {
         &self.segments
     }
 
+    /// Revalidates the immutable identity plan after local IPC transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::FirmwareIdentityUnknown`] when the ELF digest or
+    /// segment set cannot prove one exact target firmware identity.
+    pub fn validate(&self) -> Result<(), JlinkError> {
+        if self.is_valid() {
+            Ok(())
+        } else {
+            Err(identity_unknown("符号 ELF 身份计划无效", None))
+        }
+    }
+
     /// Verifies complete target readback fingerprints against this ELF plan.
     ///
     /// `None`, a missing range, or duplicate evidence cannot prove identity and
@@ -262,9 +276,7 @@ impl FirmwareIdentityPlan {
         &self,
         observed: Option<&[FirmwareSegmentFingerprint]>,
     ) -> Result<(), JlinkError> {
-        if !self.is_valid() {
-            return Err(identity_unknown("符号 ELF 身份计划无效", None));
-        }
+        self.validate()?;
         let Some(observed) = observed else {
             return Err(identity_unknown("目标 Flash 身份读取未完成", None));
         };
