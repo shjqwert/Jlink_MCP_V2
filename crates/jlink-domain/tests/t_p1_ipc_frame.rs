@@ -31,6 +31,18 @@ fn t_p1_ipc_frame_survives_partial_byte_reads() {
     let decoded: IpcRequest =
         read_ipc_frame(&mut OneByteReader(Cursor::new(bytes))).expect("partial frame");
     assert_eq!(decoded, status_request());
+
+    let recovery = IpcRequest::new(
+        ProtocolVersion::V1,
+        RequestId::new("t-p3-recover-key").expect("request ID"),
+        SessionCommand::HssStatus,
+    )
+    .with_capture_key("boot-check-001");
+    let mut bytes = Vec::new();
+    write_ipc_frame(&mut bytes, &recovery).expect("encode recovery frame");
+    let decoded: IpcRequest =
+        read_ipc_frame(&mut OneByteReader(Cursor::new(bytes))).expect("partial recovery frame");
+    assert_eq!(decoded, recovery);
 }
 
 #[test]

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError};
+use crate::{AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError, TargetConnectionSpec};
 
 const HSS_TIMESTAMP_BYTES: u32 = 4;
 const HSS_CAPS_TIMESTAMP_FLAG: u32 = 2;
@@ -1453,6 +1453,7 @@ impl HssCapabilities {
 pub struct HssCaptureReservation {
     capture_id: String,
     request_fingerprint: String,
+    target_fingerprint: String,
 }
 
 impl HssCaptureReservation {
@@ -1466,6 +1467,12 @@ impl HssCaptureReservation {
     #[must_use]
     pub fn request_fingerprint(&self) -> &str {
         &self.request_fingerprint
+    }
+
+    /// Returns the complete target-connection fingerprint retained for conflict evidence.
+    #[must_use]
+    pub fn target_fingerprint(&self) -> &str {
+        &self.target_fingerprint
     }
 }
 
@@ -1502,11 +1509,23 @@ impl HssStartRegistry {
     pub fn reserve(
         &mut self,
         probe_identity: &str,
+        target: &TargetConnectionSpec,
         plan: &HssStartPlan,
     ) -> Result<HssReservationOutcome, JlinkError> {
         plan.validate()?;
+        target.validate()?;
+        if probe_identity != target.probe_serial().to_string() {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "Worker 探针身份与目标连接中的 probe_serial 不一致",
+                false,
+            ));
+        }
+        let target_fingerprint = target_fingerprint(target)?;
         if let Some(existing) = self.by_key.get(plan.capture_key()) {
-            if existing.request_fingerprint == plan.request_fingerprint {
+            if existing.request_fingerprint == plan.request_fingerprint
+                && existing.target_fingerprint == target_fingerprint
+            {
                 return Ok(HssReservationOutcome::Existing(existing.clone()));
             }
             return Err(JlinkError::new(
@@ -1522,15 +1541,29 @@ impl HssStartRegistry {
             .with_detail(
                 "requested_request_fingerprint",
                 json!(plan.request_fingerprint),
-            ));
+            )
+            .with_detail(
+                "original_target_fingerprint",
+                json!(existing.target_fingerprint),
+            )
+            .with_detail("requested_target_fingerprint", json!(target_fingerprint)));
         }
         let reservation = HssCaptureReservation {
-            capture_id: capture_id(probe_identity, plan),
+            capture_id: capture_id(probe_identity, &target_fingerprint, plan),
             request_fingerprint: plan.request_fingerprint.clone(),
+            target_fingerprint,
         };
         self.by_key
             .insert(plan.capture_key.clone(), reservation.clone());
         Ok(HssReservationOutcome::Created(reservation))
+    }
+
+    /// Resolves a previously reserved capture key without changing registry state.
+    #[must_use]
+    pub fn capture_id_for_key(&self, capture_key: &str) -> Option<&str> {
+        self.by_key
+            .get(capture_key)
+            .map(HssCaptureReservation::capture_id)
     }
 
     /// Releases only the exact newly-created reservation after Start failed.
@@ -1585,15 +1618,23 @@ fn normalize_rules(mut rules: Vec<HssThresholdRule>) -> Result<Vec<HssThresholdR
     Ok(rules)
 }
 
-fn capture_id(probe_identity: &str, plan: &HssStartPlan) -> String {
+fn capture_id(probe_identity: &str, target_fingerprint: &str, plan: &HssStartPlan) -> String {
     let mut hasher = Sha256::new();
     hasher.update(probe_identity.as_bytes());
+    hasher.update([0]);
+    hasher.update(target_fingerprint.as_bytes());
     hasher.update([0]);
     hasher.update(plan.capture_key.as_bytes());
     hasher.update([0]);
     hasher.update(plan.request_fingerprint.as_bytes());
     let digest = encode_sha256(&hasher.finalize());
     format!("cap_{}", digest.chars().take(24).collect::<String>())
+}
+
+fn target_fingerprint(target: &TargetConnectionSpec) -> Result<String, JlinkError> {
+    serde_json::to_vec(target)
+        .map(|bytes| sha256(&bytes))
+        .map_err(|error| hss_value_invalid(format!("无法规范化 HSS 目标连接身份：{error}")))
 }
 
 fn sha256(bytes: &[u8]) -> String {

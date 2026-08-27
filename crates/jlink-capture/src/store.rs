@@ -10,7 +10,7 @@ use std::{
 use crc32fast::hash as crc32;
 use jlink_domain::{
     ErrorCode, HssCaptureState, HssDataIntegrity, HssDrainTiming, HssRecoveryNotification,
-    HssRunSnapshot, HssStartPlan, JlinkError,
+    HssRunSnapshot, HssStartPlan, JlinkError, TargetConnectionSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -95,6 +95,7 @@ struct CaptureHeader {
     capture_key: String,
     request_fingerprint: String,
     created_unix_us: u64,
+    target: TargetConnectionSpec,
     plan: HssStartPlan,
 }
 
@@ -140,6 +141,12 @@ impl CaptureSnapshot {
         &self.header.plan
     }
 
+    /// Returns the complete target connection identity bound to this capture.
+    #[must_use]
+    pub const fn target(&self) -> &TargetConnectionSpec {
+        &self.header.target
+    }
+
     /// Returns the verified terminal Worker snapshot.
     #[must_use]
     pub const fn status(&self) -> &HssRunSnapshot {
@@ -172,6 +179,8 @@ pub enum CaptureRecovery {
         capture_key: Option<String>,
         /// Self-describing start plan when the header remains valid.
         plan: Option<HssStartPlan>,
+        /// Complete target connection identity when the header remains valid.
+        target: Option<TargetConnectionSpec>,
         /// Aborted/unknown status with recovery facts.
         status: HssRunSnapshot,
         /// Undeleted partial path retained for later inspection.
@@ -275,10 +284,12 @@ impl CaptureStore {
     pub fn create_writer(
         &self,
         capture_id: &str,
+        target: &TargetConnectionSpec,
         plan: &HssStartPlan,
         max_bytes: u64,
     ) -> Result<CaptureWriter, JlinkError> {
         validate_capture_id(capture_id)?;
+        target.validate()?;
         self.preflight(plan, max_bytes)?;
         let partial_path = self.partial_path(capture_id);
         let completed_path = self.completed_path(capture_id);
@@ -291,6 +302,7 @@ impl CaptureStore {
             capture_key: plan.capture_key().to_owned(),
             request_fingerprint: plan.request_fingerprint().to_owned(),
             created_unix_us: unix_time_us()?,
+            target: target.clone(),
             plan: plan.clone(),
         };
         CaptureWriter::create(partial_path, completed_path, header, max_bytes)
@@ -305,14 +317,53 @@ impl CaptureStore {
         validate_capture_id(capture_id)?;
         let path = self.completed_path(capture_id);
         let scan = scan_capture(&path)?;
+        if scan.header.capture_id != capture_id {
+            return Err(invalid_store("完成 capture 文件名与自描述身份不一致")
+                .with_detail("requested_capture_id", json!(capture_id))
+                .with_detail("stored_capture_id", json!(scan.header.capture_id)));
+        }
         let manifest = scan
             .manifest
             .ok_or_else(|| invalid_store("完成 capture 缺少终态清单"))?;
+        if manifest.snapshot.capture_id != capture_id {
+            return Err(invalid_store("完成 capture 终态清单与自描述身份不一致")
+                .with_detail("capture_id", json!(capture_id))
+                .with_detail("manifest_capture_id", json!(manifest.snapshot.capture_id)));
+        }
         Ok(CaptureSnapshot {
             path,
             header: scan.header,
             manifest,
         })
+    }
+
+    /// Opens and verifies every immutable completed capture in stable path order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable directory, identity, frame, CRC, digest, or local storage error.
+    pub fn completed_snapshots(&self) -> Result<Vec<CaptureSnapshot>, JlinkError> {
+        let mut paths = fs::read_dir(&self.root)
+            .map_err(|error| storage_error(format!("无法扫描 Capture Store：{error}")))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension() == Some(OsStr::new("capture")))
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let capture_id = capture_id_from_store_path(&path, "capture").ok_or_else(|| {
+                    invalid_store("完成 capture 文件名不符合 capture-<id>.capture")
+                })?;
+                let snapshot = self.open_snapshot(&capture_id)?;
+                if snapshot.path() != path {
+                    return Err(invalid_store("完成 capture 路径与自描述身份不一致")
+                        .with_detail("capture_id", json!(capture_id)));
+                }
+                Ok(snapshot)
+            })
+            .collect()
     }
 
     /// Scans every partial file without deleting it and atomically publishes any
@@ -361,6 +412,7 @@ impl CaptureStore {
                     capture_id: scan.header.capture_id.clone(),
                     capture_key: Some(scan.header.capture_key.clone()),
                     plan: Some(scan.header.plan.clone()),
+                    target: Some(scan.header.target.clone()),
                     valid_payload_bytes: scan.valid_payload_bytes,
                     last_host_elapsed_us: scan.last_host_elapsed_us,
                     trailing_bytes: scan.trailing_bytes,
@@ -378,6 +430,7 @@ impl CaptureStore {
                     capture_id,
                     capture_key: None,
                     plan: None,
+                    target: None,
                     valid_payload_bytes: 0,
                     last_host_elapsed_us: 0,
                     trailing_bytes: 0,
@@ -645,6 +698,7 @@ fn scan_capture(path: &Path) -> Result<CaptureScan, JlinkError> {
     let header: CaptureHeader = serde_json::from_slice(&header_json)
         .map_err(|error| invalid_store(format!("Capture Store 自描述头无效：{error}")))?;
     header.plan.validate()?;
+    header.target.validate()?;
     if header.capture_id.trim().is_empty()
         || header.capture_key != header.plan.capture_key()
         || header.request_fingerprint != header.plan.request_fingerprint()
@@ -786,6 +840,7 @@ struct AbortedRecoveryInput {
     capture_id: String,
     capture_key: Option<String>,
     plan: Option<HssStartPlan>,
+    target: Option<TargetConnectionSpec>,
     valid_payload_bytes: u64,
     last_host_elapsed_us: u64,
     trailing_bytes: u64,
@@ -800,6 +855,7 @@ fn aborted_recovery(input: AbortedRecoveryInput) -> CaptureRecovery {
         capture_id,
         capture_key,
         plan,
+        target,
         valid_payload_bytes,
         last_host_elapsed_us,
         trailing_bytes,
@@ -823,6 +879,7 @@ fn aborted_recovery(input: AbortedRecoveryInput) -> CaptureRecovery {
         capture_id: capture_id.clone(),
         capture_key,
         plan,
+        target,
         status: HssRunSnapshot {
             capture_id,
             state: state.lifecycle(),
@@ -902,6 +959,13 @@ fn validate_json_length(length: usize) -> Result<(), JlinkError> {
 }
 
 fn capture_id_from_partial_path(path: &Path) -> Option<String> {
+    capture_id_from_store_path(path, "partial")
+}
+
+fn capture_id_from_store_path(path: &Path, extension: &str) -> Option<String> {
+    if path.extension()?.to_str()? != extension {
+        return None;
+    }
     path.file_stem()?
         .to_str()?
         .strip_prefix("capture-")
@@ -938,7 +1002,8 @@ mod tests {
 
     use jlink_domain::{
         AccessLayout, AccessPlan, FirmwareIdentityPlan, HssDataIntegrity, HssDrainTiming,
-        HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, ScalarEncoding, VariableSelector,
+        HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, ScalarEncoding,
+        TargetConnectionSpec, TargetInterface, VariableSelector,
     };
     use serde_json::json;
     use tempfile::tempdir;
@@ -980,6 +1045,17 @@ mod tests {
         .expect("start plan")
     }
 
+    fn target() -> TargetConnectionSpec {
+        TargetConnectionSpec::new(
+            "S32K144",
+            TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target fixture")
+    }
+
     fn completed_snapshot(capture_id: &str) -> HssRunSnapshot {
         HssRunSnapshot {
             capture_id: capture_id.to_owned(),
@@ -1015,7 +1091,7 @@ mod tests {
         assert!(estimate.storage_bytes() > estimate.raw_bytes());
 
         let mut writer = store
-            .create_writer("cap-store", &plan, 16 * 1024 * 1024)
+            .create_writer("cap-store", &target(), &plan, 16 * 1024 * 1024)
             .expect("partial writer");
         let partial = writer.partial_path().to_path_buf();
         writer
@@ -1041,9 +1117,13 @@ mod tests {
                 .expect("immutable snapshot reopens"),
             snapshot
         );
+        assert_eq!(
+            store.completed_snapshots().expect("completed index scan"),
+            [snapshot]
+        );
         assert!(
             store
-                .create_writer("cap-store", &plan, 16 * 1024 * 1024)
+                .create_writer("cap-store", &target(), &plan, 16 * 1024 * 1024)
                 .is_err(),
             "completed capture is never overwritten"
         );
@@ -1055,7 +1135,7 @@ mod tests {
         let store = CaptureStore::open(directory.path()).expect("store opens");
         let plan = start_plan();
         let mut writer = store
-            .create_writer("cap-partial", &plan, 16 * 1024 * 1024)
+            .create_writer("cap-partial", &target(), &plan, 16 * 1024 * 1024)
             .expect("partial writer");
         writer
             .append(
@@ -1074,6 +1154,7 @@ mod tests {
             capture_id,
             capture_key,
             plan: _,
+            target: recovered_target,
             status,
             path,
         } = &recovery[0]
@@ -1082,6 +1163,7 @@ mod tests {
         };
         assert_eq!(capture_id, "cap-partial");
         assert_eq!(capture_key.as_deref(), Some("store-fixture"));
+        assert_eq!(recovered_target.as_ref(), Some(&target()));
         assert_eq!(status.state, HssRunState::Aborted);
         assert_eq!(status.integrity, HssDataIntegrity::Unknown);
         assert!(status.partial_available);
@@ -1096,7 +1178,7 @@ mod tests {
         let store = CaptureStore::open(directory.path()).expect("store opens");
         let plan = start_plan();
         let mut writer = store
-            .create_writer("cap-corrupt", &plan, 16 * 1024 * 1024)
+            .create_writer("cap-corrupt", &target(), &plan, 16 * 1024 * 1024)
             .expect("partial writer");
         writer
             .append(

@@ -497,8 +497,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 }
 ```
 
-- `capture_key` 必填，由 Agent 提供；同一规范化请求和 key 幂等映射到同一 capture。
-- 相同 key 配置不同请求返回 `CAPTURE_KEY_CONFLICT`。
+- `capture_key` 必填，由 Agent 提供；同一目标连接身份、规范化请求和 key 幂等映射到同一 capture。
+- 相同 key 配置不同目标连接或不同请求返回 `CAPTURE_KEY_CONFLICT`；目标身份与请求身份由内部持久化，不增加公共输入字段。
 - `duration_s` 为 `1..300`；`rate_hz` 为 `1..1000`，属于请求值而不是无损保证。
 - `return_when` 必填：`started | completed`。
 - MCP 内部按固定时长自动停止、尾部排空和完成校验，不提供 Agent `stop` action。

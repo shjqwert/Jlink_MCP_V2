@@ -6,13 +6,106 @@ use std::{
     process::{Command, Stdio},
     sync::{Arc, Barrier},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use jlink_domain::ErrorCode;
-use jlink_mcp::worker_client::{WorkerLaunchSpec, attach_or_spawn};
+use jlink_mcp::worker_client::{WorkerClient, WorkerLaunchSpec, attach_or_spawn};
 
 const DLL_PATH: &str = r"C:\Program Files (x86)\SEGGER\JLink\JLink_x64.dll";
+
+fn verify_idle_orphan_exit(
+    worker: &std::path::Path,
+    lease_root: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let orphan_probe = format!("t-p3-orphan-{}", std::process::id());
+    let orphan_spec = WorkerLaunchSpec {
+        executable: worker.to_path_buf(),
+        lease_root: lease_root.join("orphan-leases"),
+        probe_identity: orphan_probe.clone(),
+        dll_path: PathBuf::from(DLL_PATH),
+    };
+    let mut parent = Command::new("cmd")
+        .args(["/C", "ping -n 10 127.0.0.1 >nul"])
+        .spawn()?;
+    let mut orphan = Command::new(worker)
+        .arg("--lease-root")
+        .arg(&orphan_spec.lease_root)
+        .arg("--probe")
+        .arg(&orphan_probe)
+        .arg("--dll")
+        .arg(DLL_PATH)
+        .arg("--parent-pid")
+        .arg(parent.id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let orphan_client = WorkerClient::for_probe(&orphan_probe)?;
+    let attach_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match orphan_client.status() {
+            Ok(_) => break,
+            Err(error) if error.code == ErrorCode::WorkerUnavailable => {
+                if Instant::now() >= attach_deadline {
+                    let _ = orphan.kill();
+                    let _ = orphan.wait();
+                    let _ = parent.kill();
+                    let _ = parent.wait();
+                    return Err("孤立 Worker 未建立端点".into());
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    parent.kill()?;
+    parent.wait()?;
+    let exit_deadline = Instant::now() + Duration::from_secs(5);
+    while orphan.try_wait()?.is_none() {
+        if Instant::now() >= exit_deadline {
+            let _ = orphan.kill();
+            let _ = orphan.wait();
+            return Err("父进程退出后，无活动 HSS 的 Worker 未释放资源".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut replacement = attach_or_spawn(&orphan_spec)?;
+    if !replacement.spawned {
+        return Err("孤立 Worker 退出后探针租约仍未释放".into());
+    }
+    replacement.client.disconnect()?;
+    replacement
+        .spawned_child_mut()
+        .ok_or("孤立恢复 Worker 缺少子进程句柄")?
+        .wait()?;
+    Ok(())
+}
+
+fn verify_competing_worker_rejected(
+    worker: &std::path::Path,
+    spec: &WorkerLaunchSpec,
+    probe_identity: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let competing = Command::new(worker)
+        .arg("--lease-root")
+        .arg(&spec.lease_root)
+        .arg("--probe")
+        .arg(probe_identity)
+        .arg("--dll")
+        .arg(DLL_PATH)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()?;
+    let error = String::from_utf8_lossy(&competing.stderr);
+    if competing.status.success() || !error.contains(ErrorCode::ProbeBusy.as_str()) {
+        return Err(format!("第二 Worker 未返回 PROBE_BUSY：{error}").into());
+    }
+    Ok(())
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let worker = env::args_os()
@@ -76,21 +169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("附着优先未复用同一 Worker".into());
     }
 
-    let competing = Command::new(&worker)
-        .arg("--lease-root")
-        .arg(&spec.lease_root)
-        .arg("--probe")
-        .arg(&probe_identity)
-        .arg("--dll")
-        .arg(DLL_PATH)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    let competing_error = String::from_utf8_lossy(&competing.stderr);
-    if competing.status.success() || !competing_error.contains(ErrorCode::ProbeBusy.as_str()) {
-        return Err(format!("第二 Worker 未返回 PROBE_BUSY：{competing_error}").into());
-    }
+    verify_competing_worker_rejected(&worker, &spec, &probe_identity)?;
 
     let child = first.spawned_child_mut().ok_or("首次附着缺少子进程句柄")?;
     child.kill()?;
@@ -117,6 +196,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("正常恢复 Worker 缺少子进程句柄")?
         .wait()?;
 
-    println!("T-P1-IPC 通过：附着优先、单 Worker、探针互斥、崩溃与正常退出释放租约均符合预期");
+    verify_idle_orphan_exit(&worker, directory.path())?;
+
+    println!(
+        "T-P1-IPC 通过：附着优先、单 Worker、探针互斥、崩溃、正常退出和无活动 HSS 的父进程退出释放租约均符合预期"
+    );
     Ok(())
 }

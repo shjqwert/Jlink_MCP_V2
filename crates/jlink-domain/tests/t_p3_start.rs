@@ -3,7 +3,7 @@
 use jlink_domain::{
     AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HSS_MAX_EXPANDED_SAMPLE_BYTES,
     HssCapabilities, HssReservationOutcome, HssReturnWhen, HssStartPlan, HssStartRegistry,
-    HssThresholdRule, ScalarEncoding, VariableSelector,
+    HssThresholdRule, ScalarEncoding, TargetConnectionSpec, TargetInterface, VariableSelector,
 };
 use serde_json::json;
 
@@ -17,6 +17,21 @@ fn firmware() -> FirmwareIdentityPlan {
         }]
     }))
     .expect("valid firmware identity fixture")
+}
+
+fn target() -> TargetConnectionSpec {
+    target_with_speed(4_000)
+}
+
+fn target_with_speed(speed_khz: u32) -> TargetConnectionSpec {
+    TargetConnectionSpec::new(
+        "S32K144",
+        TargetInterface::Swd,
+        speed_khz,
+        Some(260_106_173),
+        None,
+    )
+    .expect("valid target fixture")
 }
 
 fn scalar_plan(index: u32, byte_size: u64) -> AccessPlan {
@@ -132,16 +147,17 @@ fn t_p3_start_normalizes_rules_and_binds_them_to_capture_key_idempotency() {
 
     let mut registry = HssStartRegistry::new();
     registry
-        .reserve("260106173", &first)
+        .reserve("260106173", &target(), &first)
         .expect("reserve normalized rules");
     assert!(matches!(
-        registry.reserve("260106173", &reordered),
+        registry.reserve("260106173", &target(), &reordered),
         Ok(HssReservationOutcome::Existing(_))
     ));
 
     let conflict = registry
         .reserve(
             "260106173",
+            &target(),
             &start_plan_with_rules(3, vec![rule("r0", 9), rule("r1", 2)]),
         )
         .expect_err("different start rule must conflict under the same key");
@@ -153,13 +169,13 @@ fn t_p3_start_capture_key_is_idempotent_and_conflicts_with_original_fingerprint(
     let mut registry = HssStartRegistry::new();
     let original = start_plan(3);
     let HssReservationOutcome::Created(created) = registry
-        .reserve("260106173", &original)
+        .reserve("260106173", &target(), &original)
         .expect("reserve capture key")
     else {
         panic!("first reservation must create");
     };
     let HssReservationOutcome::Existing(existing) = registry
-        .reserve("260106173", &original)
+        .reserve("260106173", &target(), &original)
         .expect("recover equivalent request")
     else {
         panic!("same request must recover");
@@ -167,8 +183,18 @@ fn t_p3_start_capture_key_is_idempotent_and_conflicts_with_original_fingerprint(
     assert_eq!(created, existing);
     assert!(created.capture_id().starts_with("cap_"));
 
+    let target_conflict = registry
+        .reserve("260106173", &target_with_speed(1_000), &original)
+        .expect_err("same key on a different target connection must conflict");
+    assert_eq!(target_conflict.code(), ErrorCode::CaptureKeyConflict);
+    let target_details = target_conflict.details.expect("target conflict evidence");
+    assert_ne!(
+        target_details["original_target_fingerprint"],
+        target_details["requested_target_fingerprint"]
+    );
+
     let conflict = registry
-        .reserve("260106173", &start_plan(4))
+        .reserve("260106173", &target(), &start_plan(4))
         .expect_err("different duration under same key must conflict");
     assert_eq!(conflict.code(), ErrorCode::CaptureKeyConflict);
     let details = conflict.details.expect("conflict evidence");

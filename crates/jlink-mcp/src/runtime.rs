@@ -437,6 +437,7 @@ impl Runtime {
             .expect("MCP Schema guarantees hss.action")
         {
             "start" => self.start_hss(arguments),
+            "status" => self.status_hss(arguments),
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
@@ -480,6 +481,43 @@ impl Runtime {
             }
         }
         Ok(ToolCall::success(hss_start_result(&snapshot)))
+    }
+
+    fn status_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let resolved = self.resolve()?;
+        validate_dll_identity(&resolved.jlink)?;
+        self.ensure_attachment(&resolved)?;
+        let mut result = self.read_hss_status(arguments);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+        {
+            self.attachment = None;
+            self.ensure_attachment(&resolved)?;
+            result = self.read_hss_status(arguments);
+        }
+        let snapshot = result?;
+        Ok(ToolCall::success(hss_status_result(&snapshot)))
+    }
+
+    fn read_hss_status(&self, arguments: &Value) -> Result<HssRunSnapshot, JlinkError> {
+        let client = &self
+            .attachment
+            .as_ref()
+            .expect("attachment was established")
+            .client;
+        match (
+            arguments.get("capture_id").and_then(Value::as_str),
+            arguments.get("capture_key").and_then(Value::as_str),
+        ) {
+            (Some(capture_id), None) => client.hss_status(capture_id),
+            (None, Some(capture_key)) => client.hss_status_by_key(capture_key),
+            _ => Err(JlinkError::new(
+                ErrorCode::ValueInvalid,
+                "jlink_hss.status 必须且只能提供 capture_id 或 capture_key",
+                false,
+            )),
+        }
     }
 
     fn inspect_symbols(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -814,6 +852,15 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
             json!(snapshot.partial_available),
         );
     }
+    Value::Object(result)
+}
+
+fn hss_status_result(snapshot: &HssRunSnapshot) -> Value {
+    let mut result = hss_start_result(snapshot)
+        .as_object()
+        .expect("HSS result is an object")
+        .clone();
+    result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
     Value::Object(result)
 }
 
@@ -1185,7 +1232,7 @@ fn config_value_error(name: &str) -> JlinkError {
 mod hss_state_tests {
     use jlink_domain::{ErrorCode, HssDataIntegrity, HssDrainTiming, HssRunSnapshot, HssRunState};
 
-    use super::hss_start_result;
+    use super::{hss_start_result, hss_status_result};
 
     fn snapshot(state: HssRunState, integrity: HssDataIntegrity) -> HssRunSnapshot {
         HssRunSnapshot {
@@ -1227,5 +1274,13 @@ mod hss_state_tests {
         assert_eq!(result["quality"]["loss"]["evidence"], "unknown");
         assert!(result["quality"]["loss"].get("lost_samples").is_none());
         assert_eq!(result["quality"]["clock"]["source_resolution_us"], 1_000);
+    }
+
+    #[test]
+    fn recovered_running_status_exposes_same_identity_and_elapsed_time() {
+        let result = hss_status_result(&snapshot(HssRunState::Running, HssDataIntegrity::Unknown));
+        assert_eq!(result["capture_id"], "cap-state");
+        assert_eq!(result["state"], "running");
+        assert_eq!(result["elapsed_us"], 10);
     }
 }

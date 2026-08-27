@@ -9,6 +9,7 @@ use jlink_domain::{
     ErrorCode, HssCaptureReservation, HssCaptureState, HssDrainTiming, HssQualitySummary,
     HssQualityTracker, HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState,
     HssStartPlan, HssStartRegistry, HssWriteResult, HssWriteTiming, JlinkError,
+    TargetConnectionSpec,
 };
 use serde_json::json;
 
@@ -101,43 +102,74 @@ pub(crate) struct HssCoordinator {
 }
 
 impl HssCoordinator {
-    pub(crate) fn open(root: impl Into<PathBuf>) -> Result<Self, JlinkError> {
+    pub(crate) fn open(root: impl Into<PathBuf>, probe_identity: &str) -> Result<Self, JlinkError> {
         let store = CaptureStore::open(root)?;
+        let recoveries = store.recover_partials()?;
+        let mut registry = HssStartRegistry::new();
         let mut terminal = BTreeMap::new();
-        for recovery in store.recover_partials()? {
+        for snapshot in store.completed_snapshots()? {
+            let reservation =
+                registry.reserve(probe_identity, snapshot.target(), snapshot.plan())?;
+            validate_recovered_capture_id(&reservation, snapshot.capture_id())?;
+            terminal.insert(
+                snapshot.capture_id().to_owned(),
+                TerminalCapture {
+                    snapshot: snapshot.status().clone(),
+                    _plan: Some(snapshot.plan().clone()),
+                    _store: Some(snapshot),
+                    _failure: None,
+                },
+            );
+        }
+        for recovery in recoveries {
             match recovery {
-                CaptureRecovery::Published(snapshot) => {
-                    terminal.insert(
-                        snapshot.capture_id().to_owned(),
-                        TerminalCapture {
-                            snapshot: snapshot.status().clone(),
-                            _plan: Some(snapshot.plan().clone()),
-                            _store: Some(snapshot),
-                            _failure: None,
-                        },
-                    );
-                }
+                CaptureRecovery::Published(_) => {}
                 CaptureRecovery::Aborted {
                     capture_id,
                     plan,
+                    target,
                     status,
                     ..
                 } => {
-                    terminal.insert(
-                        capture_id,
-                        TerminalCapture {
-                            snapshot: status,
-                            _plan: plan,
-                            _store: None,
-                            _failure: None,
-                        },
-                    );
+                    match (&target, &plan) {
+                        (Some(target), Some(plan)) => {
+                            let reservation = registry.reserve(probe_identity, target, plan)?;
+                            validate_recovered_capture_id(&reservation, &capture_id)?;
+                        }
+                        (None, None) => {}
+                        _ => {
+                            return Err(JlinkError::new(
+                                ErrorCode::FrameInvalid,
+                                "恢复 capture 的目标身份与启动计划必须同时存在",
+                                false,
+                            )
+                            .with_detail("capture_id", json!(capture_id)));
+                        }
+                    }
+                    if terminal
+                        .insert(
+                            capture_id,
+                            TerminalCapture {
+                                snapshot: status,
+                                _plan: plan,
+                                _store: None,
+                                _failure: None,
+                            },
+                        )
+                        .is_some()
+                    {
+                        return Err(JlinkError::new(
+                            ErrorCode::FrameInvalid,
+                            "同一 capture_id 同时存在完成和部分恢复事实",
+                            false,
+                        ));
+                    }
                 }
             }
         }
         Ok(Self {
             store,
-            registry: HssStartRegistry::new(),
+            registry,
             active: None,
             terminal,
         })
@@ -154,6 +186,7 @@ impl HssCoordinator {
     pub(crate) fn start<I, F>(
         &mut self,
         probe_identity: &str,
+        target: &TargetConnectionSpec,
         plan: HssStartPlan,
         capture_max_bytes: u64,
         io: &mut I,
@@ -163,7 +196,7 @@ impl HssCoordinator {
         I: HssIo,
         F: FnOnce(&mut I) -> Result<(), JlinkError>,
     {
-        let reservation = match self.registry.reserve(probe_identity, &plan)? {
+        let reservation = match self.registry.reserve(probe_identity, target, &plan)? {
             HssReservationOutcome::Existing(reservation) => {
                 let snapshot = self.status(reservation.capture_id(), Instant::now())?;
                 return Ok(HssStartOutcome {
@@ -188,7 +221,7 @@ impl HssCoordinator {
         let capture_id = reservation.capture_id().to_owned();
         let writer = match self
             .store
-            .create_writer(&capture_id, &plan, capture_max_bytes)
+            .create_writer(&capture_id, target, &plan, capture_max_bytes)
         {
             Ok(writer) => writer,
             Err(error) => {
@@ -458,6 +491,21 @@ impl HssCoordinator {
             })
     }
 
+    pub(crate) fn status_by_key(
+        &self,
+        capture_key: &str,
+        now: Instant,
+    ) -> Result<HssRunSnapshot, JlinkError> {
+        let capture_id = self
+            .registry
+            .capture_id_for_key(capture_key)
+            .ok_or_else(|| {
+                JlinkError::new(ErrorCode::ValueInvalid, "Worker 找不到 capture_key", false)
+                    .with_detail("capture_key", json!(capture_key))
+            })?;
+        self.status(capture_id, now)
+    }
+
     pub(crate) fn begin_write(
         &mut self,
         request_id: &str,
@@ -517,6 +565,27 @@ impl HssCoordinator {
             Err(code) => HssWriteResult::Failed { code },
         };
         active.pending_write_impact = Some(token.index);
+    }
+}
+
+fn validate_recovered_capture_id(
+    reservation: &HssReservationOutcome,
+    stored_capture_id: &str,
+) -> Result<(), JlinkError> {
+    let reservation = match reservation {
+        HssReservationOutcome::Created(reservation)
+        | HssReservationOutcome::Existing(reservation) => reservation,
+    };
+    if reservation.capture_id() == stored_capture_id {
+        Ok(())
+    } else {
+        Err(JlinkError::new(
+            ErrorCode::FrameInvalid,
+            "持久化 capture 身份与探针、键和请求指纹不一致",
+            false,
+        )
+        .with_detail("stored_capture_id", json!(stored_capture_id))
+        .with_detail("expected_capture_id", json!(reservation.capture_id())))
     }
 }
 
@@ -662,7 +731,8 @@ mod tests {
         AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssClockMappingMethod,
         HssDataIntegrity, HssNormalizedTimeUnit, HssQualityBasis, HssQualityEventKind,
         HssQualityEvidence, HssRecoveryNotification, HssReturnWhen, HssRunSnapshot, HssRunState,
-        HssSourceTimeUnit, HssStartPlan, HssWriteResult, ScalarEncoding, VariableSelector,
+        HssSourceTimeUnit, HssStartPlan, HssWriteResult, ScalarEncoding, TargetConnectionSpec,
+        VariableSelector,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -759,9 +829,21 @@ mod tests {
         .expect("start plan")
     }
 
+    fn target() -> TargetConnectionSpec {
+        TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target fixture")
+    }
+
     fn open_coordinator() -> (TempDir, HssCoordinator) {
         let root = tempdir().expect("capture store root");
-        let coordinator = HssCoordinator::open(root.path()).expect("capture store opens");
+        let coordinator =
+            HssCoordinator::open(root.path(), "260106173").expect("capture store opens");
         (root, coordinator)
     }
 
@@ -805,6 +887,7 @@ mod tests {
         let capture = coordinator
             .start(
                 "260106173",
+                &target(),
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
@@ -905,6 +988,7 @@ mod tests {
         let outcome = coordinator
             .start(
                 "260106173",
+                &target(),
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
@@ -978,6 +1062,53 @@ mod tests {
     }
 
     #[test]
+    fn t_p3_recover_restores_completed_identity_and_same_key_without_second_start() {
+        let plan = start_plan();
+        let (store_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss::healthy([record(1, 7)]);
+        let started = coordinator
+            .start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
+            .expect("capture starts");
+        let capture_id = started.snapshot.capture_id;
+        let completed = complete_capture(&mut coordinator, &mut io, &capture_id);
+        assert_eq!(completed.state, HssRunState::Completed);
+        drop(coordinator);
+
+        let mut recovered = HssCoordinator::open(store_root.path(), "260106173")
+            .expect("completed capture index restores");
+        let by_key = recovered
+            .status_by_key(plan.capture_key(), Instant::now())
+            .expect("capture key resolves after Worker restart");
+        assert_eq!(by_key.capture_id, capture_id);
+        assert_eq!(by_key.state, HssRunState::Completed);
+
+        let mut second_io = ScriptedHss::healthy([]);
+        let same = recovered
+            .start(
+                "260106173",
+                &target(),
+                plan,
+                TEST_CAPTURE_MAX_BYTES,
+                &mut second_io,
+                |_| panic!("recovered identity must return before hardware preflight"),
+            )
+            .expect("same key and request recover completed capture");
+        assert!(!same.started_new);
+        assert_eq!(same.snapshot.capture_id, capture_id);
+        assert!(
+            second_io.calls.is_empty(),
+            "recovery must not call HSS Start"
+        );
+    }
+
+    #[test]
     fn live_drain_failure_stops_once_and_retains_a_failed_capture() {
         let mut io = ScriptedHss {
             start_error: None,
@@ -996,6 +1127,7 @@ mod tests {
         let outcome = coordinator
             .start(
                 "260106173",
+                &target(),
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
@@ -1045,6 +1177,7 @@ mod tests {
         let error = coordinator
             .start(
                 "260106173",
+                &target(),
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
@@ -1071,9 +1204,14 @@ mod tests {
         );
 
         let recovered = coordinator
-            .start("260106173", plan, TEST_CAPTURE_MAX_BYTES, &mut io, |_| {
-                Ok(())
-            })
+            .start(
+                "260106173",
+                &target(),
+                plan,
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect("same key and request recover the failed identity");
         assert!(!recovered.started_new);
         assert_eq!(recovered.snapshot.capture_id, failed.capture_id);
@@ -1096,6 +1234,7 @@ mod tests {
         let outcome = coordinator
             .start(
                 "260106173",
+                &target(),
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
@@ -1111,12 +1250,20 @@ mod tests {
         assert_eq!(io.calls, ["start", "drain", "stop"]);
         let capture_id = outcome.snapshot.capture_id;
         drop(coordinator);
-        let recovered = HssCoordinator::open(store_root.path()).expect("partial recovery scan");
+        let recovered =
+            HssCoordinator::open(store_root.path(), "260106173").expect("partial recovery scan");
         let snapshot = recovered
             .status(&capture_id, Instant::now())
             .expect("aborted partial remains queryable after restart");
         assert_eq!(snapshot.state, HssRunState::Aborted);
         assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
+        assert_eq!(
+            recovered
+                .status_by_key("run-fixture", Instant::now())
+                .expect("aborted capture key remains queryable")
+                .capture_id,
+            capture_id
+        );
     }
 
     #[test]
@@ -1128,6 +1275,7 @@ mod tests {
         let outcome = coordinator
             .start(
                 "260106173",
+                &target(),
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,

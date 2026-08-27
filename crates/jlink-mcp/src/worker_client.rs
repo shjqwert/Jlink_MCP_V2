@@ -293,6 +293,18 @@ impl WorkerClient {
         response_result(response).and_then(parse_hss_snapshot)
     }
 
+    /// Polls the internal Worker-owned status through an Agent recovery key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable identity, protocol, transport, or Worker error.
+    pub fn hss_status_by_key(&self, capture_key: &str) -> Result<HssRunSnapshot, JlinkError> {
+        let response = self.request(SessionCommand::HssStatus, |request| {
+            request.with_capture_key(capture_key)
+        })?;
+        response_result(response).and_then(parse_hss_snapshot)
+    }
+
     fn request<F>(&self, command: SessionCommand, configure: F) -> Result<IpcResponse, JlinkError>
     where
         F: FnOnce(IpcRequest) -> IpcRequest,
@@ -367,6 +379,8 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         .arg(&spec.probe_identity)
         .arg("--dll")
         .arg(&spec.dll_path)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

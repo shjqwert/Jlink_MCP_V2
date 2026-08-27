@@ -1,10 +1,11 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::PathBuf,
     sync::mpsc::{self, RecvTimeoutError},
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use jlink_domain::{
@@ -12,6 +13,10 @@ use jlink_domain::{
     probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
 };
 use serde_json::json;
+use windows_sys::Win32::{
+    Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
+};
 
 use crate::{
     control::execute_control,
@@ -33,6 +38,8 @@ pub struct WorkerOptions {
     pub probe_identity: String,
     /// Identity-validated J-Link x64 DLL path.
     pub dll_path: PathBuf,
+    /// MCP process whose unexpected exit bounds this Worker's lifetime.
+    pub parent_pid: u32,
 }
 
 impl WorkerOptions {
@@ -65,7 +72,10 @@ impl WorkerOptions {
         }
         let mut values = BTreeMap::new();
         for pair in pairs {
-            if !matches!(pair[0].as_str(), "--lease-root" | "--probe" | "--dll") {
+            if !matches!(
+                pair[0].as_str(),
+                "--lease-root" | "--probe" | "--dll" | "--parent-pid"
+            ) {
                 return Err(JlinkError::new(
                     ErrorCode::ConfigInvalid,
                     format!("未知 Worker 参数：{}", pair[0]),
@@ -89,12 +99,77 @@ impl WorkerOptions {
                 )
             })
         };
+        let parent_pid = required("--parent-pid")?.parse::<u32>().map_err(|_| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "Worker --parent-pid 必须是非零 u32",
+                false,
+            )
+        })?;
+        if parent_pid == 0 {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "Worker --parent-pid 必须是非零 u32",
+                false,
+            ));
+        }
         Ok(Self {
             lease_root: PathBuf::from(required("--lease-root")?),
             probe_identity: required("--probe")?,
             dll_path: PathBuf::from(required("--dll")?),
+            parent_pid,
         })
     }
+}
+
+struct ParentProcess {
+    handle: OwnedHandle,
+}
+
+impl ParentProcess {
+    fn open(parent_pid: u32) -> Result<Self, JlinkError> {
+        // SAFETY: the requested access is read-only synchronization and no raw pointer is passed.
+        let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, parent_pid) };
+        if raw.is_null() {
+            // SAFETY: GetLastError has no preconditions and is read at the failure site.
+            let code = unsafe { GetLastError() };
+            return Err(JlinkError::new(
+                ErrorCode::WorkerUnavailable,
+                format!("无法监视 MCP 父进程 {parent_pid}（Windows 错误 {code}）"),
+                true,
+            ));
+        }
+        Ok(Self {
+            // SAFETY: `raw` is a unique valid process handle returned by OpenProcess.
+            handle: unsafe { OwnedHandle::from_raw_handle(raw) },
+        })
+    }
+
+    fn has_exited(&self) -> Result<bool, JlinkError> {
+        // SAFETY: the owned process handle remains valid for this non-blocking wait.
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+            WAIT_OBJECT_0 => Ok(true),
+            WAIT_TIMEOUT => Ok(false),
+            WAIT_FAILED => {
+                // SAFETY: GetLastError has no preconditions and is read at the failure site.
+                let code = unsafe { GetLastError() };
+                Err(JlinkError::new(
+                    ErrorCode::WorkerUnavailable,
+                    format!("无法检查 MCP 父进程状态（Windows 错误 {code}）"),
+                    false,
+                ))
+            }
+            value => Err(JlinkError::new(
+                ErrorCode::WorkerUnavailable,
+                format!("MCP 父进程等待返回未知状态 {value}"),
+                false,
+            )),
+        }
+    }
+}
+
+const fn orphan_must_exit(parent_exited: bool, hss_active: bool) -> bool {
+    parent_exited && !hss_active
 }
 
 struct WorkerRuntime {
@@ -270,19 +345,22 @@ fn validate_hss_payload(request: &IpcRequest) -> Result<(), JlinkError> {
                     .capture_max_bytes
                     .is_some_and(|max_bytes| max_bytes > 0)
                 && request.capture_id.is_none()
+                && request.capture_key.is_none()
         }
         SessionCommand::HssStatus => {
             request.hss_start.is_none()
                 && request.capture_max_bytes.is_none()
-                && request
-                    .capture_id
-                    .as_deref()
-                    .is_some_and(|capture_id| !capture_id.trim().is_empty())
+                && match (&request.capture_id, &request.capture_key) {
+                    (Some(capture_id), None) => !capture_id.trim().is_empty(),
+                    (None, Some(capture_key)) => !capture_key.trim().is_empty(),
+                    _ => false,
+                }
         }
         _ => {
             request.hss_start.is_none()
                 && request.capture_max_bytes.is_none()
                 && request.capture_id.is_none()
+                && request.capture_key.is_none()
         }
     };
     if valid {
@@ -420,6 +498,7 @@ impl WorkerRuntime {
                 let session = &mut self.session;
                 let outcome = self.hss.start(
                     &self.probe_identity,
+                    &target,
                     plan.clone(),
                     capture_max_bytes,
                     &mut self.gateway,
@@ -454,16 +533,17 @@ impl WorkerRuntime {
         &self,
         request_id: jlink_domain::RequestId,
         capture_id: Option<String>,
+        capture_key: Option<String>,
     ) -> (IpcResponse, bool) {
-        let result = capture_id
-            .ok_or_else(|| {
-                JlinkError::new(
-                    ErrorCode::IpcProtocolError,
-                    "HSS status 缺少 capture_id",
-                    false,
-                )
-            })
-            .and_then(|capture_id| self.hss.status(&capture_id, Instant::now()));
+        let result = match (capture_id, capture_key) {
+            (Some(capture_id), None) => self.hss.status(&capture_id, Instant::now()),
+            (None, Some(capture_key)) => self.hss.status_by_key(&capture_key, Instant::now()),
+            _ => Err(JlinkError::new(
+                ErrorCode::IpcProtocolError,
+                "HSS status 必须且只能提供 capture_id 或 capture_key",
+                false,
+            )),
+        };
         match result {
             Ok(snapshot) => (
                 IpcResponse::success(
@@ -606,7 +686,9 @@ impl WorkerRuntime {
                 request.hss_start,
                 request.capture_max_bytes,
             ),
-            SessionCommand::HssStatus => self.handle_hss_status(request_id, request.capture_id),
+            SessionCommand::HssStatus => {
+                self.handle_hss_status(request_id, request.capture_id, request.capture_key)
+            }
         }
     }
 }
@@ -667,10 +749,14 @@ fn listen_for_requests(
 /// transport cannot be established. Malformed client frames are rejected by
 /// closing that connection while the authoritative Worker remains alive.
 pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
+    let parent = ParentProcess::open(options.parent_pid)?;
     let endpoint = worker_endpoint_name(&options.probe_identity)?;
     let lease = ProbeLease::acquire(&options.lease_root, &options.probe_identity)?;
     let identity_hash = probe_identity_hash(&options.probe_identity)?;
-    let hss = HssCoordinator::open(options.lease_root.join("captures").join(&identity_hash))?;
+    let hss = HssCoordinator::open(
+        options.lease_root.join("captures").join(&identity_hash),
+        &options.probe_identity,
+    )?;
     let gateway = DllGateway::load(&options.dll_path)?;
     let mut runtime = WorkerRuntime {
         probe_identity: options.probe_identity.clone(),
@@ -683,21 +769,24 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     let (request_tx, request_rx) = mpsc::channel();
     let listener = thread::spawn(move || listen_for_requests(&endpoint, &request_tx));
     let mut keep_running = true;
+    let mut parent_exit = false;
     while keep_running {
         if runtime.hss.is_active() && runtime.hss.advance(&mut runtime.gateway)? {
             runtime.session.record_hss_completed();
         }
-        let envelope = if runtime.hss.is_active() {
-            match request_rx.recv_timeout(HssCoordinator::next_wait()) {
-                Ok(envelope) => Some(envelope),
-                Err(RecvTimeoutError::Timeout) => None,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
+        parent_exit = parent.has_exited()?;
+        if orphan_must_exit(parent_exit, runtime.hss.is_active()) {
+            break;
+        }
+        let wait = if runtime.hss.is_active() {
+            HssCoordinator::next_wait()
         } else {
-            match request_rx.recv() {
-                Ok(envelope) => Some(envelope),
-                Err(_) => break,
-            }
+            Duration::from_millis(100)
+        };
+        let envelope = match request_rx.recv_timeout(wait) {
+            Ok(envelope) => Some(envelope),
+            Err(RecvTimeoutError::Timeout) => None,
+            Err(RecvTimeoutError::Disconnected) => break,
         };
         let Some(envelope) = envelope else {
             continue;
@@ -718,6 +807,9 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
                 true,
             ));
         }
+    }
+    if parent_exit {
+        return Ok(());
     }
     match listener.join() {
         Ok(result) => result,
@@ -886,6 +978,28 @@ mod tests {
         .with_capture_id("cap-1");
         validate_request_contract(&valid).expect("internal status identity");
 
+        let valid_key = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("hss-status-key").expect("request id"),
+            SessionCommand::HssStatus,
+        )
+        .with_capture_key("recover-key");
+        validate_request_contract(&valid_key).expect("internal status recovery key");
+
+        let both = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("hss-status-both").expect("request id"),
+            SessionCommand::HssStatus,
+        )
+        .with_capture_id("cap-1")
+        .with_capture_key("recover-key");
+        assert_eq!(
+            validate_request_contract(&both)
+                .expect_err("status identity must be exclusive")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+
         let missing = IpcRequest::new(
             ProtocolVersion::V1,
             RequestId::new("hss-missing").expect("request id"),
@@ -910,5 +1024,21 @@ mod tests {
                 .code,
             ErrorCode::IpcProtocolError
         );
+    }
+
+    #[test]
+    fn t_p3_recover_parent_exit_is_observable_and_only_idle_worker_must_exit() {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "ping -n 10 127.0.0.1 >nul"])
+            .spawn()
+            .expect("bounded parent fixture starts");
+        let parent = ParentProcess::open(child.id()).expect("fixture process is observable");
+        assert!(!parent.has_exited().expect("live parent status"));
+        child.kill().expect("fixture process terminates");
+        child.wait().expect("fixture process is reaped");
+        assert!(parent.has_exited().expect("exited parent status"));
+        assert!(orphan_must_exit(true, false));
+        assert!(!orphan_must_exit(true, true));
+        assert!(!orphan_must_exit(false, false));
     }
 }

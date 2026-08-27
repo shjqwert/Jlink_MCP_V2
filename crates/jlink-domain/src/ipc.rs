@@ -359,6 +359,9 @@ pub struct IpcRequest {
     /// Stable capture identity required only by `hss_status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_id: Option<String>,
+    /// Agent-provided recovery key accepted only by `hss_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_key: Option<String>,
 }
 
 impl IpcRequest {
@@ -381,6 +384,7 @@ impl IpcRequest {
             hss_start: None,
             capture_max_bytes: None,
             capture_id: None,
+            capture_key: None,
         }
     }
 
@@ -437,6 +441,13 @@ impl IpcRequest {
     #[must_use]
     pub fn with_capture_id(mut self, capture_id: impl Into<String>) -> Self {
         self.capture_id = Some(capture_id.into());
+        self
+    }
+
+    /// Attaches one Agent-provided recovery key for internal status lookup.
+    #[must_use]
+    pub fn with_capture_key(mut self, capture_key: impl Into<String>) -> Self {
+        self.capture_key = Some(capture_key.into());
         self
     }
 }
