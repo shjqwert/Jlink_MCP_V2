@@ -1,8 +1,8 @@
 use jlink_domain::{
     ConnectionState, DebugRequest, ErrorCode, FaultDiagnostics, JlinkError, RecoveryAction,
     RecoveryNotification, SessionEvent, TargetConnectionSpec, TargetState, ValidationAfter,
-    ValidationInvalidation, ValidationReport, WorkerStatus, ensure_disconnect_allowed,
-    transition_session,
+    ValidationCheckKind, ValidationInvalidation, ValidationReport, WorkerStatus,
+    ensure_disconnect_allowed, transition_session,
 };
 use serde_json::json;
 
@@ -280,7 +280,7 @@ impl TargetSessionManager {
         }
         self.validation_runs += 1;
         let report = gateway.validation_report(self.validation_runs);
-        if !report.valid {
+        if !ordinary_debug_validation_passed(&report) {
             gateway.close_target();
             self.target_state = TargetState::Unknown;
             self.connection_state =
@@ -421,6 +421,13 @@ impl TargetSessionManager {
     }
 }
 
+fn ordinary_debug_validation_passed(report: &ValidationReport) -> bool {
+    report
+        .checks
+        .iter()
+        .all(|item| item.kind == ValidationCheckKind::HssCapability || item.passed)
+}
+
 fn recover_target<T: RecoveryIo>(
     io: &mut T,
     initial: TargetState,
@@ -485,6 +492,32 @@ mod tests {
     use std::{collections::VecDeque, env, path::PathBuf};
 
     use super::*;
+
+    #[test]
+    fn t_p3_abi_optional_hss_failure_does_not_block_ordinary_debug_validation() {
+        let mut report = ValidationReport {
+            valid: false,
+            checks: vec![jlink_domain::ValidationCheck {
+                kind: ValidationCheckKind::HssCapability,
+                passed: false,
+                detail: "missing JLINK_HSS_Start".to_owned(),
+                recommendation: Some("use a HSS-capable DLL".to_owned()),
+            }],
+            target_state: TargetState::Running,
+            target_id: Some(0x2BA0_1477),
+            validation_runs: 1,
+            recovery_notifications: Vec::new(),
+        };
+        assert!(ordinary_debug_validation_passed(&report));
+
+        report.checks.push(jlink_domain::ValidationCheck {
+            kind: ValidationCheckKind::BackgroundAccess,
+            passed: false,
+            detail: "background read failed".to_owned(),
+            recommendation: None,
+        });
+        assert!(!ordinary_debug_validation_passed(&report));
+    }
 
     struct ScriptedRecovery {
         resume: VecDeque<Result<TargetState, JlinkError>>,

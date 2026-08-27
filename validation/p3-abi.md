@@ -24,7 +24,7 @@ P3-4.1 为 `PASS`。生产 gateway 只声明 F0-A 冻结的 `JLINK_HSS_GetCaps/S
 | 命令 | 结果 | 覆盖 |
 |---|---|---|
 | `cargo test -p jlink-domain --test t_p3_abi` | `PASS`；2/2 | 6.98a 标志、10×32-bit 帧步长、little-endian 双帧解析、不完整尾部保留、无效/溢出布局拒绝 |
-| `cargo test -p jlink-worker --lib t_p3_abi` | `PASS`；2/2，另有 1 个显式冻结 DLL 测试默认忽略 | 函数指针类型、结构体大小/对齐/字段偏移、完整和缺失导出集合 |
+| `cargo test -p jlink-worker --lib t_p3_abi` | `PASS`；3/3，另有 1 个显式冻结 DLL 测试默认忽略 | 函数指针类型、结构体大小/对齐/字段偏移、完整和缺失导出集合；缺失 HSS 只使完整环境报告降级，不阻断普通调试连接，其他失败检查仍阻断 |
 | 设置 `JLINK_MCP_T_P3_ABI_DLL` 后运行精确 ignored 测试 | `PASS`；1/1 | 冻结 6.98a DLL 可加载且四个 HSS 导出全部存在；不连接探针、不启动 HSS |
 
 ## 边界与失效条件
