@@ -672,14 +672,16 @@ fn inspect_output_schema() -> Value {
 }
 
 fn action_output_schema(name: &str, arguments: &Value) -> Option<Value> {
-    (name == "jlink_inspect").then(|| {
-        inspect_success_schema(
+    match name {
+        "jlink_inspect" => Some(inspect_success_schema(
             arguments
                 .get("action")
                 .and_then(Value::as_str)
                 .expect("MCP Schema guarantees inspect.action"),
-        )
-    })
+        )),
+        "jlink_hss" => Some(hss_action_output_schema(arguments)),
+        _ => None,
+    }
 }
 
 fn inspect_success_schema(action: &str) -> Value {
@@ -693,59 +695,263 @@ fn inspect_success_schema(action: &str) -> Value {
 }
 
 fn hss_output_schema() -> Value {
+    closed_schema_union(&[
+        hss_status_output_schema(),
+        hss_overview_output_schema(),
+        hss_completed_start_output_schema(),
+        closed_object(vec![("error", error_schema())], &["error"]),
+    ])
+}
+
+fn hss_action_output_schema(arguments: &Value) -> Value {
+    match arguments
+        .get("action")
+        .and_then(Value::as_str)
+        .expect("MCP Schema guarantees hss.action")
+    {
+        "start" => closed_schema_union(&[
+            hss_status_output_schema(),
+            hss_completed_start_output_schema(),
+        ]),
+        "status" => hss_status_output_schema(),
+        "query" => match arguments
+            .get("view")
+            .and_then(Value::as_str)
+            .expect("non-cursor query Schema guarantees hss.view")
+        {
+            "overview" => hss_overview_output_schema(),
+            _ => hss_output_schema(),
+        },
+        _ => unreachable!("HSS action was validated against the closed catalog"),
+    }
+}
+
+fn hss_status_output_schema() -> Value {
     closed_object(
         vec![
             ("capture_id", non_empty_string()),
-            (
-                "state",
-                string_enum(&[
-                    "starting",
-                    "running",
-                    "stopping",
-                    "completed",
-                    "failed",
-                    "aborted",
-                ]),
-            ),
+            ("state", hss_state_schema()),
             ("elapsed_us", non_negative_integer()),
-            (
-                "dictionary",
-                json!({ "type": "object", "additionalProperties": { "type": "string" } }),
-            ),
-            (
-                "changes",
-                json!({ "type": "array", "items": { "type": "object" } }),
-            ),
-            (
-                "matches",
-                json!({ "type": "array", "items": { "type": "object" } }),
-            ),
-            (
-                "variables",
-                json!({ "type": "array", "items": { "type": "object" } }),
-            ),
-            (
-                "events",
-                json!({ "oneOf": [{ "type": "integer", "minimum": 0 }, { "type": "array", "items": { "type": "object" } }] }),
-            ),
-            ("truncated", boolean()),
-            ("next_cursor", non_empty_string()),
-            ("clock", non_empty_string()),
-            (
-                "time_us",
-                json!({ "type": "array", "items": non_negative_integer() }),
-            ),
-            ("values", json!({ "type": "object" })),
-            ("event", json!({ "type": "object" })),
+            ("complete_records", non_negative_integer()),
+            ("from_us", non_negative_integer()),
+            ("to_us", non_negative_integer()),
             ("failure_code", non_empty_string()),
             ("partial_available", boolean()),
             ("reason", non_empty_string()),
             ("recoverable", boolean()),
-            ("quality", json!({ "type": "object" })),
-            ("error", error_schema()),
+            ("quality", hss_quality_schema()),
         ],
-        &[],
+        &["capture_id", "state"],
     )
+}
+
+fn hss_overview_output_schema() -> Value {
+    closed_object(
+        vec![
+            ("capture_id", non_empty_string()),
+            ("from_us", non_negative_integer()),
+            ("to_us", non_negative_integer()),
+            (
+                "dictionary",
+                json!({ "type": "object", "additionalProperties": non_empty_string() }),
+            ),
+            ("variables", hss_overview_variables_schema()),
+            ("events", non_negative_integer()),
+            ("quality", hss_quality_schema()),
+        ],
+        &[
+            "capture_id",
+            "from_us",
+            "to_us",
+            "dictionary",
+            "variables",
+            "events",
+        ],
+    )
+}
+
+fn hss_completed_start_output_schema() -> Value {
+    let mut schema = hss_overview_output_schema();
+    let object = schema
+        .as_object_mut()
+        .expect("overview Schema is an object");
+    let properties = object
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+        .expect("overview Schema has properties");
+    properties.insert("state".to_owned(), json!({ "const": "completed" }));
+    properties.insert("elapsed_us".to_owned(), non_negative_integer());
+    let required = object
+        .get_mut("required")
+        .and_then(Value::as_array_mut)
+        .expect("overview Schema has required fields");
+    required.push(json!("state"));
+    required.push(json!("elapsed_us"));
+    schema
+}
+
+fn hss_overview_variables_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": closed_object(
+            vec![
+                ("series", non_empty_string()),
+                ("samples", non_negative_integer()),
+                ("changes", non_negative_integer()),
+            ],
+            &["series", "samples", "changes"],
+        )
+    })
+}
+
+fn hss_state_schema() -> Value {
+    string_enum(&[
+        "starting",
+        "running",
+        "stopping",
+        "completed",
+        "failed",
+        "aborted",
+    ])
+}
+
+fn hss_quality_schema() -> Value {
+    closed_object(
+        vec![
+            (
+                "integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
+            ("requested_rate_hz", non_negative_integer()),
+            ("expected_samples", non_negative_integer()),
+            ("actual_samples", non_negative_integer()),
+            ("actual_rate_millihz", non_negative_integer()),
+            ("intervals", hss_interval_schema()),
+            ("loss", hss_assessment_schema("lost_samples")),
+            ("overflow", hss_assessment_schema("events")),
+            ("clock", hss_clock_schema()),
+            ("events", hss_quality_events_schema()),
+        ],
+        &[
+            "integrity",
+            "requested_rate_hz",
+            "expected_samples",
+            "actual_samples",
+            "intervals",
+            "loss",
+            "overflow",
+            "clock",
+        ],
+    )
+}
+
+fn hss_interval_schema() -> Value {
+    closed_object(
+        vec![
+            ("intervals", non_negative_integer()),
+            ("min_us", non_negative_integer()),
+            ("max_us", non_negative_integer()),
+            ("total_us", non_negative_integer()),
+            ("collisions", non_negative_integer()),
+            ("gap_events", non_negative_integer()),
+            ("gap_slots", non_negative_integer()),
+            ("regressions", non_negative_integer()),
+        ],
+        &[
+            "intervals",
+            "total_us",
+            "collisions",
+            "gap_events",
+            "gap_slots",
+            "regressions",
+        ],
+    )
+}
+
+fn hss_assessment_schema(count_name: &'static str) -> Value {
+    closed_object(
+        vec![
+            ("evidence", hss_quality_evidence_schema()),
+            (
+                "basis",
+                string_enum(&[
+                    "no_independent_overflow_or_sequence_counter",
+                    "dll_overflow_signal",
+                    "short_or_malformed_read",
+                    "source_timestamp_gap",
+                    "source_timestamp_regression",
+                ]),
+            ),
+            (count_name, non_negative_integer()),
+        ],
+        &["evidence", "basis"],
+    )
+}
+
+fn hss_clock_schema() -> Value {
+    closed_object(
+        vec![
+            ("source_unit", json!({ "const": "milliseconds" })),
+            ("source_frequency_hz", non_negative_integer()),
+            ("source_resolution_us", non_negative_integer()),
+            ("normalized_unit", json!({ "const": "microseconds" })),
+            ("host_monotonic_since_start", boolean()),
+            (
+                "mapping_method",
+                json!({ "const": "capture_start_call_bound" }),
+            ),
+            ("mapping_error_us", non_negative_integer()),
+            ("first_timestamp_us", non_negative_integer()),
+            ("last_timestamp_us", non_negative_integer()),
+        ],
+        &[
+            "source_unit",
+            "source_frequency_hz",
+            "source_resolution_us",
+            "normalized_unit",
+            "host_monotonic_since_start",
+            "mapping_method",
+        ],
+    )
+}
+
+fn hss_quality_events_schema() -> Value {
+    json!({
+        "type": "array",
+        "items": closed_object(
+            vec![
+                (
+                    "kind",
+                    string_enum(&[
+                        "buffer_overflow",
+                        "short_frame",
+                        "frame_format",
+                        "sample_interval",
+                        "clock_regression",
+                    ]),
+                ),
+                ("evidence", hss_quality_evidence_schema()),
+                ("first_host_elapsed_us", non_negative_integer()),
+                ("last_host_elapsed_us", non_negative_integer()),
+                ("first_record", non_negative_integer()),
+                ("last_record", non_negative_integer()),
+                ("occurrences", non_negative_integer()),
+            ],
+            &[
+                "kind",
+                "evidence",
+                "first_host_elapsed_us",
+                "last_host_elapsed_us",
+                "first_record",
+                "last_record",
+                "occurrences",
+            ],
+        )
+    })
+}
+
+fn hss_quality_evidence_schema() -> Value {
+    string_enum(&["confirmed", "suspected", "unknown"])
 }
 
 fn empty_or_error_output() -> Value {
@@ -921,6 +1127,23 @@ fn tagged_union(tag: &str, variants: Vec<Value>) -> Value {
     schema.insert("additionalProperties".to_owned(), json!(false));
     schema.insert("oneOf".to_owned(), Value::Array(variants));
     Value::Object(schema)
+}
+
+fn closed_schema_union(variants: &[Value]) -> Value {
+    let mut properties = Map::new();
+    for variant in variants {
+        if let Some(variant_properties) = variant.get("properties").and_then(Value::as_object) {
+            for name in variant_properties.keys() {
+                properties.entry(name.clone()).or_insert_with(|| json!({}));
+            }
+        }
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "additionalProperties": false,
+        "oneOf": variants
+    })
 }
 
 fn tagged_object(

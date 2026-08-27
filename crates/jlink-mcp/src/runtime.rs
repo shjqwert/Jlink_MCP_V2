@@ -2,12 +2,13 @@
 
 use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
+use jlink_capture::{CaptureSnapshot, CaptureStore, overview};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
     HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
     MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
-    ValidationAfter, VariableSelector, WriteVerify,
+    ValidationAfter, VariableSelector, WriteVerify, probe_identity_hash,
 };
 use serde_json::{Map, Value, json};
 
@@ -438,6 +439,9 @@ impl Runtime {
         {
             "start" => self.start_hss(arguments),
             "status" => self.status_hss(arguments),
+            "query" if arguments.get("view").and_then(Value::as_str) == Some("overview") => {
+                self.overview_hss(arguments)
+            }
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
@@ -480,7 +484,22 @@ impl Runtime {
                 snapshot = status?;
             }
         }
-        Ok(ToolCall::success(hss_start_result(&snapshot)))
+        if snapshot.state == HssRunState::Completed {
+            let result = self.completed_overview(snapshot.capture_id.as_str())?;
+            let mut result = serde_json::to_value(result)
+                .map_err(serialization_error)?
+                .as_object()
+                .expect("CaptureOverview serializes as an object")
+                .clone();
+            result.insert("state".to_owned(), json!(snapshot.state));
+            result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
+            Ok(ToolCall::with_raw_capture(
+                Value::Object(result),
+                snapshot.capture_id.as_str(),
+            ))
+        } else {
+            Ok(ToolCall::success(hss_start_result(&snapshot)))
+        }
     }
 
     fn status_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -497,7 +516,65 @@ impl Runtime {
             result = self.read_hss_status(arguments);
         }
         let snapshot = result?;
-        Ok(ToolCall::success(hss_status_result(&snapshot)))
+        let structured = hss_status_result(&snapshot)?;
+        if snapshot.state == HssRunState::Completed {
+            Ok(ToolCall::with_raw_capture(
+                structured,
+                snapshot.capture_id.as_str(),
+            ))
+        } else {
+            Ok(ToolCall::success(structured))
+        }
+    }
+
+    fn overview_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let snapshot = self.completed_snapshot(arguments)?;
+        let capture_id = snapshot.capture_id().to_owned();
+        let result = overview(&snapshot)?;
+        Ok(ToolCall::with_raw_capture(
+            serde_json::to_value(result).map_err(serialization_error)?,
+            &capture_id,
+        ))
+    }
+
+    fn completed_overview(
+        &self,
+        capture_id: &str,
+    ) -> Result<jlink_capture::CaptureOverview, JlinkError> {
+        let arguments = json!({ "capture_id": capture_id });
+        overview(&self.completed_snapshot(&arguments)?)
+    }
+
+    fn completed_snapshot(&self, arguments: &Value) -> Result<CaptureSnapshot, JlinkError> {
+        let resolved = self.resolve()?;
+        let probe = resolved.probe.serial.as_ref().ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "查询 HSS capture 前必须配置 probe.serial",
+                false,
+            )
+        })?;
+        let identity_hash = probe_identity_hash(&probe.value.to_string())?;
+        let root = self.lease_root.join("captures").join(identity_hash);
+        let Some(store) = CaptureStore::open_existing(root)? else {
+            return Err(capture_not_found(arguments));
+        };
+        match (
+            arguments.get("capture_id").and_then(Value::as_str),
+            arguments.get("capture_key").and_then(Value::as_str),
+        ) {
+            (Some(capture_id), None) => store
+                .find_snapshot(capture_id)?
+                .ok_or_else(|| capture_not_found(arguments)),
+            (None, Some(capture_key)) => store
+                .find_snapshot_by_key(capture_key)?
+                .ok_or_else(|| capture_not_found(arguments)),
+            _ => Err(JlinkError::new(
+                ErrorCode::ValueInvalid,
+                "HSS 查询必须且只能提供 capture_id 或 capture_key",
+                false,
+            )),
+        }
     }
 
     fn read_hss_status(&self, arguments: &Value) -> Result<HssRunSnapshot, JlinkError> {
@@ -855,13 +932,65 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
     Value::Object(result)
 }
 
-fn hss_status_result(snapshot: &HssRunSnapshot) -> Value {
+fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
     let mut result = hss_start_result(snapshot)
         .as_object()
         .expect("HSS result is an object")
         .clone();
     result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
-    Value::Object(result)
+    result.insert(
+        "complete_records".to_owned(),
+        json!(snapshot.complete_records),
+    );
+    if snapshot.quality.requested_rate_hz > 0 || snapshot.complete_records > 0 {
+        let mut quality = serde_json::to_value(&snapshot.quality)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("HssQualitySummary serializes as an object")
+            .clone();
+        quality.insert("integrity".to_owned(), json!(snapshot.integrity));
+        result.insert("quality".to_owned(), Value::Object(quality));
+    }
+    if let Some((from_us, to_us)) = persisted_range(snapshot)? {
+        result.insert("from_us".to_owned(), json!(from_us));
+        result.insert("to_us".to_owned(), json!(to_us));
+    }
+    Ok(Value::Object(result))
+}
+
+fn persisted_range(snapshot: &HssRunSnapshot) -> Result<Option<(u64, u64)>, JlinkError> {
+    match (
+        snapshot.quality.clock.first_timestamp_us,
+        snapshot.quality.clock.last_timestamp_us,
+    ) {
+        (None, None) => Ok(None),
+        (Some(from_us), Some(last_us)) => last_us
+            .checked_add(u64::from(snapshot.quality.clock.source_resolution_us))
+            .map(|to_us| Some((from_us, to_us)))
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::FrameInvalid,
+                    "HSS 已持久化范围结束边界溢出",
+                    false,
+                )
+            }),
+        _ => Err(JlinkError::new(
+            ErrorCode::FrameInvalid,
+            "HSS 已持久化范围只有一个时间边界",
+            false,
+        )),
+    }
+}
+
+fn capture_not_found(arguments: &Value) -> JlinkError {
+    let mut error = JlinkError::new(ErrorCode::ValueInvalid, "找不到已完成的 HSS capture", false);
+    if let Some(capture_id) = arguments.get("capture_id") {
+        error = error.with_detail("capture_id", capture_id.clone());
+    }
+    if let Some(capture_key) = arguments.get("capture_key") {
+        error = error.with_detail("capture_key", capture_key.clone());
+    }
+    error
 }
 
 impl Drop for Runtime {
@@ -1278,9 +1407,19 @@ mod hss_state_tests {
 
     #[test]
     fn recovered_running_status_exposes_same_identity_and_elapsed_time() {
-        let result = hss_status_result(&snapshot(HssRunState::Running, HssDataIntegrity::Unknown));
+        let mut running = snapshot(HssRunState::Running, HssDataIntegrity::Unknown);
+        running.quality.requested_rate_hz = 1_000;
+        running.quality.expected_samples = 1_000;
+        running.quality.actual_samples = 1;
+        running.quality.clock.first_timestamp_us = Some(10_000);
+        running.quality.clock.last_timestamp_us = Some(10_000);
+        let result = hss_status_result(&running).expect("status result");
         assert_eq!(result["capture_id"], "cap-state");
         assert_eq!(result["state"], "running");
         assert_eq!(result["elapsed_us"], 10);
+        assert_eq!(result["complete_records"], 1);
+        assert_eq!(result["from_us"], 10_000);
+        assert_eq!(result["to_us"], 11_000);
+        assert_eq!(result["quality"]["integrity"], "unknown");
     }
 }

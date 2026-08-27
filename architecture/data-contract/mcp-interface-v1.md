@@ -509,21 +509,27 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 { "capture_id": "cap_01J...", "state": "running" }
 ```
 
-`return_when = completed`：返回 `capture_id`、`state` 和最小 overview：
+`return_when = completed`：返回 `capture_id`、`state` 和与 `query.overview` 相同的最小导航字段；完整路径只在 `dictionary` 登记：
 
 ```json
 {
   "capture_id": "cap_01J...",
   "state": "completed",
   "elapsed_us": 30001234,
+  "from_us": 0,
+  "to_us": 30001000,
+  "dictionary": {
+    "s0": "motor",
+    "s1": "temperature"
+  },
   "variables": [
     {
-      "path": "motor",
+      "series": "s0",
       "samples": 30000,
       "changes": 83
     },
     {
-      "path": "temperature",
+      "series": "s1",
       "samples": 30000,
       "changes": 19
     }
@@ -559,10 +565,17 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 { "action": "status", "capture_key": "boot-check-001" }
 ```
 
-两者必须且只能提供一个。运行中示例：
+两者必须且只能提供一个。运行中示例；`from_us/to_us` 是已持久化源时间的半开区间，`to_us` 为最后一条完整记录的源时间加已声明源分辨率，尚无完整记录时省略：
 
 ```json
-{ "state": "running", "elapsed_us": 12400000 }
+{
+  "capture_id": "cap_01J...",
+  "state": "running",
+  "elapsed_us": 12400000,
+  "complete_records": 12400,
+  "from_us": 0,
+  "to_us": 12400000
+}
 ```
 
 `state` 为 `starting | running | stopping | completed | failed | aborted`。
@@ -596,7 +609,26 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 }
 ```
 
-返回采集边界、每个顶层变量的 `samples`/`changes`、事件数量和异常质量，不返回成员预览。`content` 同时附带：
+返回采集边界、每个顶层变量的 `samples`/`changes`、事件数量和异常质量，不返回成员预览。结果的固定形状为：
+
+```json
+{
+  "capture_id": "cap_01J...",
+  "from_us": 0,
+  "to_us": 30001000,
+  "dictionary": {
+    "s0": "motor",
+    "s1": "temperature"
+  },
+  "variables": [
+    { "series": "s0", "samples": 30000, "changes": 83 },
+    { "series": "s1", "samples": 30000, "changes": 19 }
+  ],
+  "events": 2
+}
+```
+
+`from_us/to_us` 为半开区间；`events` 统计已持久化的写入、恢复和质量事件出现次数。J-Link 6.98a 的 loss/overflow 证据为 `unknown` 时必须返回 `quality`，空的 `quality.events` 省略。`content` 同时附带：
 
 ```json
 {

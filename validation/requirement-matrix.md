@@ -78,9 +78,9 @@ public contract and is recorded in the implementation constraints.
 | HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` target-bound recovery + `validation/p3-stage.md` parent-exit hardware smoke | F0-B |
 | HSSA-010 | T-P3-QUALITY | `validation/p3-quality.md` rate/interval fixture + `validation/p3-stage.md` hardware rate | F0-A |
 | HSSA-011 | T-P3-QUALITY | `validation/p3-quality.md` clock fixture + `validation/p3-stage.md` hardware clock | F0-A |
-| HSSQ-001 | T-P4-OVERVIEW | Capture fixture integration | None |
-| HSSQ-002 | T-P4-OVERVIEW | Capture fixture integration | None |
-| HSSQ-003 | T-P4-OVERVIEW | Capture fixture integration | F0-D resource observation |
+| HSSQ-001 | T-P4-OVERVIEW | `validation/p4-overview.md` status range + immutable lookup | None |
+| HSSQ-002 | T-P4-OVERVIEW | `validation/p4-overview.md` strict view Schema | None |
+| HSSQ-003 | T-P4-OVERVIEW | `validation/p4-overview.md` navigation counts + raw link | F0-D resource observation |
 | HSSQ-004 | T-P4-CHANGES | Deterministic query fixture | None |
 | HSSQ-005 | T-P4-WINDOW | Deterministic query fixture | None |
 | HSSQ-006 | T-P4-WINDOW | Deterministic query fixture | None |

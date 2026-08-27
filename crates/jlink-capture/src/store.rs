@@ -164,6 +164,21 @@ impl CaptureSnapshot {
     pub fn raw_sha256(&self) -> &str {
         &self.manifest.raw_sha256
     }
+
+    /// Reads the concatenated raw HSS payload after re-verifying the immutable file.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable identity, frame, CRC, digest, or local storage error.
+    pub(crate) fn read_verified_payload(&self) -> Result<Vec<u8>, JlinkError> {
+        let scan = scan_capture(&self.path, true)?;
+        if scan.header != self.header || scan.manifest.as_ref() != Some(&self.manifest) {
+            return Err(invalid_store(
+                "查询期间 Capture Store 自描述身份或终态清单发生变化",
+            ));
+        }
+        Ok(scan.raw_payload)
+    }
 }
 
 /// Startup classification of one file left with a `.partial` suffix.
@@ -209,6 +224,28 @@ impl CaptureStore {
             ))
         })?;
         Ok(Self { root })
+    }
+
+    /// Opens an existing store root without creating directories or capture files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable local storage error when metadata cannot be inspected or
+    /// the existing path is not a directory.
+    pub fn open_existing(root: impl Into<PathBuf>) -> Result<Option<Self>, JlinkError> {
+        let root = root.into();
+        match fs::metadata(&root) {
+            Ok(metadata) if metadata.is_dir() => Ok(Some(Self { root })),
+            Ok(_) => Err(storage_error(format!(
+                "Capture Store 根路径不是目录：{}",
+                root.display()
+            ))),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(storage_error(format!(
+                "无法读取 Capture Store 根路径 {}：{error}",
+                root.display()
+            ))),
+        }
     }
 
     /// Returns the local store root.
@@ -316,7 +353,7 @@ impl CaptureStore {
     pub fn open_snapshot(&self, capture_id: &str) -> Result<CaptureSnapshot, JlinkError> {
         validate_capture_id(capture_id)?;
         let path = self.completed_path(capture_id);
-        let scan = scan_capture(&path)?;
+        let scan = scan_capture(&path, false)?;
         if scan.header.capture_id != capture_id {
             return Err(invalid_store("完成 capture 文件名与自描述身份不一致")
                 .with_detail("requested_capture_id", json!(capture_id))
@@ -335,6 +372,57 @@ impl CaptureStore {
             header: scan.header,
             manifest,
         })
+    }
+
+    /// Finds one immutable completed capture by stable identity without creating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable identity, frame, CRC, digest, or local storage error.
+    pub fn find_snapshot(&self, capture_id: &str) -> Result<Option<CaptureSnapshot>, JlinkError> {
+        validate_capture_id(capture_id)?;
+        let path = self.completed_path(capture_id);
+        match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => self.open_snapshot(capture_id).map(Some),
+            Ok(_) => Err(invalid_store(format!(
+                "完成 capture 路径不是文件：{}",
+                path.display()
+            ))),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(storage_error(format!(
+                "无法读取完成 capture 元数据 {}：{error}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Finds one immutable completed capture by Agent-provided recovery key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable frame or local storage error. Duplicate keys are rejected
+    /// as an invalid immutable index instead of selecting an arbitrary capture.
+    pub fn find_snapshot_by_key(
+        &self,
+        capture_key: &str,
+    ) -> Result<Option<CaptureSnapshot>, JlinkError> {
+        if capture_key.trim().is_empty() {
+            return Err(JlinkError::new(
+                ErrorCode::ValueInvalid,
+                "capture_key 不能为空或仅包含空白",
+                false,
+            ));
+        }
+        let mut found = None;
+        for snapshot in self.completed_snapshots()? {
+            if snapshot.capture_key() != capture_key {
+                continue;
+            }
+            if found.replace(snapshot).is_some() {
+                return Err(invalid_store("同一 Capture Store 存在重复 capture_key"));
+            }
+        }
+        Ok(found)
     }
 
     /// Opens and verifies every immutable completed capture in stable path order.
@@ -388,7 +476,7 @@ impl CaptureStore {
     }
 
     fn recover_one(&self, path: PathBuf) -> Result<CaptureRecovery, JlinkError> {
-        match scan_capture(&path) {
+        match scan_capture(&path, false) {
             Ok(scan) => {
                 if let Some(manifest) = scan.manifest {
                     let completed_path = self.completed_path(&scan.header.capture_id);
@@ -645,7 +733,7 @@ impl CaptureWriter {
             .and_then(|()| writer.get_ref().sync_all())
             .map_err(|error| storage_error(format!("无法提交 Capture Store 终态：{error}")))?;
         drop(writer);
-        let scan = scan_capture(&self.partial_path)?;
+        let scan = scan_capture(&self.partial_path, false)?;
         let verified_manifest = scan
             .manifest
             .ok_or_else(|| invalid_store("原子发布前缺少已校验终态清单"))?;
@@ -670,9 +758,10 @@ struct CaptureScan {
     last_host_elapsed_us: u64,
     trailing_bytes: u64,
     crc_error: bool,
+    raw_payload: Vec<u8>,
 }
 
-fn scan_capture(path: &Path) -> Result<CaptureScan, JlinkError> {
+fn scan_capture(path: &Path, retain_payload: bool) -> Result<CaptureScan, JlinkError> {
     let mut file = File::open(path)
         .map_err(|error| storage_error(format!("无法打开 {}：{error}", path.display())))?;
     let file_len = file
@@ -713,6 +802,7 @@ fn scan_capture(path: &Path) -> Result<CaptureScan, JlinkError> {
         last_host_elapsed_us: 0,
         trailing_bytes: 0,
         crc_error: false,
+        raw_payload: Vec::new(),
     };
     let mut raw_hasher = Sha256::new();
     loop {
@@ -739,7 +829,13 @@ fn scan_capture(path: &Path) -> Result<CaptureScan, JlinkError> {
             scan.trailing_bytes = file_len.saturating_sub(position);
             return Ok(scan);
         }
-        if !read_block(&mut file, file_len, &mut scan, &mut raw_hasher)? {
+        if !read_block(
+            &mut file,
+            file_len,
+            &mut scan,
+            &mut raw_hasher,
+            retain_payload,
+        )? {
             return Ok(scan);
         }
     }
@@ -750,6 +846,7 @@ fn read_block(
     file_len: u64,
     scan: &mut CaptureScan,
     raw_hasher: &mut Sha256,
+    retain_payload: bool,
 ) -> Result<bool, JlinkError> {
     let mut header = [0_u8; BLOCK_HEADER_REST_LEN];
     if let Err(error) = file.read_exact(&mut header) {
@@ -793,6 +890,9 @@ fn read_block(
         return Ok(false);
     }
     raw_hasher.update(&payload);
+    if retain_payload {
+        scan.raw_payload.extend_from_slice(&payload);
+    }
     scan.valid_blocks += 1;
     scan.valid_payload_bytes += u64::try_from(payload_len).expect("bounded payload fits u64");
     scan.last_host_elapsed_us = host_elapsed_us;

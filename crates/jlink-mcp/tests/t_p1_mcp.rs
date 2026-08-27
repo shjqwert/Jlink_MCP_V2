@@ -64,9 +64,11 @@ impl ToolDispatcher for ContractFixture {
             ("jlink_hss", Some("query")) => ToolCall::with_raw_capture(
                 json!({
                     "capture_id": "cap_t_p1_mcp",
-                    "state": "completed",
-                    "events": 0,
-                    "truncated": false
+                    "from_us": 0,
+                    "to_us": 1_000,
+                    "dictionary": { "s0": "motor.state" },
+                    "variables": [{ "series": "s0", "samples": 1, "changes": 0 }],
+                    "events": 0
                 }),
                 "cap_t_p1_mcp",
             ),
@@ -468,7 +470,7 @@ fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
                 "arguments": {
                     "action": "query",
                     "capture_id": "future_capture",
-                    "view": "overview"
+                    "view": "changes"
                 }
             }
         })],
