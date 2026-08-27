@@ -266,6 +266,8 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::HssUnsupported => "HSS_UNSUPPORTED",
         ErrorCode::HssStartFailed => "HSS_START_FAILED",
         ErrorCode::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
+        ErrorCode::CursorInvalid => "CURSOR_INVALID",
+        ErrorCode::CursorExpired => "CURSOR_EXPIRED",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
@@ -718,6 +720,7 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
             hss_completed_start_output_schema(),
         ]),
         "status" => hss_status_output_schema(),
+        "query" if arguments.get("cursor").is_some() => hss_output_schema(),
         "query" => match arguments
             .get("view")
             .and_then(Value::as_str)
@@ -831,9 +834,25 @@ fn hss_changes_output_schema() -> Value {
                     )
                 }),
             ),
+            (
+                "events",
+                json!({ "type": "array", "items": hss_capture_event_schema() }),
+            ),
+            (
+                "relations",
+                json!({ "type": "array", "items": hss_event_change_relation_schema() }),
+            ),
             ("truncated", boolean()),
+            ("next_cursor", non_empty_string()),
         ],
-        &["dictionary", "changes", "matches", "truncated"],
+        &[
+            "dictionary",
+            "changes",
+            "matches",
+            "events",
+            "relations",
+            "truncated",
+        ],
     )
 }
 
@@ -869,9 +888,18 @@ fn hss_window_rows_output_schema() -> Value {
                     }
                 }),
             ),
+            ("quality", hss_quality_events_schema()),
             ("truncated", boolean()),
+            ("next_cursor", non_empty_string()),
         ],
-        &["clock", "dictionary", "time_us", "values", "truncated"],
+        &[
+            "clock",
+            "dictionary",
+            "time_us",
+            "values",
+            "quality",
+            "truncated",
+        ],
     )
 }
 
@@ -905,9 +933,11 @@ fn hss_window_buckets_output_schema() -> Value {
                     )
                 }),
             ),
+            ("quality", hss_quality_events_schema()),
             ("truncated", boolean()),
+            ("next_cursor", non_empty_string()),
         ],
-        &["clock", "dictionary", "buckets", "truncated"],
+        &["clock", "dictionary", "buckets", "quality", "truncated"],
     )
 }
 
@@ -930,14 +960,20 @@ fn hss_around_event_output_schema() -> Value {
                 "changes",
                 json!({ "type": "array", "items": hss_change_item_schema() }),
             ),
+            (
+                "relations",
+                json!({ "type": "array", "items": hss_event_change_relation_schema() }),
+            ),
             ("quality", hss_quality_events_schema()),
             ("truncated", boolean()),
+            ("next_cursor", non_empty_string()),
         ],
         &[
             "event",
             "window",
             "dictionary",
             "changes",
+            "relations",
             "quality",
             "truncated",
         ],
@@ -978,8 +1014,30 @@ fn hss_capture_event_schema() -> Value {
             ("request_id", non_empty_string()),
             ("outcome", string_enum(&["succeeded", "failed"])),
             ("error_code", non_empty_string()),
+            (
+                "sample_relation",
+                string_enum(&["before", "after", "overlaps", "indeterminate"]),
+            ),
+            ("mapping_uncertainty_us", non_negative_integer()),
         ],
-        &["id", "kind", "start", "end"],
+        &["id", "kind", "start", "end", "sample_relation"],
+    )
+}
+
+fn hss_event_change_relation_schema() -> Value {
+    closed_object(
+        vec![
+            ("event", non_empty_string()),
+            ("series", non_empty_string()),
+            ("after_us", non_negative_integer()),
+            ("observed_by_us", non_negative_integer()),
+            (
+                "relation",
+                string_enum(&["before", "after", "overlaps", "indeterminate"]),
+            ),
+            ("mapping_uncertainty_us", non_negative_integer()),
+        ],
+        &["event", "series", "after_us", "observed_by_us", "relation"],
     )
 }
 

@@ -1,8 +1,9 @@
 //! Primary T-P4-WINDOW raw, explicit aggregate, transition, and event-neighborhood assertions.
 
 use jlink_capture::{
-    CaptureClock, CaptureEventKind, CapturePhase, CaptureSnapshot, CaptureStore, CaptureWindow,
-    CaptureWindowMode, CaptureWindowQuery, around_event, window,
+    CaptureClock, CaptureEventKind, CapturePhase, CaptureSnapshot, CaptureStore,
+    CaptureTimeRelation, CaptureWindow, CaptureWindowMode, CaptureWindowQuery, around_event,
+    window,
 };
 use jlink_domain::{
     AccessLayout, AccessPlan, FirmwareIdentityPlan, HssDataIntegrity, HssDrainTiming,
@@ -202,6 +203,11 @@ fn t_p4_window_around_event_reuses_sample_bounds_without_returning_raw_waveform(
     assert_eq!(around.window.from_us, 0);
     assert_eq!(around.window.to_us, 3_100);
     assert_eq!(around.changes.len(), 2);
+    assert_eq!(around.relations[0].relation, CaptureTimeRelation::Overlaps);
+    assert_eq!(
+        around.relations[1].relation,
+        CaptureTimeRelation::Indeterminate
+    );
     assert_eq!(around.quality.len(), 1);
     assert!(!around.truncated);
 

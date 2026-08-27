@@ -18,6 +18,7 @@ pub struct CaptureChangesQuery {
     to_us: u64,
     rules: Option<Vec<HssThresholdRule>>,
     limit: usize,
+    offset: usize,
 }
 
 impl CaptureChangesQuery {
@@ -54,7 +55,15 @@ impl CaptureChangesQuery {
             to_us,
             rules: rules.map(normalize_hss_rules).transpose()?,
             limit,
+            offset: 0,
         })
+    }
+
+    /// Sets the deterministic combined change/match row offset for cursor continuation.
+    #[must_use]
+    pub const fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
     }
 }
 
@@ -138,7 +147,7 @@ pub fn changes(
         &rule_bindings,
         query,
     )?;
-    Ok(rows.into_result(&catalog, query.limit))
+    Ok(rows.into_result(&catalog))
 }
 
 #[derive(Clone, Debug)]
@@ -365,28 +374,38 @@ enum Row {
     Match(CaptureRuleMatch),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct CollectedRows {
     rows: Vec<Row>,
     has_more: bool,
+    skipped: usize,
+    offset: usize,
 }
 
 impl CollectedRows {
+    const fn new(offset: usize) -> Self {
+        Self {
+            rows: Vec::new(),
+            has_more: false,
+            skipped: 0,
+            offset,
+        }
+    }
+
     fn push(&mut self, row: Row, limit: usize) -> bool {
-        if self.rows.len() > limit {
+        if self.skipped < self.offset {
+            self.skipped += 1;
+            return true;
+        }
+        if self.rows.len() == limit {
             self.has_more = true;
             return false;
         }
         self.rows.push(row);
-        if self.rows.len() > limit {
-            self.has_more = true;
-            return false;
-        }
         true
     }
 
-    fn into_result(mut self, catalog: &[SeriesDescriptor], limit: usize) -> CaptureChanges {
-        self.rows.truncate(limit);
+    fn into_result(self, catalog: &[SeriesDescriptor]) -> CaptureChanges {
         let mut dictionary = BTreeMap::new();
         let mut changes = Vec::new();
         let mut matches = Vec::new();
@@ -421,9 +440,9 @@ fn collect_rows(
     query: &CaptureChangesQuery,
 ) -> Result<CollectedRows, JlinkError> {
     let Some(first) = frames.first() else {
-        return Ok(CollectedRows::default());
+        return Ok(CollectedRows::new(query.offset));
     };
-    let mut rows = CollectedRows::default();
+    let mut rows = CollectedRows::new(query.offset);
     let mut before = decode_frame(snapshot.plan().variables(), first.sample)?;
     let mut previous_timestamp_raw = first.timestamp_raw;
     for frame in &frames[1..] {

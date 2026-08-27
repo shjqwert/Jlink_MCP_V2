@@ -84,9 +84,9 @@ public contract and is recorded in the implementation constraints.
 | HSSQ-004 | T-P4-CHANGES | `validation/p4-changes.md` deterministic Capture Store + stdio MCP fixture | None |
 | HSSQ-005 | T-P4-WINDOW | `validation/p4-window.md` raw/transition/aggregate immutable fixture | None |
 | HSSQ-006 | T-P4-WINDOW | `validation/p4-window.md` event-neighborhood + reusable bounds fixture | None |
-| HSSQ-007 | T-P4-TIMELINE | Deterministic timeline fixture | F0-A clock evidence |
-| HSSQ-008 | T-P4-TIMELINE | Deterministic pagination fixture | None |
-| HSSQ-009 | T-P4-TIMELINE | Immutable snapshot fixture | None |
+| HSSQ-007 | T-P4-TIMELINE | `validation/p4-timeline.md` interval + uncertainty relation fixture | F0-A clock evidence |
+| HSSQ-008 | T-P4-TIMELINE | `validation/p4-timeline.md` incremental dictionary pages | None |
+| HSSQ-009 | T-P4-TIMELINE | `validation/p4-timeline.md` cursor binding/tamper/expiry fixture | None |
 | HSSQ-010 | T-P4-RESOURCE | Capture resource integration | F0-A format + F0-D link |
 | HSSQ-011 | T-P4-RESOURCE | Contract/resource integration | F0-D |
 

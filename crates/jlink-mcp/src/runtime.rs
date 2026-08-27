@@ -3,8 +3,9 @@
 use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use jlink_capture::{
-    CaptureChangesQuery, CaptureSnapshot, CaptureStore, CaptureWindowMode, CaptureWindowQuery,
-    around_event, changes, overview, window,
+    CaptureChangesQuery, CaptureEvent, CaptureSnapshot, CaptureStore, CaptureWindow,
+    CaptureWindowMode, CaptureWindowQuery, around_event_page, capture_events, changes,
+    decode_cursor, encode_cursor, event_change_relations, overview, window,
 };
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
@@ -33,6 +34,17 @@ pub struct Runtime {
     lease_root: PathBuf,
     attachment: Option<WorkerAttachment>,
     symbol_cache: SymbolCache,
+}
+
+struct CursorPageContext<'a> {
+    snapshot: &'a CaptureSnapshot,
+    arguments: &'a Value,
+    ordering: &'a str,
+    offset: usize,
+    row_count: usize,
+    truncated: bool,
+    emitted_series: &'a [String],
+    structured: Map<String, Value>,
 }
 
 impl Runtime {
@@ -442,6 +454,7 @@ impl Runtime {
         {
             "start" => self.start_hss(arguments),
             "status" => self.status_hss(arguments),
+            "query" if arguments.get("cursor").is_some() => self.cursor_hss(arguments),
             "query" if arguments.get("view").and_then(Value::as_str) == Some("overview") => {
                 self.overview_hss(arguments)
             }
@@ -550,6 +563,16 @@ impl Runtime {
     }
 
     fn changes_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let snapshot = self.completed_snapshot(arguments)?;
+        Self::changes_hss_page(arguments, &snapshot, 0, &[])
+    }
+
+    fn changes_hss_page(
+        arguments: &Value,
+        snapshot: &CaptureSnapshot,
+        offset: usize,
+        emitted_series: &[String],
+    ) -> Result<ToolCall, JlinkError> {
         let series = arguments.get("series").map(|value| {
             value
                 .as_array()
@@ -597,81 +620,132 @@ impl Runtime {
             arguments.get("to_us").and_then(Value::as_u64),
             rules,
             limit,
-        )?;
-        let snapshot = self.completed_snapshot(arguments)?;
-        Ok(ToolCall::success(
-            serde_json::to_value(changes(&snapshot, &query)?).map_err(serialization_error)?,
-        ))
+        )?
+        .with_offset(offset);
+        let result = changes(snapshot, &query)?;
+        let row_count = result.changes.len().saturating_add(result.matches.len());
+        let page_bounds = result
+            .changes
+            .iter()
+            .map(|item| (item.after_us, item.observed_by_us))
+            .chain(
+                result
+                    .matches
+                    .iter()
+                    .map(|item| (item.after_us, item.observed_by_us)),
+            )
+            .reduce(merge_sample_bounds)
+            .unwrap_or_else(|| requested_sample_bounds(arguments, snapshot));
+        let events = page_events(snapshot, page_bounds.0, page_bounds.1);
+        let relations = events
+            .iter()
+            .flat_map(|event| {
+                event_change_relations(
+                    event,
+                    &result.changes,
+                    snapshot.status().quality.clock.mapping_error_us,
+                )
+            })
+            .collect::<Vec<_>>();
+        let truncated = result.truncated;
+        let mut structured = serde_json::to_value(result)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("CaptureChanges serializes as an object")
+            .clone();
+        structured.insert("events".to_owned(), json!(events));
+        structured.insert("relations".to_owned(), json!(relations));
+        Self::finish_cursor_page(CursorPageContext {
+            snapshot,
+            arguments,
+            ordering: "changes:source-record:exact-before-rule-id-path:v1",
+            offset,
+            row_count,
+            truncated,
+            emitted_series,
+            structured,
+        })
     }
 
     fn window_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
-        let series = arguments
-            .get("series")
-            .and_then(Value::as_array)
-            .expect("window.series passed MCP Schema")
-            .iter()
-            .map(|item| {
-                item.as_str()
-                    .expect("window.series item passed MCP Schema")
-                    .to_owned()
-            })
-            .collect();
-        let mode = match arguments
-            .get("mode")
-            .and_then(Value::as_str)
-            .expect("window.mode passed MCP Schema")
-        {
-            "raw" => CaptureWindowMode::Raw,
-            "transitions" => CaptureWindowMode::Transitions,
-            "min_max" => CaptureWindowMode::MinMax {
-                points: usize::try_from(
-                    arguments["points"]
-                        .as_u64()
-                        .expect("window.points passed MCP Schema"),
-                )
-                .map_err(|_| {
-                    JlinkError::new(ErrorCode::ValueInvalid, "window.points 超出 usize", false)
-                })?,
-            },
-            "first_last" => CaptureWindowMode::FirstLast {
-                points: usize::try_from(
-                    arguments["points"]
-                        .as_u64()
-                        .expect("window.points passed MCP Schema"),
-                )
-                .map_err(|_| {
-                    JlinkError::new(ErrorCode::ValueInvalid, "window.points 超出 usize", false)
-                })?,
-            },
-            _ => unreachable!("window.mode passed closed MCP Schema"),
-        };
-        let limit =
-            arguments
-                .get("limit")
-                .and_then(Value::as_u64)
-                .map_or(Ok(1_000_usize), |value| {
-                    usize::try_from(value).map_err(|_| {
-                        JlinkError::new(ErrorCode::ValueInvalid, "window.limit 超出 usize", false)
-                    })
-                })?;
-        let query = CaptureWindowQuery::new(
-            series,
-            arguments["from_us"]
-                .as_u64()
-                .expect("window.from_us passed MCP Schema"),
-            arguments["to_us"]
-                .as_u64()
-                .expect("window.to_us passed MCP Schema"),
-            mode,
-            limit,
-        )?;
         let snapshot = self.completed_snapshot(arguments)?;
-        Ok(ToolCall::success(
-            serde_json::to_value(window(&snapshot, &query)?).map_err(serialization_error)?,
-        ))
+        Self::window_hss_page(arguments, &snapshot, 0, &[])
+    }
+
+    fn window_hss_page(
+        arguments: &Value,
+        snapshot: &CaptureSnapshot,
+        offset: usize,
+        emitted_series: &[String],
+    ) -> Result<ToolCall, JlinkError> {
+        let (query, mode) = parse_window_query(arguments, offset)?;
+        let result = window(snapshot, &query)?;
+        let (row_count, truncated, page_bounds) = match &result {
+            CaptureWindow::Rows(rows) => (
+                rows.time_us.len(),
+                rows.truncated,
+                rows.time_us
+                    .first()
+                    .zip(rows.time_us.last())
+                    .map(|(first, last)| {
+                        (
+                            *first,
+                            last.saturating_add(u64::from(
+                                snapshot.status().quality.clock.source_resolution_us,
+                            )),
+                        )
+                    }),
+            ),
+            CaptureWindow::Buckets(buckets) => (
+                buckets.buckets.len(),
+                buckets.truncated,
+                buckets
+                    .buckets
+                    .first()
+                    .zip(buckets.buckets.last())
+                    .map(|(first, last)| (first.from_us, last.to_us)),
+            ),
+        };
+        let ordering = match mode {
+            CaptureWindowMode::Raw => "window:raw:source-record:v1",
+            CaptureWindowMode::Transitions => "window:transitions:source-record:v1",
+            CaptureWindowMode::MinMax { .. } => "window:min-max:fixed-bucket:v1",
+            CaptureWindowMode::FirstLast { .. } => "window:first-last:fixed-bucket:v1",
+        };
+        let mut structured = serde_json::to_value(result)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("CaptureWindow serializes as an object")
+            .clone();
+        let page_bounds =
+            page_bounds.unwrap_or_else(|| requested_sample_bounds(arguments, snapshot));
+        structured.insert(
+            "quality".to_owned(),
+            json!(page_quality(snapshot, page_bounds.0, page_bounds.1)),
+        );
+        Self::finish_cursor_page(CursorPageContext {
+            snapshot,
+            arguments,
+            ordering,
+            offset,
+            row_count,
+            truncated,
+            emitted_series,
+            structured,
+        })
     }
 
     fn around_event_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let snapshot = self.completed_snapshot(arguments)?;
+        Self::around_event_hss_page(arguments, &snapshot, 0, &[])
+    }
+
+    fn around_event_hss_page(
+        arguments: &Value,
+        snapshot: &CaptureSnapshot,
+        offset: usize,
+        emitted_series: &[String],
+    ) -> Result<ToolCall, JlinkError> {
         let limit =
             arguments
                 .get("limit")
@@ -685,9 +759,8 @@ impl Runtime {
                         )
                     })
                 })?;
-        let snapshot = self.completed_snapshot(arguments)?;
-        let result = around_event(
-            &snapshot,
+        let result = around_event_page(
+            snapshot,
             arguments["event_id"]
                 .as_str()
                 .expect("around_event.event_id passed MCP Schema"),
@@ -698,10 +771,130 @@ impl Runtime {
                 .as_u64()
                 .expect("around_event.after_us passed MCP Schema"),
             limit,
+            offset,
         )?;
-        Ok(ToolCall::success(
-            serde_json::to_value(result).map_err(serialization_error)?,
-        ))
+        let row_count = result.changes.len();
+        let truncated = result.truncated;
+        let structured = serde_json::to_value(result)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("CaptureAroundEvent serializes as an object")
+            .clone();
+        Self::finish_cursor_page(CursorPageContext {
+            snapshot,
+            arguments,
+            ordering: "around-event:changes:source-record:v1",
+            offset,
+            row_count,
+            truncated,
+            emitted_series,
+            structured,
+        })
+    }
+
+    fn cursor_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let cursor = decode_cursor(
+            arguments["cursor"]
+                .as_str()
+                .expect("cursor passed MCP Schema"),
+        )?;
+        let identity = json!({ "capture_id": cursor.capture_id() });
+        let snapshot = self.completed_snapshot(&identity).map_err(|error| {
+            if error.code == ErrorCode::ValueInvalid {
+                JlinkError::new(
+                    ErrorCode::CursorExpired,
+                    "游标绑定的不可变 capture 资源已不存在",
+                    false,
+                )
+                .with_detail("capture_id", json!(cursor.capture_id()))
+            } else {
+                error
+            }
+        })?;
+        cursor.validate_snapshot(&snapshot)?;
+        match (
+            arguments.get("capture_id").and_then(Value::as_str),
+            arguments.get("capture_key").and_then(Value::as_str),
+        ) {
+            (Some(capture_id), None) if capture_id == cursor.capture_id() => {}
+            (None, Some(_)) => {
+                let requested = self
+                    .completed_snapshot(arguments)
+                    .map_err(|_| cursor_invalid("游标与请求的 capture_key 不匹配"))?;
+                if requested.capture_id() != cursor.capture_id() {
+                    return Err(cursor_invalid("游标与请求的 capture_key 不匹配"));
+                }
+            }
+            _ => return Err(cursor_invalid("游标与请求的 capture 身份不匹配")),
+        }
+        let query = cursor.query();
+        if query.get("action").and_then(Value::as_str) != Some("query")
+            || query.get("capture_id").and_then(Value::as_str) != Some(cursor.capture_id())
+            || query.get("cursor").is_some()
+        {
+            return Err(cursor_invalid("游标中的查询身份无效"));
+        }
+        let ordering = cursor_query_ordering(query)?;
+        if ordering != cursor.ordering() {
+            return Err(cursor_invalid("游标中的查询排序身份不匹配"));
+        }
+        let offset = usize::try_from(cursor.position())
+            .map_err(|_| cursor_invalid("游标位置超出平台 usize"))?;
+        match query.get("view").and_then(Value::as_str) {
+            Some("changes") => {
+                Self::changes_hss_page(query, &snapshot, offset, cursor.emitted_series())
+            }
+            Some("window") => {
+                Self::window_hss_page(query, &snapshot, offset, cursor.emitted_series())
+            }
+            Some("around_event") => {
+                Self::around_event_hss_page(query, &snapshot, offset, cursor.emitted_series())
+            }
+            _ => Err(cursor_invalid("游标引用了不支持分页的查询视图")),
+        }
+    }
+
+    fn finish_cursor_page(mut page: CursorPageContext<'_>) -> Result<ToolCall, JlinkError> {
+        let mut all_series = page.emitted_series.to_vec();
+        if let Some(dictionary) = page
+            .structured
+            .get_mut("dictionary")
+            .and_then(Value::as_object_mut)
+        {
+            let page_series = dictionary.keys().cloned().collect::<Vec<_>>();
+            dictionary.retain(|series, _| !page.emitted_series.contains(series));
+            all_series.extend(page_series);
+            all_series.sort();
+            all_series.dedup();
+        }
+        if page.truncated {
+            if page.row_count == 0 {
+                return Err(cursor_invalid("截断页没有可推进的确定性结果"));
+            }
+            let next_position = page
+                .offset
+                .checked_add(page.row_count)
+                .ok_or_else(|| cursor_invalid("游标位置溢出"))?;
+            let mut normalized = page
+                .arguments
+                .as_object()
+                .expect("validated query arguments are an object")
+                .clone();
+            normalized.remove("capture_key");
+            normalized.remove("cursor");
+            normalized.insert("capture_id".to_owned(), json!(page.snapshot.capture_id()));
+            let next_cursor = encode_cursor(
+                page.snapshot,
+                &Value::Object(normalized),
+                page.ordering,
+                u64::try_from(next_position)
+                    .map_err(|_| cursor_invalid("游标位置无法表示为 u64"))?,
+                &all_series,
+            )?;
+            page.structured
+                .insert("next_cursor".to_owned(), json!(next_cursor));
+        }
+        Ok(ToolCall::success(Value::Object(page.structured)))
     }
 
     fn completed_overview(
@@ -1514,6 +1707,146 @@ fn serialization_error(error: serde_json::Error) -> JlinkError {
         format!("无法序列化 MCP 结果：{message}"),
         false,
     )
+}
+
+fn parse_window_query(
+    arguments: &Value,
+    offset: usize,
+) -> Result<(CaptureWindowQuery, CaptureWindowMode), JlinkError> {
+    let series = arguments
+        .get("series")
+        .and_then(Value::as_array)
+        .expect("window.series passed MCP Schema")
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .expect("window.series item passed MCP Schema")
+                .to_owned()
+        })
+        .collect();
+    let mode = match arguments
+        .get("mode")
+        .and_then(Value::as_str)
+        .expect("window.mode passed MCP Schema")
+    {
+        "raw" => CaptureWindowMode::Raw,
+        "transitions" => CaptureWindowMode::Transitions,
+        "min_max" => CaptureWindowMode::MinMax {
+            points: window_points(arguments)?,
+        },
+        "first_last" => CaptureWindowMode::FirstLast {
+            points: window_points(arguments)?,
+        },
+        _ => unreachable!("window.mode passed closed MCP Schema"),
+    };
+    let limit =
+        arguments
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map_or(Ok(1_000_usize), |value| {
+                usize::try_from(value).map_err(|_| {
+                    JlinkError::new(ErrorCode::ValueInvalid, "window.limit 超出 usize", false)
+                })
+            })?;
+    let query = CaptureWindowQuery::new(
+        series,
+        arguments["from_us"]
+            .as_u64()
+            .expect("window.from_us passed MCP Schema"),
+        arguments["to_us"]
+            .as_u64()
+            .expect("window.to_us passed MCP Schema"),
+        mode,
+        limit,
+    )?
+    .with_offset(offset);
+    Ok((query, mode))
+}
+
+fn window_points(arguments: &Value) -> Result<usize, JlinkError> {
+    usize::try_from(
+        arguments["points"]
+            .as_u64()
+            .expect("window.points passed MCP Schema"),
+    )
+    .map_err(|_| JlinkError::new(ErrorCode::ValueInvalid, "window.points 超出 usize", false))
+}
+
+fn merge_sample_bounds(current: (u64, u64), next: (u64, u64)) -> (u64, u64) {
+    (current.0.min(next.0), current.1.max(next.1))
+}
+
+fn requested_sample_bounds(arguments: &Value, snapshot: &CaptureSnapshot) -> (u64, u64) {
+    let clock = &snapshot.status().quality.clock;
+    let capture_from = clock.first_timestamp_us.unwrap_or(0);
+    let capture_to = clock
+        .last_timestamp_us
+        .unwrap_or(capture_from)
+        .saturating_add(u64::from(clock.source_resolution_us));
+    let from = arguments
+        .get("from_us")
+        .and_then(Value::as_u64)
+        .unwrap_or(capture_from)
+        .max(capture_from);
+    let to = arguments
+        .get("to_us")
+        .and_then(Value::as_u64)
+        .unwrap_or(capture_to)
+        .min(capture_to);
+    (from, to.max(from))
+}
+
+fn page_events(snapshot: &CaptureSnapshot, from_us: u64, to_us: u64) -> Vec<CaptureEvent> {
+    let uncertainty = snapshot.status().quality.clock.mapping_error_us;
+    capture_events(snapshot)
+        .into_iter()
+        .filter(|event| {
+            uncertainty.is_none_or(|uncertainty| {
+                event.end.us.saturating_add(uncertainty) >= from_us
+                    && event.start.us.saturating_sub(uncertainty) < to_us
+            })
+        })
+        .collect()
+}
+
+fn page_quality(
+    snapshot: &CaptureSnapshot,
+    from_us: u64,
+    to_us: u64,
+) -> Vec<jlink_domain::HssQualityEvent> {
+    let uncertainty = snapshot.status().quality.clock.mapping_error_us;
+    snapshot
+        .status()
+        .quality
+        .events
+        .iter()
+        .filter(|event| {
+            uncertainty.is_none_or(|uncertainty| {
+                event.last_host_elapsed_us.saturating_add(uncertainty) >= from_us
+                    && event.first_host_elapsed_us.saturating_sub(uncertainty) < to_us
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+fn cursor_query_ordering(arguments: &Value) -> Result<&'static str, JlinkError> {
+    match arguments.get("view").and_then(Value::as_str) {
+        Some("changes") => Ok("changes:source-record:exact-before-rule-id-path:v1"),
+        Some("window") => match arguments.get("mode").and_then(Value::as_str) {
+            Some("raw") => Ok("window:raw:source-record:v1"),
+            Some("transitions") => Ok("window:transitions:source-record:v1"),
+            Some("min_max") => Ok("window:min-max:fixed-bucket:v1"),
+            Some("first_last") => Ok("window:first-last:fixed-bucket:v1"),
+            _ => Err(cursor_invalid("游标中的 window.mode 无效")),
+        },
+        Some("around_event") => Ok("around-event:changes:source-record:v1"),
+        _ => Err(cursor_invalid("游标中的分页视图无效")),
+    }
+}
+
+fn cursor_invalid(message: impl Into<String>) -> JlinkError {
+    JlinkError::new(ErrorCode::CursorInvalid, message, false)
 }
 
 fn config_value_error(name: &str) -> JlinkError {

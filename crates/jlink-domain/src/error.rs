@@ -75,6 +75,10 @@ pub enum ErrorCode {
     HssStartFailed,
     /// One capture key was reused for a different normalized start request.
     CaptureKeyConflict,
+    /// An opaque query cursor is malformed, corrupted, or violates its binding.
+    CursorInvalid,
+    /// The immutable capture snapshot bound to a cursor is no longer available.
+    CursorExpired,
 }
 
 impl ErrorCode {
@@ -116,6 +120,8 @@ impl ErrorCode {
             Self::HssUnsupported => "HSS_UNSUPPORTED",
             Self::HssStartFailed => "HSS_START_FAILED",
             Self::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
+            Self::CursorInvalid => "CURSOR_INVALID",
+            Self::CursorExpired => "CURSOR_EXPIRED",
         }
     }
 }

@@ -43,6 +43,7 @@ pub struct CaptureWindowQuery {
     to_us: u64,
     mode: CaptureWindowMode,
     limit: usize,
+    offset: usize,
 }
 
 impl CaptureWindowQuery {
@@ -78,7 +79,15 @@ impl CaptureWindowQuery {
             to_us,
             mode,
             limit,
+            offset: 0,
         })
+    }
+
+    /// Sets the deterministic qualifying row or non-empty bucket offset.
+    #[must_use]
+    pub const fn with_offset(mut self, offset: usize) -> Self {
+        self.offset = offset;
+        self
     }
 }
 
@@ -172,6 +181,21 @@ pub enum CaptureEventKind {
     RecoveryAbortedCapture,
 }
 
+impl CaptureEventKind {
+    /// Returns whether this event is acquisition-quality evidence.
+    #[must_use]
+    pub const fn is_quality(self) -> bool {
+        matches!(
+            self,
+            Self::QualityBufferOverflow
+                | Self::QualityShortFrame
+                | Self::QualityFrameFormat
+                | Self::QualitySampleInterval
+                | Self::QualityClockRegression
+        )
+    }
+}
+
 /// Stable outcome available only for target-write events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -180,6 +204,20 @@ pub enum CaptureEventOutcome {
     Succeeded,
     /// Target write returned a stable error.
     Failed,
+}
+
+/// Non-causal ordering relation between a host interval and a sample interval.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureTimeRelation {
+    /// The complete uncertainty envelope ends before the sample interval.
+    Before,
+    /// The complete uncertainty envelope starts after the sample interval.
+    After,
+    /// The central host interval overlaps the sample interval.
+    Overlaps,
+    /// Mapping uncertainty prevents a reliable ordering conclusion.
+    Indeterminate,
 }
 
 /// One event endpoint in an explicit clock domain.
@@ -213,6 +251,30 @@ pub struct CaptureEvent {
     /// Stable target-write failure code when applicable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_code: Option<ErrorCode>,
+    /// Relation of this host event to the capture's complete sample range.
+    pub sample_relation: CaptureTimeRelation,
+    /// Persisted host-to-sample mapping uncertainty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapping_uncertainty_us: Option<u64>,
+}
+
+/// One explicit non-causal relation between an event and a nearby sample change.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureEventChangeRelation {
+    /// Stable event short ID.
+    pub event: String,
+    /// Stable changed leaf-series ID.
+    pub series: String,
+    /// Latest source time at which the prior value was observed.
+    pub after_us: u64,
+    /// First source time at which the changed value was observed.
+    pub observed_by_us: u64,
+    /// Conservative cross-clock relation, never a causality claim.
+    pub relation: CaptureTimeRelation,
+    /// Persisted mapping uncertainty used for the relation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapping_uncertainty_us: Option<u64>,
 }
 
 /// Event, reusable sample-window bounds, nearby changes, and overlapping quality evidence.
@@ -227,6 +289,8 @@ pub struct CaptureAroundEvent {
     pub dictionary: BTreeMap<String, String>,
     /// Nearby exact changes without raw waveform duplication.
     pub changes: Vec<CaptureChange>,
+    /// Explicit non-causal relations between the selected event and nearby changes.
+    pub relations: Vec<CaptureEventChangeRelation>,
     /// Quality evidence whose host interval overlaps the requested neighborhood.
     pub quality: Vec<HssQualityEvent>,
     /// Whether more nearby changes exist after this bounded result.
@@ -297,11 +361,27 @@ pub fn around_event(
     after_us: u64,
     limit: usize,
 ) -> Result<CaptureAroundEvent, JlinkError> {
+    around_event_page(snapshot, event_id, before_us, after_us, limit, 0)
+}
+
+/// Returns one cursor page for an event neighborhood.
+///
+/// # Errors
+///
+/// Returns the same stable errors as [`around_event`].
+pub fn around_event_page(
+    snapshot: &CaptureSnapshot,
+    event_id: &str,
+    before_us: u64,
+    after_us: u64,
+    limit: usize,
+    offset: usize,
+) -> Result<CaptureAroundEvent, JlinkError> {
     require_completed(snapshot, "around_event")?;
     if !(1..=1_000).contains(&limit) {
         return Err(window_value_invalid("around_event.limit 必须为 1..1000"));
     }
-    let event = event_catalog(snapshot)
+    let event = capture_events(snapshot)
         .into_iter()
         .find(|candidate| candidate.id == event_id)
         .ok_or_else(|| {
@@ -331,7 +411,8 @@ pub fn around_event(
     }
     let nearby = changes(
         snapshot,
-        &CaptureChangesQuery::new(None, Some(from_us), Some(to_us), Some(Vec::new()), limit)?,
+        &CaptureChangesQuery::new(None, Some(from_us), Some(to_us), Some(Vec::new()), limit)?
+            .with_offset(offset),
     )?;
     let quality = snapshot
         .status()
@@ -343,11 +424,17 @@ pub fn around_event(
         })
         .cloned()
         .collect();
+    let relations = event_change_relations(
+        &event,
+        &nearby.changes,
+        snapshot.status().quality.clock.mapping_error_us,
+    );
     Ok(CaptureAroundEvent {
         event,
         window: CaptureAroundEventWindow { from_us, to_us },
         dictionary: nearby.dictionary,
         changes: nearby.changes,
+        relations,
         quality,
         truncated: nearby.truncated,
     })
@@ -364,6 +451,7 @@ fn collect_rows(
     let mut values = empty_values(catalog, selected);
     let mut previous: Option<Vec<Value>> = None;
     let mut truncated = false;
+    let mut skipped = 0_usize;
     for frame in frames {
         let decoded = decode_frame(snapshot.plan().variables(), frame.sample)?;
         let timestamp_us = normalize_hss_timestamp_us(frame.timestamp_raw);
@@ -387,6 +475,11 @@ fn collect_rows(
                 CaptureWindowMode::MinMax { .. } | CaptureWindowMode::FirstLast { .. } => false,
             };
         if include {
+            if skipped < query.offset {
+                skipped += 1;
+                previous = Some(decoded);
+                continue;
+            }
             if time_us.len() == query.limit {
                 truncated = true;
                 break;
@@ -434,10 +527,15 @@ fn collect_buckets(
     }
     let mut buckets = Vec::new();
     let mut truncated = false;
+    let mut skipped = 0_usize;
     for (index, accumulator) in accumulators.into_iter().enumerate() {
         let Some(accumulator) = accumulator else {
             continue;
         };
+        if skipped < query.offset {
+            skipped += 1;
+            continue;
+        }
         if buckets.len() == query.limit {
             truncated = true;
             break;
@@ -598,7 +696,9 @@ fn bucket_bounds(
     ))
 }
 
-fn event_catalog(snapshot: &CaptureSnapshot) -> Vec<CaptureEvent> {
+/// Returns all persisted device, quality, and recovery events in stable chronological order.
+#[must_use]
+pub fn capture_events(snapshot: &CaptureSnapshot) -> Vec<CaptureEvent> {
     let mut pending = Vec::new();
     for (index, write) in snapshot.status().writes.iter().enumerate() {
         let (outcome, error_code) = match write.result {
@@ -645,25 +745,107 @@ fn event_catalog(snapshot: &CaptureSnapshot) -> Vec<CaptureEvent> {
         });
     }
     pending.sort_by_key(|item| (item.start_us, item.end_us, item.rank, item.source_index));
+    let mapping_uncertainty_us = snapshot.status().quality.clock.mapping_error_us;
+    let sample_range = capture_sample_range(snapshot).ok();
     pending
         .into_iter()
         .enumerate()
-        .map(|(index, item)| CaptureEvent {
-            id: format!("e{index}"),
-            kind: item.kind,
-            start: CaptureEventTime {
-                clock: CaptureClock::Host,
-                us: item.start_us,
-            },
-            end: CaptureEventTime {
-                clock: CaptureClock::Host,
-                us: item.end_us,
-            },
-            request_id: item.request_id,
-            outcome: item.outcome,
-            error_code: item.error_code,
+        .map(|(index, item)| {
+            let sample_relation =
+                sample_range.map_or(CaptureTimeRelation::Indeterminate, |range| {
+                    relate_host_to_sample(
+                        item.start_us,
+                        item.end_us,
+                        range.0,
+                        range.1,
+                        mapping_uncertainty_us,
+                    )
+                });
+            CaptureEvent {
+                id: format!("e{index}"),
+                kind: item.kind,
+                start: CaptureEventTime {
+                    clock: CaptureClock::Host,
+                    us: item.start_us,
+                },
+                end: CaptureEventTime {
+                    clock: CaptureClock::Host,
+                    us: item.end_us,
+                },
+                request_id: item.request_id,
+                outcome: item.outcome,
+                error_code: item.error_code,
+                sample_relation,
+                mapping_uncertainty_us,
+            }
         })
         .collect()
+}
+
+/// Relates one immutable host-clock event to exact sample-change intervals.
+#[must_use]
+pub fn event_change_relations(
+    event: &CaptureEvent,
+    changes: &[CaptureChange],
+    mapping_uncertainty_us: Option<u64>,
+) -> Vec<CaptureEventChangeRelation> {
+    changes
+        .iter()
+        .map(|change| CaptureEventChangeRelation {
+            event: event.id.clone(),
+            series: change.series.clone(),
+            after_us: change.after_us,
+            observed_by_us: change.observed_by_us,
+            relation: relate_host_to_sample(
+                event.start.us,
+                event.end.us,
+                change.after_us,
+                change.observed_by_us,
+                mapping_uncertainty_us,
+            ),
+            mapping_uncertainty_us,
+        })
+        .collect()
+}
+
+/// Relates one immutable event to an arbitrary sample-clock interval.
+#[must_use]
+pub const fn event_sample_relation(
+    event: &CaptureEvent,
+    sample_start_us: u64,
+    sample_end_us: u64,
+    mapping_uncertainty_us: Option<u64>,
+) -> CaptureTimeRelation {
+    relate_host_to_sample(
+        event.start.us,
+        event.end.us,
+        sample_start_us,
+        sample_end_us,
+        mapping_uncertainty_us,
+    )
+}
+
+const fn relate_host_to_sample(
+    host_start_us: u64,
+    host_end_us: u64,
+    sample_start_us: u64,
+    sample_end_us: u64,
+    mapping_uncertainty_us: Option<u64>,
+) -> CaptureTimeRelation {
+    let Some(uncertainty) = mapping_uncertainty_us else {
+        return CaptureTimeRelation::Indeterminate;
+    };
+    let earliest = host_start_us.saturating_sub(uncertainty);
+    let latest = host_end_us.saturating_add(uncertainty);
+    if latest < sample_start_us {
+        CaptureTimeRelation::Before
+    } else if earliest > sample_end_us {
+        CaptureTimeRelation::After
+    } else if host_end_us >= sample_start_us && host_start_us <= sample_end_us {
+        CaptureTimeRelation::Overlaps
+    } else {
+        CaptureTimeRelation::Indeterminate
+    }
 }
 
 struct PendingEvent {

@@ -31,7 +31,7 @@ PASS。T-P4-WINDOW 覆盖 HSSQ-005、HSSQ-006 的不可变完成快照查询；�
 - `cargo test -p jlink-capture --test t_p4_window`：PASS，3 个测试。
 - `cargo test -p jlink-mcp --test t_p4_window`：PASS，2 个测试。
 - `cargo test -p jlink-worker hss::tests`：PASS，7 个 Worker HSS 回归。
-- `cargo test -p jlink-mcp --test t_p1_mcp t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable`：PASS，未来动作占位迁移至 5.4 cursor。
+- `cargo test -p jlink-mcp --test t_p1_mcp t_p1_mcp_runtime_keeps_raw_resource_unavailable_until_5_5`：PASS，5.4 接通 cursor 后只保留 5.5 raw resource 占位。
 
 ## 原子提交门禁
 

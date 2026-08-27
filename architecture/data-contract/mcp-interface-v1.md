@@ -693,6 +693,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 `series` 可使用不可变采集字典中的稳定短 ID 或精确叶路径。规则路径只接受精确叶路径和数组索引通配符 `[*]`；不跟随指针，也不推断 union 的活动成员。查询省略 `rules` 时复用采集启动时持久化的规则；显式提供 `rules` 时以该集合替换启动规则，显式空数组用于只查询精确变化。查询时间范围按 `observed_by_us` 使用半开区间，规则求值和查询不得修改原始采集。
 
+从时间线阶段起，`changes` 同页返回落入该页 sample 范围的设备调用、质量和恢复 `events`，以及事件与精确变化之间的 `relations`。关系项显式引用 `event`、`series` 和变化观测区间，只能输出 `before/after/overlaps/indeterminate` 与映射误差，绝不表达因果结论。
+
 #### `window`
 
 完整原始样本：
@@ -735,7 +737,7 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 非 `raw` 模式必须由 Agent 显式选择。MCP 不自动替 Agent 决定曲线简化方式。
 
-`raw` 和 `transitions` 使用相同的矩形 `time_us`/`values` 结构；`raw` 保留重复值，`transitions` 只在至少一个所选序列发生变化时返回该完整观测行。`min_max` 和 `first_last` 将请求的半开时间范围等分为 `points` 个桶，只返回非空桶；每个桶包含 `from_us/to_us` 和按 `series` 登记的二元值。`points`、`limit` 的 V1 上限均为 1000。稳定游标和续页从 5.4 的不可变快照游标接通。
+`raw` 和 `transitions` 使用相同的矩形 `time_us`/`values` 结构；`raw` 保留重复值，`transitions` 只在至少一个所选序列发生变化时返回该完整观测行。`min_max` 和 `first_last` 将请求的半开时间范围等分为 `points` 个桶，只返回非空桶；每个桶包含 `from_us/to_us` 和按 `series` 登记的二元值。`points`、`limit` 的 V1 上限均为 1000。每页 `quality` 只保留映射误差包络与该页 sample 范围相交的质量事件。
 
 #### `around_event`
 
@@ -753,7 +755,7 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 默认返回事件和附近变化，不返回原始波形；原始波形通过 `window` 获取。
 
-结果包含所选 `event`、可直接复用于 `window` 的 sample 时钟半开边界、附近精确 `changes` 和重叠的质量证据。写入事件保留 `memory_write` 或 `variable_write`；旧格式 capture 未保存写入类别时只报告 `target_write`，不得猜测更具体类型。事件邻域按已持久化的 host→sample 映射误差扩展并裁剪到采集范围。
+结果包含所选 `event`、可直接复用于 `window` 的 sample 时钟半开边界、附近精确 `changes`、逐变化 `relations` 和重叠的质量证据。写入事件保留 `memory_write` 或 `variable_write`；旧格式 capture 未保存写入类别时只报告 `target_write`，不得猜测更具体类型。事件邻域按已持久化的 host→sample 映射误差扩展并裁剪到采集范围。
 
 事件时间使用显式时钟域：
 
@@ -774,8 +776,11 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 - 游标绑定固定 capture 快照、查询字段、排序、schema 版本和页位置。
 - 同一游标序列不受后续追加数据影响；已完成 capture 的游标在资源存在期间有效。
+- 续页请求只提供原 capture 身份和不透明 `cursor`；视图、范围、变量、规则、mode、points、limit 和排序全部从已验证游标恢复，不接受调用方改写。
 - `truncated: true` 时必须返回 `next_cursor`；否则省略 `next_cursor`。
+- 首页返回当页需要的完整 `series` 字典；后续页只返回此前未登记的增量，未变化字典为空对象。
 - 每页只报告落在该页范围内的 gap、overflow、rate、frame 和 clock 问题。
+- 游标在绑定的不可变 capture 内容身份存在期间有效；格式、摘要、查询绑定或 capture 身份损坏返回 `CURSOR_INVALID`，绑定资源不存在或内容身份变化返回 `CURSOR_EXPIRED`，不得隐式重新开始查询。
 - capture 失败后，只要有已校验部分数据，`query` 仍允许读取，并明确返回异常质量。
 
 ## 10. HSS 并发边界

@@ -450,7 +450,7 @@ fn t_p1_mcp_resource_link_template_and_read_share_one_contract() {
 }
 
 #[test]
-fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
+fn t_p1_mcp_runtime_keeps_raw_resource_unavailable_until_5_5() {
     let paths = ConfigPaths::new(
         PathBuf::from("unused-project.toml"),
         PathBuf::from("unused-user.toml"),
@@ -464,20 +464,15 @@ fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
         &[json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "tools/call",
+            "method": "resources/read",
             "params": {
-                "name": "jlink_hss",
-                "arguments": {
-                    "action": "query",
-                    "capture_id": "future_capture",
-                    "cursor": "future-cursor"
-                }
+                "uri": "jlink-mcp://capture/future_capture/raw"
             }
         })],
         &mut runtime,
     );
 
-    assert_eq!(responses[0]["error"]["code"], -32_603);
+    assert_eq!(responses[0]["error"]["code"], -32_002);
     assert!(responses[0].get("result").is_none());
 }
 
