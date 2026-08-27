@@ -26,5 +26,5 @@ P3-4.6 为 `PASS`。生产 Worker 已在唯一排空路径中解析冻结 6.98a 
 
 - 本任务没有执行真机或修改目标 SVN 工程；DLL、探针、S32K144、SWD 4000 kHz、OUT 与保护文件指纹未变化。
 - 复用 F0-A 已确认的 6.98a 帧布局、毫秒时间戳和“无 overflow/sequence counter”限制；脚本 I/O 只验证确定分类规则，不替代 4.8 真机质量证据。
-- 4.8 仍需在生产 10×32-bit、1 kHz、300 秒链路确认源首尾时间、实际频率、碰撞/gap、交错写入关联和 unknown loss/overflow 结论。
+- `validation/p3-stage.md` 已由生产 10×32-bit、1 kHz、300 秒链路确认源首尾时间、实际频率、碰撞/gap、交错写入关联和 unknown loss/overflow 结论。
 - 帧布局、时间单位/分辨率、质量算法、直接溢出信号映射、Capture Store 终态、Worker Start 时刻或公共质量字段变化时，本证据对应部分失效。

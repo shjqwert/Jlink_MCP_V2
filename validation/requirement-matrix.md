@@ -35,9 +35,9 @@ public contract and is recorded in the implementation constraints.
 | CFG-004 | T-P1-CFG | `validation/p1-stage.md` DLL identity fixture | F0-A identity |
 | CFG-005 | T-P1-CFG | `validation/p1-stage.md` repository/config fixture | None |
 | RUN-001 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
-| RUN-002 | T-P3-RUN | Production Worker scheduler trace + J-Link hardware timeline | F0-A |
+| RUN-002 | T-P3-RUN | `validation/p3-run.md` scheduler trace + `validation/p3-stage.md` J-Link hardware timeline | F0-A |
 | RUN-003 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
-| RUN-004 | T-P3-RECOVER | `validation/p3-recover.md` production parent-handle/process integration + P3 hardware smoke | F0-B |
+| RUN-004 | T-P3-RECOVER | `validation/p3-recover.md` parent-handle/process integration + `validation/p3-stage.md` hardware smoke | F0-B |
 | RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
 | RUN-006 | T-P3-ABI | `validation/p3-abi.md` frozen DLL exports/ABI/raw-frame fixture | F0-A |
 | SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A identity |
@@ -65,19 +65,19 @@ public contract and is recorded in the implementation constraints.
 | DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware；`validation/p2-stage.md` | F0-A |
 | DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware；`validation/p2-stage.md` | F0-A |
 | DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；`validation/p2-stage.md` | F0-A |
-| DBG-007 | T-P3-RUN | Production session conflict tests + active-capture hardware timeline | F0-A |
+| DBG-007 | T-P3-RUN | `validation/p3-run.md` session conflict tests + `validation/p3-stage.md` active-capture timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
 | HSSA-001 | T-P3-START | `validation/p3-start.md` normalized request/key fixture + frozen J-Link capability preflight | F0-A |
 | HSSA-002 | T-P3-START | `validation/p3-start.md` IAR DWARF AccessPlan/frame fixture + frozen J-Link capability preflight | F0-A + F0-C |
 | HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
-| HSSA-004 | T-P3-RUN | Production automatic Stop/tail-drain trace + timed J-Link capture | F0-A |
+| HSSA-004 | T-P3-RUN | `validation/p3-run.md` automatic Stop/tail trace + `validation/p3-stage.md` timed capture | F0-A |
 | HSSA-005 | T-P3-STATE | Production state-machine/fault-retention fixture | F0-A + F0-B |
-| HSSA-006 | T-P3-STORE | Production Capture Store limit/CRC/atomic-publish fixture + Worker restart recovery | F0-A throughput |
-| HSSA-007 | T-P3-QUALITY | Production frame/overflow/loss classifier + P3 hardware smoke | F0-A |
-| HSSA-008 | T-P3-RUN | Production write event trace + J-Link write-interleaving timeline | F0-A |
-| HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` target-bound persisted-key/process recovery + P3 hardware smoke | F0-B |
-| HSSA-010 | T-P3-QUALITY | Production requested/actual-rate and interval fixture + P3 hardware smoke | F0-A |
-| HSSA-011 | T-P3-QUALITY | Production ms-to-us/clock-mapping fixture + P3 hardware smoke | F0-A |
+| HSSA-006 | T-P3-STORE | `validation/p3-store.md` Store fixture + `validation/p3-stage.md` 300-second atomic resource | F0-A throughput |
+| HSSA-007 | T-P3-QUALITY | `validation/p3-quality.md` classifier + `validation/p3-stage.md` hardware quality | F0-A |
+| HSSA-008 | T-P3-RUN | `validation/p3-run.md` write trace + `validation/p3-stage.md` J-Link interleaving | F0-A |
+| HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` target-bound recovery + `validation/p3-stage.md` parent-exit hardware smoke | F0-B |
+| HSSA-010 | T-P3-QUALITY | `validation/p3-quality.md` rate/interval fixture + `validation/p3-stage.md` hardware rate | F0-A |
+| HSSA-011 | T-P3-QUALITY | `validation/p3-quality.md` clock fixture + `validation/p3-stage.md` hardware clock | F0-A |
 | HSSQ-001 | T-P4-OVERVIEW | Capture fixture integration | None |
 | HSSQ-002 | T-P4-OVERVIEW | Capture fixture integration | None |
 | HSSQ-003 | T-P4-OVERVIEW | Capture fixture integration | F0-D resource observation |

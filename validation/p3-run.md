@@ -40,5 +40,5 @@ T-P3-RUN 的主断言顺序为：`Start -> drain -> write(failed) -> drain -> de
 ## 复用与剩余验证
 
 - 复用 `validation/f0-a.md` 的冻结 6.98a 真机 ABI 和时间线；DLL、探针、目标、OUT、SWD 4000 kHz 指纹均未在本任务改变。
-- 本任务修改了生产 IPC 与调度路径，因此 4.8 必须执行生产 10×32-bit、1 kHz、300 秒纵向真机测试后，才能形成阶段硬件结论。
+- 生产 10×32-bit、1 kHz、300 秒纵向真机测试已在 `validation/p3-stage.md` 闭环，确认当前调度路径的交错写入、自动 Stop 和尾排空。
 - 本证据不声明 Capture Store、质量分类、父进程恢复或查询接口完成；这些由 4.4–4.8 和 5.1–5.5 分别闭环。

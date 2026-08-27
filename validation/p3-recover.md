@@ -48,5 +48,5 @@ cargo test -p jlink-mcp hss --lib
 
 - 复用 `validation/f0-b.md` 的真实 Windows 命名管道、父进程退出期间固定时长续行和新客户端重新附着模式。F0-B 的旧 capture-key 等价算法不再作为生产身份实现证据；完整目标身份和当前 Store 索引由本任务生产测试替代。
 - 本任务没有修改目标 SVN 工程、OUT、DLL、探针、接口或速度，也没有执行真机 HSS，因此无需重新建立 SVN 基线。
-- 生产 Worker 在真实 HSS 活动期间遭遇 MCP 退出后继续 Stop、尾排空、持久化和目标安全恢复的组合证据，按阶段矩阵在 4.8 P3 真机纵向 smoke 中闭环；这不是用 Mock 替代真机声明。
+- 生产 Worker 在真实 HSS 活动期间遭遇 MCP 退出后继续 Stop、尾排空、持久化和目标安全恢复的组合证据已在 `validation/p3-stage.md` 闭环；这不是用 Mock 替代真机声明。
 - 父进程检测、Worker 启动参数、IPC 状态身份、目标指纹规则、Capture Store 头或恢复扫描任一变化时，本证据对应部分失效。

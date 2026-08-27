@@ -465,7 +465,11 @@ fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
             "method": "tools/call",
             "params": {
                 "name": "jlink_hss",
-                "arguments": { "action": "status", "capture_id": "future_capture" }
+                "arguments": {
+                    "action": "query",
+                    "capture_id": "future_capture",
+                    "view": "overview"
+                }
             }
         })],
         &mut runtime,
