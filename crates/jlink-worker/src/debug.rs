@@ -111,7 +111,7 @@ fn verify_if_requested(
     Ok(())
 }
 
-fn ensure_firmware_identity(
+pub(crate) fn ensure_firmware_identity(
     session: &mut TargetSessionManager,
     gateway: &mut DllGateway,
     firmware: &FirmwareIdentityPlan,

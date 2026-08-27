@@ -16,10 +16,10 @@ use std::{
 };
 
 use jlink_domain::{
-    ControlRequest, DebugRequest, DebugResult, DispatchState, ErrorCode, IpcRequest, IpcResponse,
-    JlinkError, ProgramRequest, ProtocolVersion, RequestId, SessionCommand, TargetConnectionSpec,
-    ValidationAfter, ValidationReport, WorkerStatus, classify_worker_loss, read_ipc_frame,
-    worker_endpoint_name, write_ipc_frame,
+    ControlRequest, DebugRequest, DebugResult, DispatchState, ErrorCode, HssRunSnapshot,
+    HssStartPlan, IpcRequest, IpcResponse, JlinkError, ProgramRequest, ProtocolVersion, RequestId,
+    SessionCommand, TargetConnectionSpec, ValidationAfter, ValidationReport, WorkerStatus,
+    classify_worker_loss, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
 };
 use serde_json::json;
 use windows_sys::Win32::{
@@ -94,7 +94,7 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn status(&self) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(SessionCommand::Status, None, None, None, None, None)?;
+        let response = self.request(SessionCommand::Status, |request| request)?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -113,14 +113,9 @@ impl WorkerClient {
     /// Returns a stable configuration, connection, recovery, validation, or
     /// transport error without selecting a different probe or interface.
     pub fn connect(&self, target: &TargetConnectionSpec) -> Result<WorkerStatus, JlinkError> {
-        let response = self.request(
-            SessionCommand::Connect,
-            Some(target),
-            None,
-            None,
-            None,
-            None,
-        )?;
+        let response = self.request(SessionCommand::Connect, |request| {
+            request.with_target(target.clone())
+        })?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -143,14 +138,13 @@ impl WorkerClient {
         target: &TargetConnectionSpec,
         after: Option<ValidationAfter>,
     ) -> Result<ValidationReport, JlinkError> {
-        let response = self.request(
-            SessionCommand::Validate,
-            Some(target),
-            after,
-            None,
-            None,
-            None,
-        )?;
+        let response = self.request(SessionCommand::Validate, |request| {
+            let request = request.with_target(target.clone());
+            match after {
+                Some(after) => request.with_validation_after(after),
+                None => request,
+            }
+        })?;
         response_result(response).and_then(|value| {
             serde_json::from_value(value).map_err(|error| {
                 JlinkError::new(
@@ -178,14 +172,11 @@ impl WorkerClient {
             ProgramRequest::Erase { .. } => SessionCommand::Erase,
             ProgramRequest::Verify { .. } => SessionCommand::Verify,
         };
-        let value = response_result(self.request(
-            command,
-            Some(target),
-            None,
-            Some(program),
-            None,
-            None,
-        )?)?;
+        let value = response_result(self.request(command, |request| {
+            request
+                .with_target(target.clone())
+                .with_program(program.clone())
+        })?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -215,8 +206,11 @@ impl WorkerClient {
             DebugRequest::ReadRegister { .. } => SessionCommand::ReadRegister,
             DebugRequest::WriteRegister { .. } => SessionCommand::WriteRegister,
         };
-        let value =
-            response_result(self.request(command, Some(target), None, None, Some(debug), None)?)?;
+        let value = response_result(self.request(command, |request| {
+            request
+                .with_target(target.clone())
+                .with_debug(debug.clone())
+        })?)?;
         serde_json::from_value(value).map_err(|error| {
             JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -237,14 +231,9 @@ impl WorkerClient {
         target: &TargetConnectionSpec,
         control: ControlRequest,
     ) -> Result<(), JlinkError> {
-        let value = response_result(self.request(
-            SessionCommand::Control,
-            Some(target),
-            None,
-            None,
-            None,
-            Some(control),
-        )?)?;
+        let value = response_result(self.request(SessionCommand::Control, |request| {
+            request.with_target(target.clone()).with_control(control)
+        })?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -261,14 +250,7 @@ impl WorkerClient {
     ///
     /// Returns a stable transport, protocol, or Worker error.
     pub fn disconnect(&self) -> Result<(), JlinkError> {
-        let value = response_result(self.request(
-            SessionCommand::Disconnect,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )?)?;
+        let value = response_result(self.request(SessionCommand::Disconnect, |request| request)?)?;
         if value.as_object().is_none_or(|object| !object.is_empty()) {
             return Err(JlinkError::new(
                 ErrorCode::IpcProtocolError,
@@ -279,36 +261,50 @@ impl WorkerClient {
         Ok(())
     }
 
-    fn request(
+    /// Starts one fixed-duration HSS plan or recovers its idempotent identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable preflight, start, protocol, transport, or Worker error.
+    pub fn start_hss(
         &self,
-        command: SessionCommand,
-        target: Option<&TargetConnectionSpec>,
-        after: Option<ValidationAfter>,
-        program: Option<&ProgramRequest>,
-        debug: Option<&DebugRequest>,
-        control: Option<ControlRequest>,
-    ) -> Result<IpcResponse, JlinkError> {
+        target: &TargetConnectionSpec,
+        plan: &HssStartPlan,
+    ) -> Result<HssRunSnapshot, JlinkError> {
+        let response = self.request(SessionCommand::HssStart, |request| {
+            request
+                .with_target(target.clone())
+                .with_hss_start(plan.clone())
+        })?;
+        response_result(response).and_then(parse_hss_snapshot)
+    }
+
+    /// Polls the internal Worker-owned status for one known capture identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable identity, protocol, transport, or Worker error.
+    pub fn hss_status(&self, capture_id: &str) -> Result<HssRunSnapshot, JlinkError> {
+        let response = self.request(SessionCommand::HssStatus, |request| {
+            request.with_capture_id(capture_id)
+        })?;
+        response_result(response).and_then(parse_hss_snapshot)
+    }
+
+    fn request<F>(&self, command: SessionCommand, configure: F) -> Result<IpcResponse, JlinkError>
+    where
+        F: FnOnce(IpcRequest) -> IpcRequest,
+    {
         let request_id = RequestId::new(format!(
             "{}-{}",
             std::process::id(),
             NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)
         ))?;
-        let mut request = IpcRequest::new(ProtocolVersion::V1, request_id.clone(), command);
-        if let Some(target) = target {
-            request = request.with_target(target.clone());
-        }
-        if let Some(after) = after {
-            request = request.with_validation_after(after);
-        }
-        if let Some(program) = program {
-            request = request.with_program(program.clone());
-        }
-        if let Some(debug) = debug {
-            request = request.with_debug(debug.clone());
-        }
-        if let Some(control) = control {
-            request = request.with_control(control);
-        }
+        let request = configure(IpcRequest::new(
+            ProtocolVersion::V1,
+            request_id.clone(),
+            command,
+        ));
         let mut pipe = open_pipe(&self.endpoint, 100)?;
         write_ipc_frame(&mut pipe, &request)
             .map_err(|error| dispatched_request_error(command, &error))?;
@@ -327,6 +323,16 @@ impl WorkerClient {
         }
         Ok(response)
     }
+}
+
+fn parse_hss_snapshot(value: serde_json::Value) -> Result<HssRunSnapshot, JlinkError> {
+    serde_json::from_value(value).map_err(|error| {
+        JlinkError::new(
+            ErrorCode::IpcProtocolError,
+            format!("Worker HSS 状态响应无效：{error}"),
+            false,
+        )
+    })
 }
 
 /// Attaches to an existing Worker before starting a new process for the probe.

@@ -146,6 +146,88 @@ pub enum HssReturnWhen {
     Completed,
 }
 
+/// Observable lifecycle states shared by the Worker and MCP process.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssRunState {
+    /// Hardware start is being prepared but has not completed.
+    Starting,
+    /// The DLL owns an active fixed-duration capture.
+    Running,
+    /// Internal Stop completed and the Worker is draining the DLL tail.
+    Stopping,
+    /// The immutable capture completed normally.
+    Completed,
+    /// Capture cleanup completed after an execution failure.
+    Failed,
+    /// A prior process ended without completing the capture.
+    Aborted,
+}
+
+/// Aggregate timing evidence for serialized HSS drain calls.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssDrainTiming {
+    /// Number of serialized DLL drain calls.
+    pub calls: u64,
+    /// Sum of all drain call durations.
+    pub total_us: u64,
+    /// Longest observed drain call duration.
+    pub max_us: u64,
+}
+
+/// Result retained for one write interleaved with an active capture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HssWriteResult {
+    /// The write and requested readback completed successfully.
+    Succeeded,
+    /// The write returned a stable error while capture continued.
+    Failed {
+        /// Stable error returned to the write caller.
+        code: ErrorCode,
+    },
+}
+
+/// Queue, execution, and next-drain evidence for one interleaved write.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssWriteTiming {
+    /// IPC request correlated with this target write.
+    pub request_id: String,
+    /// Time since capture start when the listener accepted the request.
+    pub requested_at_us: u64,
+    /// Time since capture start when the DLL scheduler began the write.
+    pub started_at_us: u64,
+    /// Time since capture start when the write returned.
+    pub completed_at_us: u64,
+    /// Stable write outcome retained even when the write failed.
+    pub result: HssWriteResult,
+    /// Complete records observed before the write began.
+    pub samples_before: u64,
+    /// Complete records observed immediately after the next drain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub samples_after_next_drain: Option<u64>,
+}
+
+/// Minimal internal status returned while persistence and query views are built.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssRunSnapshot {
+    /// Stable public capture identity.
+    pub capture_id: String,
+    /// Current capture lifecycle state.
+    pub state: HssRunState,
+    /// Monotonic time since the successful Start call.
+    pub elapsed_us: u64,
+    /// Number of complete frozen-layout records drained so far.
+    pub complete_records: u64,
+    /// Aggregate serialized drain timings.
+    pub drain: HssDrainTiming,
+    /// Ordered write-interleaving evidence.
+    pub writes: Vec<HssWriteTiming>,
+}
+
 /// Direction retained by one declarative threshold-crossing rule.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -650,6 +732,15 @@ impl HssStartRegistry {
         self.by_key
             .insert(plan.capture_key.clone(), reservation.clone());
         Ok(HssReservationOutcome::Created(reservation))
+    }
+
+    /// Releases only the exact newly-created reservation after Start failed.
+    ///
+    /// Existing idempotent reservations are never removed by this operation.
+    pub fn rollback_created(&mut self, plan: &HssStartPlan, reservation: &HssCaptureReservation) {
+        if self.by_key.get(plan.capture_key()) == Some(reservation) {
+            self.by_key.remove(plan.capture_key());
+        }
     }
 }
 

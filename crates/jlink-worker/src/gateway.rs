@@ -388,6 +388,7 @@ pub(crate) struct DllGateway {
     opened: bool,
     connected_spec: Option<TargetConnectionSpec>,
     target_id: Option<u32>,
+    hss_started: bool,
     path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -430,6 +431,7 @@ impl DllGateway {
             opened: false,
             connected_spec: None,
             target_id: None,
+            hss_started: false,
             path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
@@ -478,6 +480,154 @@ impl DllGateway {
             caps.flags,
             caps.reserved,
         )
+    }
+
+    /// Starts one validated HSS plan through the frozen 6.98a ABI.
+    pub(crate) fn start_hss(
+        &mut self,
+        plan: &jlink_domain::HssStartPlan,
+    ) -> Result<(), JlinkError> {
+        if self.hss_started {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "DLL 已持有一个活动 HSS 采集",
+                true,
+            ));
+        }
+        let mut blocks = plan
+            .variables()
+            .iter()
+            .map(|variable| {
+                let access = variable.access_plan();
+                Ok(HssBlock {
+                    address: u32::try_from(access.address()).map_err(|_| {
+                        JlinkError::new(
+                            ErrorCode::HssUnsupported,
+                            "HSS 变量地址超出冻结 32-bit ABI",
+                            false,
+                        )
+                    })?,
+                    byte_count: u32::try_from(access.byte_size()).map_err(|_| {
+                        JlinkError::new(
+                            ErrorCode::HssUnsupported,
+                            "HSS 变量长度超出冻结 32-bit ABI",
+                            false,
+                        )
+                    })?,
+                    flags: jlink_domain::HSS_BLOCK_FLAGS_DEFAULT,
+                    reserved: 0,
+                })
+            })
+            .collect::<Result<Vec<_>, JlinkError>>()?;
+        let block_count = i32::try_from(blocks.len()).map_err(|_| {
+            JlinkError::new(ErrorCode::HssUnsupported, "HSS block 数量无法表示", false)
+        })?;
+        let period_us = i32::try_from(plan.period_us()).map_err(|_| {
+            JlinkError::new(ErrorCode::HssUnsupported, "HSS period_us 无法表示", false)
+        })?;
+        let start = self
+            .api
+            .hss
+            .start
+            .expect("HSS preflight requires the complete export set");
+        // SAFETY: block layout and call signature are frozen by F0-A; the unique
+        // gateway owns the live target and serializes every DLL call.
+        let result = unsafe {
+            start(
+                blocks.as_mut_ptr(),
+                block_count,
+                period_us,
+                jlink_domain::HSS_START_FLAGS_698A_MAINLINE,
+            )
+        };
+        if result < 0 {
+            return Err(JlinkError::new(
+                ErrorCode::HssStartFailed,
+                format!("JLINK_HSS_Start 返回失败状态 {result}"),
+                false,
+            ));
+        }
+        self.hss_started = true;
+        Ok(())
+    }
+
+    /// Drains currently buffered HSS bytes, including the frozen zero-return case.
+    pub(crate) fn read_hss(
+        &mut self,
+        buffer: &mut [u8],
+        record_bytes: usize,
+    ) -> Result<usize, JlinkError> {
+        const SENTINEL: u8 = 0xA5;
+        if record_bytes == 0 || record_bytes > buffer.len() {
+            return Err(JlinkError::new(
+                ErrorCode::FrameInvalid,
+                "HSS 读取缓冲区小于一个完整帧",
+                false,
+            ));
+        }
+        buffer.fill(SENTINEL);
+        let read = self
+            .api
+            .hss
+            .read
+            .expect("HSS preflight requires the complete export set");
+        // SAFETY: `buffer` is writable for its declared length and the ABI is frozen by F0-A.
+        let result = unsafe {
+            read(
+                buffer.as_mut_ptr().cast::<c_void>(),
+                u32::try_from(buffer.len()).expect("fixed HSS buffer fits u32"),
+            )
+        };
+        if result < 0 {
+            return Err(JlinkError::new(
+                ErrorCode::FrameInvalid,
+                format!("JLINK_HSS_Read 返回失败状态 {result}"),
+                false,
+            ));
+        }
+        let returned = usize::try_from(result)
+            .map_err(|_| JlinkError::new(ErrorCode::FrameInvalid, "HSS 返回长度无法表示", false))?;
+        if returned > buffer.len() {
+            return Err(JlinkError::new(
+                ErrorCode::FrameInvalid,
+                "JLINK_HSS_Read 返回长度超过缓冲区",
+                false,
+            ));
+        }
+        if returned == 0 && buffer[..record_bytes].iter().any(|byte| *byte != SENTINEL) {
+            Ok(record_bytes)
+        } else {
+            Ok(returned)
+        }
+    }
+
+    /// Stops the active HSS stream exactly once before tail drain.
+    pub(crate) fn stop_hss(&mut self) -> Result<(), JlinkError> {
+        if !self.hss_started {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "DLL 没有可停止的活动 HSS 采集",
+                false,
+            ));
+        }
+        let stop = self
+            .api
+            .hss
+            .stop
+            .expect("HSS preflight requires the complete export set");
+        // Mark consumed before interpreting the result so cleanup never retries a
+        // failed Stop against an uncertain DLL state.
+        self.hss_started = false;
+        // SAFETY: the unique gateway owns the matching successful Start call.
+        let result = unsafe { stop() };
+        if result < 0 {
+            return Err(JlinkError::new(
+                ErrorCode::TargetRecoveryFailed,
+                format!("JLINK_HSS_Stop 返回失败状态 {result}"),
+                false,
+            ));
+        }
+        Ok(())
     }
 
     /// Reads authoritative Flash regions from the loaded J-Link device database.
@@ -910,6 +1060,15 @@ impl DllGateway {
 
     /// Closes the target and clears all gateway-local session facts.
     pub(crate) fn close_target(&mut self) {
+        if self.hss_started
+            && let Err(error) = self.stop_hss()
+        {
+            eprintln!("HSS 安全停止失败，跳过后续目标 DLL 调用：{error}");
+            self.opened = false;
+            self.connected_spec = None;
+            self.target_id = None;
+            return;
+        }
         if self.opened {
             // SAFETY: the matching open handle is owned by this gateway.
             unsafe { (self.api.close)() };

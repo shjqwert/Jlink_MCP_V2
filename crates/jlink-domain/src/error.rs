@@ -71,6 +71,8 @@ pub enum ErrorCode {
     FrameInvalid,
     /// The selected DLL, probe, target, or frame exceeds the supported HSS capability.
     HssUnsupported,
+    /// The frozen HSS ABI rejected a validated capture start.
+    HssStartFailed,
     /// One capture key was reused for a different normalized start request.
     CaptureKeyConflict,
 }
@@ -112,6 +114,7 @@ impl ErrorCode {
             Self::VerifyFailed => "VERIFY_FAILED",
             Self::FrameInvalid => "FRAME_INVALID",
             Self::HssUnsupported => "HSS_UNSUPPORTED",
+            Self::HssStartFailed => "HSS_START_FAILED",
             Self::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
         }
     }

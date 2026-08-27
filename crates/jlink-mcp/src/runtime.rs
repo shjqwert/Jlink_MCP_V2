@@ -1,13 +1,13 @@
 //! Process-owned configuration and Worker orchestration behind the MCP boundary.
 
-use std::{fs, path::PathBuf, sync::Arc};
+use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssReturnWhen, HssStartPlan, HssThresholdRule, JlinkError, MemoryRange, ProgramAfter,
-    ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector,
-    WriteVerify,
+    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
+    MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
+    ValidationAfter, VariableSelector, WriteVerify,
 };
 use serde_json::{Map, Value, json};
 
@@ -430,6 +430,58 @@ impl Runtime {
         Ok(ToolCall::success(json!({})))
     }
 
+    fn call_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        match arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees hss.action")
+        {
+            "start" => self.start_hss(arguments),
+            action => Ok(ToolCall::Unavailable(format!(
+                "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
+            ))),
+        }
+    }
+
+    fn start_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let plan = self.prepare_hss_start(arguments)?;
+        let resolved = self.resolve()?;
+        validate_dll_identity(&resolved.jlink)?;
+        self.ensure_attachment(&resolved)?;
+        let target = target_spec(&resolved)?;
+        let client = self
+            .attachment
+            .as_ref()
+            .expect("attachment was established")
+            .client
+            .clone();
+        let result = client.start_hss(&target, &plan);
+        if result
+            .as_ref()
+            .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+        {
+            self.attachment = None;
+        }
+        let mut snapshot = result?;
+        if plan.return_when() == HssReturnWhen::Completed {
+            while matches!(
+                snapshot.state,
+                HssRunState::Starting | HssRunState::Running | HssRunState::Stopping
+            ) {
+                thread::sleep(Duration::from_millis(10));
+                let status = client.hss_status(&snapshot.capture_id);
+                if status
+                    .as_ref()
+                    .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)
+                {
+                    self.attachment = None;
+                }
+                snapshot = status?;
+            }
+        }
+        Ok(ToolCall::success(hss_start_result(&snapshot)))
+    }
+
     fn inspect_symbols(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let resolved = self.resolve()?;
         let elf_path = resolved.symbols.elf.ok_or_else(|| {
@@ -711,6 +763,7 @@ impl ToolDispatcher for Runtime {
             "jlink_inspect" => self.call_inspect(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_write" => self.call_write(arguments).unwrap_or_else(ToolCall::Error),
             "jlink_control" => self.call_control(arguments).unwrap_or_else(ToolCall::Error),
+            "jlink_hss" => self.call_hss(arguments).unwrap_or_else(ToolCall::Error),
             _ => ToolCall::Unavailable(format!(
                 "工具 {name} 已声明 V1 合同，但其 action 将在对应 OpenSpec 阶段接通"
             )),
@@ -722,6 +775,20 @@ impl ToolDispatcher for Runtime {
             "资源 {uri} 的占位合同已建立，读取实现将在任务 5.5 接通"
         ))
     }
+}
+
+fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
+    let mut result = serde_json::Map::from_iter([
+        ("capture_id".to_owned(), json!(snapshot.capture_id)),
+        (
+            "state".to_owned(),
+            serde_json::to_value(snapshot.state).expect("HssRunState is serializable"),
+        ),
+    ]);
+    if snapshot.state == HssRunState::Completed {
+        result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
+    }
+    Value::Object(result)
 }
 
 impl Drop for Runtime {

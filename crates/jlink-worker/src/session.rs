@@ -192,6 +192,52 @@ impl TargetSessionManager {
         Ok(())
     }
 
+    /// Checks the complete session boundary required before a new HSS Start.
+    pub(crate) fn ensure_hss_start_allowed(
+        &self,
+        spec: &TargetConnectionSpec,
+    ) -> Result<(), JlinkError> {
+        if self.hss_active {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "Worker 已持有一个活动 HSS 采集",
+                true,
+            ));
+        }
+        if self.connection_state != ConnectionState::Connected {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "HSS start 要求已连接且已验证的目标会话",
+                true,
+            ));
+        }
+        if self.active_target.as_ref() != Some(spec) {
+            return Err(JlinkError::new(
+                ErrorCode::OperationConflict,
+                "活动连接与 HSS 目标配置不一致",
+                true,
+            ));
+        }
+        if self.target_state != TargetState::Running {
+            return Err(JlinkError::new(
+                ErrorCode::InvalidStateTransition,
+                "HSS start 要求目标 CPU 正在运行",
+                true,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records a successful DLL Start after all preconditions were checked.
+    pub(crate) const fn record_hss_started(&mut self) {
+        self.hss_active = true;
+    }
+
+    /// Releases HSS ownership after internal Stop and tail drain completed.
+    pub(crate) const fn record_hss_completed(&mut self) {
+        self.hss_active = false;
+    }
+
     /// Records the target state confirmed after one public control action.
     pub(crate) const fn record_control_state(&mut self, state: TargetState) {
         self.target_state = state;

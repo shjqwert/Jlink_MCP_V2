@@ -1,4 +1,11 @@
-use std::{collections::BTreeMap, ffi::OsString, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    ffi::OsString,
+    path::PathBuf,
+    sync::mpsc::{self, RecvTimeoutError},
+    thread,
+    time::Instant,
+};
 
 use jlink_domain::{
     ErrorCode, IpcRequest, IpcResponse, JlinkError, ProtocolVersion, SessionCommand,
@@ -7,8 +14,14 @@ use jlink_domain::{
 use serde_json::json;
 
 use crate::{
-    control::execute_control, debug::execute_debug, gateway::DllGateway, lease::ProbeLease,
-    pipe::PipeServer, program::execute_program, session::TargetSessionManager,
+    control::execute_control,
+    debug::{ensure_firmware_identity, execute_debug},
+    gateway::DllGateway,
+    hss::HssCoordinator,
+    lease::ProbeLease,
+    pipe::PipeServer,
+    program::execute_program,
+    session::TargetSessionManager,
 };
 
 /// Immutable startup inputs for one authoritative Worker process.
@@ -90,11 +103,20 @@ struct WorkerRuntime {
     _lease: ProbeLease,
     gateway: DllGateway,
     session: TargetSessionManager,
+    hss: HssCoordinator,
 }
 
 fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
+    validate_target_and_after(request)?;
+    validate_program_payload(request)?;
+    validate_debug_payload(request)?;
+    validate_control_payload(request)?;
+    validate_hss_payload(request)
+}
+
+fn validate_target_and_after(request: &IpcRequest) -> Result<(), JlinkError> {
     let unexpected_target_message = match request.command {
-        SessionCommand::Status => Some("status 请求不能携带目标配置"),
+        SessionCommand::Status | SessionCommand::HssStatus => Some("只读状态请求不能携带目标配置"),
         SessionCommand::Disconnect => Some("disconnect 请求不能携带目标配置"),
         SessionCommand::Connect
         | SessionCommand::Validate
@@ -107,7 +129,8 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
         | SessionCommand::WriteVariable
         | SessionCommand::ReadRegister
         | SessionCommand::WriteRegister
-        | SessionCommand::Control => None,
+        | SessionCommand::Control
+        | SessionCommand::HssStart => None,
     };
     if let (Some(_), Some(message)) = (&request.target, unexpected_target_message) {
         return Err(JlinkError::new(ErrorCode::IpcProtocolError, message, false));
@@ -119,6 +142,10 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             false,
         ));
     }
+    Ok(())
+}
+
+fn validate_program_payload(request: &IpcRequest) -> Result<(), JlinkError> {
     let program_matches_command = matches!(
         (&request.command, &request.program),
         (
@@ -141,7 +168,9 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
                 | SessionCommand::WriteVariable
                 | SessionCommand::ReadRegister
                 | SessionCommand::WriteRegister
-                | SessionCommand::Control,
+                | SessionCommand::Control
+                | SessionCommand::HssStart
+                | SessionCommand::HssStatus,
             None
         )
     );
@@ -152,6 +181,10 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             false,
         ));
     }
+    Ok(())
+}
+
+fn validate_debug_payload(request: &IpcRequest) -> Result<(), JlinkError> {
     let debug_matches_command = matches!(
         (&request.command, &request.debug),
         (
@@ -180,7 +213,9 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
                 | SessionCommand::Flash
                 | SessionCommand::Erase
                 | SessionCommand::Verify
-                | SessionCommand::Control,
+                | SessionCommand::Control
+                | SessionCommand::HssStart
+                | SessionCommand::HssStatus,
             None
         )
     );
@@ -191,7 +226,7 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
             false,
         ));
     }
-    validate_control_payload(request)
+    Ok(())
 }
 
 fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
@@ -211,7 +246,9 @@ fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
                     | SessionCommand::ReadVariable
                     | SessionCommand::WriteVariable
                     | SessionCommand::ReadRegister
-                    | SessionCommand::WriteRegister,
+                    | SessionCommand::WriteRegister
+                    | SessionCommand::HssStart
+                    | SessionCommand::HssStatus,
                 None
             )
     ) {
@@ -225,7 +262,44 @@ fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
     }
 }
 
+fn validate_hss_payload(request: &IpcRequest) -> Result<(), JlinkError> {
+    let valid = match request.command {
+        SessionCommand::HssStart => request.hss_start.is_some() && request.capture_id.is_none(),
+        SessionCommand::HssStatus => {
+            request.hss_start.is_none()
+                && request
+                    .capture_id
+                    .as_deref()
+                    .is_some_and(|capture_id| !capture_id.trim().is_empty())
+        }
+        _ => request.hss_start.is_none() && request.capture_id.is_none(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(JlinkError::new(
+            ErrorCode::IpcProtocolError,
+            "command 与 HSS 负载不匹配",
+            false,
+        ))
+    }
+}
+
 impl WorkerRuntime {
+    fn handle_status(&self, request_id: jlink_domain::RequestId) -> (IpcResponse, bool) {
+        let status = self
+            .session
+            .status(&self.probe_identity_hash, self.gateway.is_loaded());
+        (
+            IpcResponse::success(
+                ProtocolVersion::V1,
+                request_id,
+                serde_json::to_value(status).expect("WorkerStatus is serializable"),
+            ),
+            true,
+        )
+    }
+
     fn handle_control(
         &mut self,
         request_id: jlink_domain::RequestId,
@@ -260,6 +334,7 @@ impl WorkerRuntime {
     fn handle_debug(
         &mut self,
         request_id: jlink_domain::RequestId,
+        queued_at: Instant,
         target: Option<jlink_domain::TargetConnectionSpec>,
         debug: Option<jlink_domain::DebugRequest>,
     ) -> (IpcResponse, bool) {
@@ -278,7 +353,20 @@ impl WorkerRuntime {
                     false,
                 )
             })?;
-            execute_debug(&mut self.session, &mut self.gateway, &target, debug)
+            let write = debug.may_interleave_during_hss();
+            let token = if write {
+                self.hss
+                    .begin_write(request_id.as_str(), queued_at, Instant::now())?
+            } else {
+                None
+            };
+            let result = execute_debug(&mut self.session, &mut self.gateway, &target, debug);
+            self.hss.finish_write(
+                token,
+                Instant::now(),
+                result.as_ref().map(|_| ()).map_err(|error| error.code),
+            );
+            result
         });
         match result {
             Ok(result) => (
@@ -286,6 +374,82 @@ impl WorkerRuntime {
                     ProtocolVersion::V1,
                     request_id,
                     serde_json::to_value(result).expect("DebugResult is serializable"),
+                ),
+                true,
+            ),
+            Err(error) => (
+                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                true,
+            ),
+        }
+    }
+
+    fn handle_hss_start(
+        &mut self,
+        request_id: jlink_domain::RequestId,
+        target: Option<jlink_domain::TargetConnectionSpec>,
+        plan: Option<jlink_domain::HssStartPlan>,
+    ) -> (IpcResponse, bool) {
+        let result = target
+            .ok_or_else(|| {
+                JlinkError::new(ErrorCode::ConfigInvalid, "HSS start 缺少目标配置", false)
+            })
+            .and_then(|target| {
+                let plan = plan.ok_or_else(|| {
+                    JlinkError::new(ErrorCode::IpcProtocolError, "HSS start 缺少启动计划", false)
+                })?;
+                let session = &mut self.session;
+                let outcome = self.hss.start(
+                    &self.probe_identity,
+                    plan.clone(),
+                    &mut self.gateway,
+                    |gateway| {
+                        session.ensure_hss_start_allowed(&target)?;
+                        ensure_firmware_identity(session, gateway, plan.firmware())?;
+                        gateway.hss_capabilities()?.validate_start(&plan)
+                    },
+                )?;
+                if outcome.started_new {
+                    session.record_hss_started();
+                }
+                Ok(outcome.snapshot)
+            });
+        match result {
+            Ok(snapshot) => (
+                IpcResponse::success(
+                    ProtocolVersion::V1,
+                    request_id,
+                    serde_json::to_value(snapshot).expect("HssRunSnapshot is serializable"),
+                ),
+                true,
+            ),
+            Err(error) => (
+                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                true,
+            ),
+        }
+    }
+
+    fn handle_hss_status(
+        &self,
+        request_id: jlink_domain::RequestId,
+        capture_id: Option<String>,
+    ) -> (IpcResponse, bool) {
+        let result = capture_id
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::IpcProtocolError,
+                    "HSS status 缺少 capture_id",
+                    false,
+                )
+            })
+            .and_then(|capture_id| self.hss.status(&capture_id, Instant::now()));
+        match result {
+            Ok(snapshot) => (
+                IpcResponse::success(
+                    ProtocolVersion::V1,
+                    request_id,
+                    serde_json::to_value(snapshot).expect("HssRunSnapshot is serializable"),
                 ),
                 true,
             ),
@@ -331,7 +495,7 @@ impl WorkerRuntime {
         }
     }
 
-    fn handle(&mut self, request: IpcRequest) -> (IpcResponse, bool) {
+    fn handle(&mut self, request: IpcRequest, queued_at: Instant) -> (IpcResponse, bool) {
         if let Err(error) = validate_request_contract(&request) {
             return (
                 IpcResponse::failure(ProtocolVersion::V1, request.request_id, error),
@@ -340,19 +504,7 @@ impl WorkerRuntime {
         }
         let request_id = request.request_id;
         match request.command {
-            SessionCommand::Status => {
-                let status = self
-                    .session
-                    .status(&self.probe_identity_hash, self.gateway.is_loaded());
-                (
-                    IpcResponse::success(
-                        ProtocolVersion::V1,
-                        request_id,
-                        serde_json::to_value(status).expect("WorkerStatus is serializable"),
-                    ),
-                    true,
-                )
-            }
+            SessionCommand::Status => self.handle_status(request_id),
             SessionCommand::Disconnect => match self.session.disconnect(&mut self.gateway) {
                 Ok(()) => (
                     IpcResponse::success(ProtocolVersion::V1, request_id, json!({})),
@@ -423,11 +575,63 @@ impl WorkerRuntime {
             | SessionCommand::WriteVariable
             | SessionCommand::ReadRegister
             | SessionCommand::WriteRegister => {
-                self.handle_debug(request_id, request.target, request.debug)
+                self.handle_debug(request_id, queued_at, request.target, request.debug)
             }
             SessionCommand::Control => {
                 self.handle_control(request_id, request.target, request.control)
             }
+            SessionCommand::HssStart => {
+                self.handle_hss_start(request_id, request.target, request.hss_start)
+            }
+            SessionCommand::HssStatus => self.handle_hss_status(request_id, request.capture_id),
+        }
+    }
+}
+
+struct RequestEnvelope {
+    request: IpcRequest,
+    queued_at: Instant,
+    response: mpsc::Sender<DispatchReply>,
+}
+
+struct DispatchReply {
+    response: IpcResponse,
+    keep_running: bool,
+}
+
+fn listen_for_requests(
+    endpoint: &str,
+    requests: &mpsc::Sender<RequestEnvelope>,
+) -> Result<(), JlinkError> {
+    let mut server = PipeServer::new(endpoint)?;
+    loop {
+        let mut pipe = server.accept()?;
+        let request = match read_ipc_frame::<_, IpcRequest>(&mut pipe) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("拒绝无效 IPC 请求：{error}");
+                continue;
+            }
+        };
+        let (response_tx, response_rx) = mpsc::channel();
+        if requests
+            .send(RequestEnvelope {
+                request,
+                queued_at: Instant::now(),
+                response: response_tx,
+            })
+            .is_err()
+        {
+            return Ok(());
+        }
+        let Ok(reply) = response_rx.recv() else {
+            return Ok(());
+        };
+        if let Err(error) = write_ipc_frame(&mut pipe, &reply.response) {
+            eprintln!("Worker 响应写回失败，已保留实际执行结果：{error}");
+        }
+        if !reply.keep_running {
+            return Ok(());
         }
     }
 }
@@ -449,23 +653,55 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
         _lease: lease,
         gateway,
         session: TargetSessionManager::new(),
+        hss: HssCoordinator::new(),
     };
-    let mut server = PipeServer::new(&endpoint)?;
+    let (request_tx, request_rx) = mpsc::channel();
+    let listener = thread::spawn(move || listen_for_requests(&endpoint, &request_tx));
     let mut keep_running = true;
     while keep_running {
-        let mut pipe = server.accept()?;
-        let request = match read_ipc_frame::<_, IpcRequest>(&mut pipe) {
-            Ok(request) => request,
-            Err(error) => {
-                eprintln!("拒绝无效 IPC 请求：{error}");
-                continue;
+        if runtime.hss.is_active() && runtime.hss.advance(&mut runtime.gateway)? {
+            runtime.session.record_hss_completed();
+        }
+        let envelope = if runtime.hss.is_active() {
+            match request_rx.recv_timeout(HssCoordinator::next_wait()) {
+                Ok(envelope) => Some(envelope),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match request_rx.recv() {
+                Ok(envelope) => Some(envelope),
+                Err(_) => break,
             }
         };
-        let (response, next) = runtime.handle(request);
-        write_ipc_frame(&mut pipe, &response)?;
+        let Some(envelope) = envelope else {
+            continue;
+        };
+        let (response, next) = runtime.handle(envelope.request, envelope.queued_at);
         keep_running = next;
+        if envelope
+            .response
+            .send(DispatchReply {
+                response,
+                keep_running,
+            })
+            .is_err()
+        {
+            return Err(JlinkError::new(
+                ErrorCode::WorkerUnavailable,
+                "Worker 管道监听线程在响应前退出",
+                true,
+            ));
+        }
     }
-    Ok(())
+    match listener.join() {
+        Ok(result) => result,
+        Err(_) => Err(JlinkError::new(
+            ErrorCode::WorkerUnavailable,
+            "Worker 管道监听线程异常退出",
+            false,
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -610,6 +846,42 @@ mod tests {
         assert_eq!(
             validate_request_contract(&missing)
                 .expect_err("control payload is required")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+    }
+
+    #[test]
+    fn hss_status_requires_only_one_non_empty_capture_identity() {
+        let valid = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("hss-status").expect("request id"),
+            SessionCommand::HssStatus,
+        )
+        .with_capture_id("cap-1");
+        validate_request_contract(&valid).expect("internal status identity");
+
+        let missing = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("hss-missing").expect("request id"),
+            SessionCommand::HssStatus,
+        );
+        assert_eq!(
+            validate_request_contract(&missing)
+                .expect_err("status requires capture id")
+                .code,
+            ErrorCode::IpcProtocolError
+        );
+
+        let leaked = IpcRequest::new(
+            ProtocolVersion::V1,
+            RequestId::new("ordinary-status").expect("request id"),
+            SessionCommand::Status,
+        )
+        .with_capture_id("cap-1");
+        assert_eq!(
+            validate_request_contract(&leaked)
+                .expect_err("ordinary status cannot carry HSS identity")
                 .code,
             ErrorCode::IpcProtocolError
         );

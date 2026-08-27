@@ -294,6 +294,10 @@ pub enum SessionCommand {
     WriteRegister,
     /// Execute one explicit target control action.
     Control,
+    /// Start one validated fixed-duration HSS capture.
+    HssStart,
+    /// Read one Worker-owned capture state without touching the target.
+    HssStatus,
 }
 
 impl SessionCommand {
@@ -305,7 +309,8 @@ impl SessionCommand {
             | Self::Verify
             | Self::ReadMemory
             | Self::ReadVariable
-            | Self::ReadRegister => ExecutionKind::ReadOnly,
+            | Self::ReadRegister
+            | Self::HssStatus => ExecutionKind::ReadOnly,
             Self::Connect
             | Self::Disconnect
             | Self::Validate
@@ -314,7 +319,8 @@ impl SessionCommand {
             | Self::WriteMemory
             | Self::WriteVariable
             | Self::WriteRegister
-            | Self::Control => ExecutionKind::SideEffect,
+            | Self::Control
+            | Self::HssStart => ExecutionKind::SideEffect,
         }
     }
 }
@@ -344,6 +350,12 @@ pub struct IpcRequest {
     /// Typed target-control payload required by the control command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control: Option<crate::ControlRequest>,
+    /// Typed HSS start plan required only by `hss_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hss_start: Option<crate::HssStartPlan>,
+    /// Stable capture identity required only by `hss_status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_id: Option<String>,
 }
 
 impl IpcRequest {
@@ -363,6 +375,8 @@ impl IpcRequest {
             program: None,
             debug: None,
             control: None,
+            hss_start: None,
+            capture_id: None,
         }
     }
 
@@ -398,6 +412,20 @@ impl IpcRequest {
     #[must_use]
     pub const fn with_control(mut self, control: crate::ControlRequest) -> Self {
         self.control = Some(control);
+        self
+    }
+
+    /// Attaches one immutable HSS start plan.
+    #[must_use]
+    pub fn with_hss_start(mut self, plan: crate::HssStartPlan) -> Self {
+        self.hss_start = Some(plan);
+        self
+    }
+
+    /// Attaches one stable capture identity for internal status polling.
+    #[must_use]
+    pub fn with_capture_id(mut self, capture_id: impl Into<String>) -> Self {
+        self.capture_id = Some(capture_id.into());
         self
     }
 }

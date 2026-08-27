@@ -3,6 +3,7 @@
 mod control;
 mod debug;
 mod gateway;
+mod hss;
 mod lease;
 mod pipe;
 mod program;

@@ -264,6 +264,7 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::VerifyFailed => "VERIFY_FAILED",
         ErrorCode::FrameInvalid => "FRAME_INVALID",
         ErrorCode::HssUnsupported => "HSS_UNSUPPORTED",
+        ErrorCode::HssStartFailed => "HSS_START_FAILED",
         ErrorCode::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
@@ -1051,6 +1052,7 @@ mod tests {
     fn p3_start_errors_remain_structured_and_distinct() {
         for (code, expected) in [
             (ErrorCode::HssUnsupported, "HSS_UNSUPPORTED"),
+            (ErrorCode::HssStartFailed, "HSS_START_FAILED"),
             (ErrorCode::CaptureKeyConflict, "CAPTURE_KEY_CONFLICT"),
         ] {
             let result = public_tool_error(JlinkError::new(code, "start rejected", false))

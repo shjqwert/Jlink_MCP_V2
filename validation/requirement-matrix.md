@@ -35,7 +35,7 @@ public contract and is recorded in the implementation constraints.
 | CFG-004 | T-P1-CFG | `validation/p1-stage.md` DLL identity fixture | F0-A identity |
 | CFG-005 | T-P1-CFG | `validation/p1-stage.md` repository/config fixture | None |
 | RUN-001 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
-| RUN-002 | T-P3-RUN | J-Link hardware timeline | F0-A |
+| RUN-002 | T-P3-RUN | Production Worker scheduler trace + J-Link hardware timeline | F0-A |
 | RUN-003 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
 | RUN-004 | T-P3-RECOVER | Windows process integration | F0-B |
 | RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
@@ -65,16 +65,16 @@ public contract and is recorded in the implementation constraints.
 | DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware；`validation/p2-stage.md` | F0-A |
 | DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware；`validation/p2-stage.md` | F0-A |
 | DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；`validation/p2-stage.md` | F0-A |
-| DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
+| DBG-007 | T-P3-RUN | Production session conflict tests + active-capture hardware timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
 | HSSA-001 | T-P3-START | `validation/p3-start.md` normalized request/key fixture + frozen J-Link capability preflight | F0-A |
 | HSSA-002 | T-P3-START | `validation/p3-start.md` IAR DWARF AccessPlan/frame fixture + frozen J-Link capability preflight | F0-A + F0-C |
 | HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
-| HSSA-004 | T-P3-RUN | Timed J-Link hardware capture | F0-A |
+| HSSA-004 | T-P3-RUN | Production automatic Stop/tail-drain trace + timed J-Link capture | F0-A |
 | HSSA-005 | T-P3-STATE | State-machine/fault fixture | F0-A + F0-B |
 | HSSA-006 | T-P3-STORE | Local storage integration | F0-A throughput |
 | HSSA-007 | T-P3-QUALITY | J-Link raw-frame fixture/hardware | F0-A |
-| HSSA-008 | T-P3-RUN | J-Link write-interleaving timeline | F0-A |
+| HSSA-008 | T-P3-RUN | Production write event trace + J-Link write-interleaving timeline | F0-A |
 | HSSA-009 | T-P3-RECOVER | Windows process + hardware integration | F0-B |
 | HSSA-010 | T-P3-QUALITY | J-Link timing evidence | F0-A |
 | HSSA-011 | T-P3-QUALITY | J-Link/host clock evidence | F0-A |
