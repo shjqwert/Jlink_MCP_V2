@@ -97,6 +97,7 @@ struct TerminalCapture {
 pub(crate) struct HssCoordinator {
     store: CaptureStore,
     registry: HssStartRegistry,
+    retired_keys: BTreeMap<String, String>,
     active: Option<ActiveCapture>,
     terminal: BTreeMap<String, TerminalCapture>,
 }
@@ -106,11 +107,16 @@ impl HssCoordinator {
         let store = CaptureStore::open(root)?;
         let recoveries = store.recover_partials()?;
         let mut registry = HssStartRegistry::new();
+        let mut retired_keys = BTreeMap::new();
         let mut terminal = BTreeMap::new();
         for snapshot in store.completed_snapshots()? {
             let reservation =
                 registry.reserve(probe_identity, snapshot.target(), snapshot.plan())?;
             validate_recovered_capture_id(&reservation, snapshot.capture_id())?;
+            retired_keys.insert(
+                snapshot.plan().capture_key().to_owned(),
+                snapshot.capture_id().to_owned(),
+            );
             terminal.insert(
                 snapshot.capture_id().to_owned(),
                 TerminalCapture {
@@ -135,6 +141,7 @@ impl HssCoordinator {
                         (Some(target), Some(plan)) => {
                             let reservation = registry.reserve(probe_identity, target, plan)?;
                             validate_recovered_capture_id(&reservation, &capture_id)?;
+                            retired_keys.insert(plan.capture_key().to_owned(), capture_id.clone());
                         }
                         (None, None) => {}
                         _ => {
@@ -169,7 +176,8 @@ impl HssCoordinator {
         }
         Ok(Self {
             store,
-            registry,
+            registry: HssStartRegistry::new(),
+            retired_keys,
             active: None,
             terminal,
         })
@@ -196,6 +204,14 @@ impl HssCoordinator {
         I: HssIo,
         F: FnOnce(&mut I) -> Result<(), JlinkError>,
     {
+        if let Some(capture_id) = self.retired_keys.get(plan.capture_key()) {
+            return Err(JlinkError::new(
+                ErrorCode::CaptureKeyConflict,
+                "capture_key 属于上一 MCP/Worker 生命周期，新的采集必须使用新键",
+                false,
+            )
+            .with_detail("capture_id", json!(capture_id)));
+        }
         let reservation = match self.registry.reserve(probe_identity, target, &plan)? {
             HssReservationOutcome::Existing(reservation) => {
                 let snapshot = self.status(reservation.capture_id(), Instant::now())?;
@@ -316,6 +332,63 @@ impl HssCoordinator {
     /// Drains once before any dispatch and performs automatic Stop/tail drain.
     pub(crate) fn advance<I: HssIo>(&mut self, io: &mut I) -> Result<bool, JlinkError> {
         self.advance_at(io, Instant::now())
+    }
+
+    pub(crate) fn shutdown<I: HssIo>(&mut self, io: &mut I) -> Result<bool, JlinkError> {
+        let Some(active) = self.active.as_mut() else {
+            return Ok(false);
+        };
+        let stopped_at = Instant::now();
+        if active.status.lifecycle() == HssRunState::Running {
+            io.stop_hss()?;
+            active
+                .status
+                .mark_stopping()
+                .expect("running capture enters stopping after successful shutdown Stop");
+            active.tail_started = Some(stopped_at);
+        }
+
+        loop {
+            let now = Instant::now();
+            let active = self
+                .active
+                .as_mut()
+                .expect("shutdown retains the active capture until terminal persistence");
+            let read = match drain_once(active, io, now) {
+                Ok(read) => read,
+                Err(error) => {
+                    let reported = error.clone();
+                    self.fail(error, now, true)?;
+                    return Err(reported);
+                }
+            };
+            if read == 0 {
+                active.consecutive_empty_tail_reads += 1;
+            } else {
+                active.consecutive_empty_tail_reads = 0;
+            }
+            if active.consecutive_empty_tail_reads >= TAIL_EMPTY_READS {
+                return self.fail(
+                    JlinkError::new(
+                        ErrorCode::WorkerUnavailable,
+                        "MCP 正常关闭在固定截止时间前停止了 HSS",
+                        false,
+                    ),
+                    now,
+                    true,
+                );
+            }
+            if now.saturating_duration_since(stopped_at) >= TAIL_DRAIN_TIMEOUT {
+                let error = JlinkError::new(
+                    ErrorCode::FrameInvalid,
+                    "MCP 正常关闭后的 HSS 尾排空未在 500 ms 内收敛",
+                    false,
+                );
+                self.fail(error.clone(), now, true)?;
+                return Err(error);
+            }
+            std::thread::sleep(DRAIN_INTERVAL);
+        }
     }
 
     fn advance_at<I: HssIo>(&mut self, io: &mut I, now: Instant) -> Result<bool, JlinkError> {
@@ -1066,7 +1139,7 @@ mod tests {
     }
 
     #[test]
-    fn t_p3_recover_restores_completed_identity_and_same_key_without_second_start() {
+    fn t_p3_recover_keeps_completed_capture_by_id_but_retires_its_key_after_restart() {
         let plan = start_plan();
         let (store_root, mut coordinator) = open_coordinator();
         let mut io = ScriptedHss::healthy([record(1, 7)]);
@@ -1087,28 +1160,108 @@ mod tests {
 
         let mut recovered = HssCoordinator::open(store_root.path(), "260106173")
             .expect("completed capture index restores");
-        let by_key = recovered
-            .status_by_key(plan.capture_key(), Instant::now())
-            .expect("capture key resolves after Worker restart");
-        assert_eq!(by_key.capture_id, capture_id);
-        assert_eq!(by_key.state, HssRunState::Completed);
+        let by_id = recovered
+            .status(&capture_id, Instant::now())
+            .expect("immutable completed capture remains queryable by ID");
+        assert_eq!(by_id.state, HssRunState::Completed);
+        assert_eq!(
+            recovered
+                .status_by_key(plan.capture_key(), Instant::now())
+                .expect_err("capture key does not cross Worker lifecycles")
+                .code,
+            ErrorCode::ValueInvalid
+        );
 
         let mut second_io = ScriptedHss::healthy([]);
-        let same = recovered
+        let error = recovered
             .start(
                 "260106173",
                 &target(),
                 plan,
                 TEST_CAPTURE_MAX_BYTES,
                 &mut second_io,
-                |_| panic!("recovered identity must return before hardware preflight"),
+                |_| panic!("retired key must fail before hardware preflight"),
             )
-            .expect("same key and request recover completed capture");
-        assert!(!same.started_new);
-        assert_eq!(same.snapshot.capture_id, capture_id);
+            .expect_err("same key cannot start in a new Worker lifecycle");
+        assert_eq!(error.code, ErrorCode::CaptureKeyConflict);
         assert!(
             second_io.calls.is_empty(),
-            "recovery must not call HSS Start"
+            "retired key cannot call HSS Start"
+        );
+    }
+
+    #[test]
+    fn t_p3_recover_graceful_shutdown_stops_drains_and_persists_failed_capture() {
+        let (store_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss::healthy([record(1, 7)]);
+        let outcome = coordinator
+            .start(
+                "260106173",
+                &target(),
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
+            .expect("capture starts");
+        let capture_id = outcome.snapshot.capture_id;
+
+        assert!(
+            coordinator
+                .shutdown(&mut io)
+                .expect("graceful shutdown reaches a persisted terminal state")
+        );
+        let snapshot = coordinator
+            .status(&capture_id, Instant::now())
+            .expect("shutdown capture remains queryable in the owning Worker");
+        assert_eq!(snapshot.state, HssRunState::Failed);
+        assert_eq!(snapshot.failure_code, Some(ErrorCode::WorkerUnavailable));
+        assert!(snapshot.partial_available);
+        assert_eq!(io.calls[0..2], ["start", "stop"]);
+        assert_eq!(io.calls.iter().filter(|call| **call == "stop").count(), 1);
+        assert!(
+            store_root
+                .path()
+                .join(format!("capture-{capture_id}.capture"))
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn t_p3_recover_shutdown_reports_tail_drain_failure_after_persisting_it() {
+        let (store_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss::healthy([]);
+        let outcome = coordinator
+            .start(
+                "260106173",
+                &target(),
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
+            .expect("capture starts");
+        let capture_id = outcome.snapshot.capture_id;
+        io.reads.push_back(Err(JlinkError::new(
+            ErrorCode::FrameInvalid,
+            "tail drain fixture failure",
+            false,
+        )));
+
+        let error = coordinator
+            .shutdown(&mut io)
+            .expect_err("tail drain failure must reach the owning MCP");
+        assert_eq!(error.code, ErrorCode::FrameInvalid);
+        let snapshot = coordinator
+            .status(&capture_id, Instant::now())
+            .expect("failed capture remains queryable");
+        assert_eq!(snapshot.state, HssRunState::Failed);
+        assert_ne!(snapshot.state, HssRunState::Completed);
+        assert!(
+            store_root
+                .path()
+                .join(format!("capture-{capture_id}.capture"))
+                .is_file()
         );
     }
 

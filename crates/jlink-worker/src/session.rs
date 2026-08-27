@@ -88,9 +88,15 @@ impl TargetSessionManager {
         }
     }
 
-    pub(crate) fn status(&self, probe_identity_hash: &str, dll_loaded: bool) -> WorkerStatus {
+    pub(crate) fn status(
+        &self,
+        parent_pid: u32,
+        probe_identity_hash: &str,
+        dll_loaded: bool,
+    ) -> WorkerStatus {
         WorkerStatus {
             worker_pid: std::process::id(),
+            parent_pid,
             probe_identity_hash: probe_identity_hash.to_owned(),
             dll_loaded,
             connection_state: self.connection_state,
@@ -664,7 +670,7 @@ mod tests {
         let mut manager = TargetSessionManager::new();
         manager.validation_key = Some(spec);
         manager.hss_active = true;
-        let before = manager.status("probe-hash", true);
+        let before = manager.status(42, "probe-hash", true);
         assert!(before.hss_active);
         assert!(before.validation_cached);
         assert_eq!(before.validation_runs, 0);
@@ -862,7 +868,7 @@ mod tests {
             .record_execution_uncertain(ValidationInvalidation::ConnectionLost)
             .expect("connected session becomes faulted");
 
-        let status = manager.status("probe", true);
+        let status = manager.status(42, "probe", true);
         assert_eq!(status.connection_state, ConnectionState::Faulted);
         assert_eq!(status.target_state, TargetState::Unknown);
         assert!(status.target_id.is_none());

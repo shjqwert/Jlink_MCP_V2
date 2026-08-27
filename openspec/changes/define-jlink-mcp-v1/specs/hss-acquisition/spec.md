@@ -54,7 +54,7 @@ HSS 选择项 MUST 由 ELF/DWARF 静态变量路径解析，不得接受原始�
 
 #### Scenario: Agent 未保持连接
 - **WHEN** 启动采集的 MCP 客户端在采集期间断开
-- **THEN** Worker 仍按原时长完成停止、尾部排空和持久化
+- **THEN** MCP 正常关闭时 Worker 提前停止 HSS、尾部排空并保存非 `completed` 结果；意外退出时不保证续行
 
 ### Requirement: HSSA-005 生命周期与数据完整性分离
 采集生命周期 MUST 使用 `starting`、`running`、`stopping`、`completed`、`failed` 或 `aborted`；数据完整性 MUST 独立使用 `complete`、`degraded` 或 `unknown`。检测到质量问题时，系统 MUST 保留仍可解释的数据，不得仅因数据降级将其静默丢弃。能够执行受控故障收口但未形成正常完成 capture 时 MUST 使用 `failed`；进程被强制终止、存储中断或启动扫描发现遗留临时采集时 MUST 使用 `aborted`。
@@ -105,11 +105,11 @@ HSS 活动期间，只允许变量写入或 RAM/MMIO 写入进入 Worker；它�
 - **THEN** 系统同时记录写入事件和对应质量影响，不把变化错误归因为采样值本身
 
 ### Requirement: HSSA-009 采集恢复与探针租约
-采集身份 MUST 同时绑定稳定的采集 ID、`capture_key`、目标身份和探针租约。主 MCP 进程重启后 MUST 能查询仍在运行或已完成的采集；租约或 Worker 状态不确定时 MUST 先恢复事实，不得重复启动同一采集。
+采集身份 MUST 同时绑定稳定的采集 ID、`capture_key`、目标身份和探针租约。`capture_key` 幂等边界只适用于当前 MCP/Worker 生命周期；新的 MCP MUST NOT 接管旧活动 HSS 或要求旧键续行。启动扫描发现的未完成 Capture Store 只能恢复为 `aborted + unknown` 或安全清理，不得作为完整证据。
 
-#### Scenario: MCP 主进程重启后查询
-- **WHEN** Worker 在主进程退出期间继续采集且新的主进程使用原 `capture_key` 查询
-- **THEN** 系统返回同一采集的状态和 ID，不重新连接探针或启动第二次采集
+#### Scenario: MCP 主进程重启后发现旧临时采集
+- **WHEN** 新 Worker 启动扫描到上一生命周期留下的未完成 Capture Store
+- **THEN** 系统将其恢复为 `aborted + unknown` 或清理，不返回 `completed`，新采集重新连接目标并使用新 `capture_key`
 
 ### Requirement: HSSA-010 请求频率透明度
 系统 MUST 保存请求频率、实际样本数和可观测时间间隔统计。实际频率低于请求频率本身 MUST NOT 自动使采集失败，但任何超出已验证能力或出现异常间隔的情况 MUST 在质量信息中明确呈现。

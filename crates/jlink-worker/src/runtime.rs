@@ -168,12 +168,9 @@ impl ParentProcess {
     }
 }
 
-const fn orphan_must_exit(parent_exited: bool, hss_active: bool) -> bool {
-    parent_exited && !hss_active
-}
-
 struct WorkerRuntime {
     probe_identity: String,
+    parent_pid: u32,
     probe_identity_hash: String,
     _lease: ProbeLease,
     gateway: DllGateway,
@@ -192,7 +189,9 @@ fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
 fn validate_target_and_after(request: &IpcRequest) -> Result<(), JlinkError> {
     let unexpected_target_message = match request.command {
         SessionCommand::Status | SessionCommand::HssStatus => Some("只读状态请求不能携带目标配置"),
-        SessionCommand::Disconnect => Some("disconnect 请求不能携带目标配置"),
+        SessionCommand::Disconnect | SessionCommand::Shutdown => {
+            Some("disconnect/shutdown 请求不能携带目标配置")
+        }
         SessionCommand::Connect
         | SessionCommand::Validate
         | SessionCommand::Flash
@@ -235,6 +234,7 @@ fn validate_program_payload(request: &IpcRequest) -> Result<(), JlinkError> {
         ) | (
             SessionCommand::Connect
                 | SessionCommand::Disconnect
+                | SessionCommand::Shutdown
                 | SessionCommand::Status
                 | SessionCommand::Validate
                 | SessionCommand::ReadMemory
@@ -283,6 +283,7 @@ fn validate_debug_payload(request: &IpcRequest) -> Result<(), JlinkError> {
         ) | (
             SessionCommand::Connect
                 | SessionCommand::Disconnect
+                | SessionCommand::Shutdown
                 | SessionCommand::Status
                 | SessionCommand::Validate
                 | SessionCommand::Flash
@@ -311,6 +312,7 @@ fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
             | (
                 SessionCommand::Connect
                     | SessionCommand::Disconnect
+                    | SessionCommand::Shutdown
                     | SessionCommand::Status
                     | SessionCommand::Validate
                     | SessionCommand::Flash
@@ -376,9 +378,11 @@ fn validate_hss_payload(request: &IpcRequest) -> Result<(), JlinkError> {
 
 impl WorkerRuntime {
     fn handle_status(&self, request_id: jlink_domain::RequestId) -> (IpcResponse, bool) {
-        let status = self
-            .session
-            .status(&self.probe_identity_hash, self.gateway.is_loaded());
+        let status = self.session.status(
+            self.parent_pid,
+            &self.probe_identity_hash,
+            self.gateway.is_loaded(),
+        );
         (
             IpcResponse::success(
                 ProtocolVersion::V1,
@@ -387,6 +391,26 @@ impl WorkerRuntime {
             ),
             true,
         )
+    }
+
+    fn graceful_shutdown(&mut self) -> Result<(), JlinkError> {
+        if self.hss.shutdown(&mut self.gateway)? {
+            self.session.record_hss_completed();
+        }
+        self.session.disconnect(&mut self.gateway)
+    }
+
+    fn handle_shutdown(&mut self, request_id: jlink_domain::RequestId) -> (IpcResponse, bool) {
+        match self.graceful_shutdown() {
+            Ok(()) => (
+                IpcResponse::success(ProtocolVersion::V1, request_id, json!({})),
+                false,
+            ),
+            Err(error) => (
+                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                false,
+            ),
+        }
     }
 
     fn handle_control(
@@ -609,6 +633,7 @@ impl WorkerRuntime {
         let request_id = request.request_id;
         match request.command {
             SessionCommand::Status => self.handle_status(request_id),
+            SessionCommand::Shutdown => self.handle_shutdown(request_id),
             SessionCommand::Disconnect => match self.session.disconnect(&mut self.gateway) {
                 Ok(()) => (
                     IpcResponse::success(ProtocolVersion::V1, request_id, json!({})),
@@ -626,9 +651,11 @@ impl WorkerRuntime {
                 match result.and_then(|target| {
                     self.session
                         .connect(&mut self.gateway, &self.probe_identity, &target)?;
-                    Ok(self
-                        .session
-                        .status(&self.probe_identity_hash, self.gateway.is_loaded()))
+                    Ok(self.session.status(
+                        self.parent_pid,
+                        &self.probe_identity_hash,
+                        self.gateway.is_loaded(),
+                    ))
                 }) {
                     Ok(status) => (
                         IpcResponse::success(
@@ -764,6 +791,7 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     let gateway = DllGateway::load(&options.dll_path)?;
     let mut runtime = WorkerRuntime {
         probe_identity: options.probe_identity.clone(),
+        parent_pid: options.parent_pid,
         probe_identity_hash: identity_hash,
         _lease: lease,
         gateway,
@@ -775,12 +803,12 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     let mut keep_running = true;
     let mut parent_exit = false;
     while keep_running {
+        parent_exit = parent.has_exited()?;
+        if parent_exit {
+            break;
+        }
         if runtime.hss.is_active() && runtime.hss.advance(&mut runtime.gateway)? {
             runtime.session.record_hss_completed();
-        }
-        parent_exit = parent.has_exited()?;
-        if orphan_must_exit(parent_exit, runtime.hss.is_active()) {
-            break;
         }
         let wait = if runtime.hss.is_active() {
             HssCoordinator::next_wait()
@@ -1031,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn t_p3_recover_parent_exit_is_observable_and_only_idle_worker_must_exit() {
+    fn t_p3_recover_parent_exit_is_observable_and_terminates_worker_lifecycle() {
         let mut child = std::process::Command::new("cmd")
             .args(["/C", "ping -n 10 127.0.0.1 >nul"])
             .spawn()
@@ -1041,8 +1069,5 @@ mod tests {
         child.kill().expect("fixture process terminates");
         child.wait().expect("fixture process is reaped");
         assert!(parent.has_exited().expect("exited parent status"));
-        assert!(orphan_must_exit(true, false));
-        assert!(!orphan_must_exit(true, true));
-        assert!(!orphan_must_exit(false, false));
     }
 }

@@ -1382,8 +1382,8 @@ fn capture_id_from_resource_uri(uri: &str) -> Result<&str, JlinkError> {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        if let Some(attachment) = &self.attachment {
-            let _ = attachment.client.disconnect();
+        if let Some(mut attachment) = self.attachment.take() {
+            let _ = attachment.shutdown();
         }
     }
 }

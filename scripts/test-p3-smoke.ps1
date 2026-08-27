@@ -258,7 +258,6 @@ $localAppData = Join-Path $temporaryRoot 'localappdata'
 $null = New-Item -ItemType Directory -Path $localAppData
 
 $ownerProcess = $null
-$recoveryProcess = $null
 $testError = $null
 $cleanupError = $null
 $captureId = $null
@@ -333,33 +332,8 @@ try {
     if ($workers.Count -ne 1) {
         throw "HSS Start 后 Worker 数量不是 1：$($workers.Count)"
     }
-    $workerProcessId = $workers[0].Id
 
-    # Intentionally terminate only the MCP parent. The Worker must retain the live HSS capture.
-    $ownerProcess.Kill()
-    if (-not $ownerProcess.WaitForExit(5000)) {
-        throw '原 MCP 父进程未退出'
-    }
-    Start-Sleep -Milliseconds 250
-    $sameWorker = Get-Process -Id $workerProcessId -ErrorAction Stop
-    if ($sameWorker.ProcessName -ne 'jlink-worker') {
-        throw '父进程退出后活动 Worker 身份发生变化'
-    }
-
-    $recoveryProcess = Start-McpProcess -WorkingDirectory $temporaryRoot -LocalAppData $localAppData
-    Initialize-Mcp -Process $recoveryProcess -Id 100
-    $recovered = Invoke-McpTool -Process $recoveryProcess -Id 101 -Name 'jlink_hss' -Arguments @{
-        action = 'status'
-        capture_key = $captureKey
-    }
-    if ($activeStates -notcontains $recovered.result.structuredContent.state) {
-        throw "新 MCP 未恢复活动采集：$($recovered.result.structuredContent | ConvertTo-Json -Compress)"
-    }
-    if ($recovered.result.structuredContent.capture_id -ne $captureId) {
-        throw '按 capture_key 恢复的 capture_id 发生变化'
-    }
-
-    $conflict = Invoke-McpToolRaw -Process $recoveryProcess -Id 102 -Name 'jlink_inspect' -Arguments @{
+    $conflict = Invoke-McpToolRaw -Process $ownerProcess -Id 102 -Name 'jlink_inspect' -Arguments @{
         action = 'memory'
         address = $writableAddress
         length = 4
@@ -367,14 +341,14 @@ try {
     Assert-ToolError -Response $conflict -ExpectedCode 'OPERATION_CONFLICT' -Description '活动 HSS 读取冲突路由'
 
     $variableDirty = $true
-    $changedWrite = Invoke-McpTool -Process $recoveryProcess -Id 103 -Name 'jlink_write' -Arguments @{
+    $changedWrite = Invoke-McpTool -Process $ownerProcess -Id 103 -Name 'jlink_write' -Arguments @{
         action = 'memory'
         address = $writableAddress
         data = $changedBytes
         verify = 'readback'
     }
     Assert-EmptyToolResult -Response $changedWrite -Description 'HSS 交错写入'
-    $restoredWrite = Invoke-McpTool -Process $recoveryProcess -Id 104 -Name 'jlink_write' -Arguments @{
+    $restoredWrite = Invoke-McpTool -Process $ownerProcess -Id 104 -Name 'jlink_write' -Arguments @{
         action = 'memory'
         address = $writableAddress
         data = $originalBytes
@@ -383,7 +357,7 @@ try {
     Assert-EmptyToolResult -Response $restoredWrite -Description 'HSS 交错写入恢复'
     $variableDirty = $false
 
-    $terminal = Wait-HssTerminal -Process $recoveryProcess -CaptureKey $captureKey -FirstId 200
+    $terminal = Wait-HssTerminal -Process $ownerProcess -CaptureKey $captureKey -FirstId 200
     $captureTerminal = $true
     if ($terminal.state -ne 'completed') {
         throw "HSS 未正常完成：$($terminal | ConvertTo-Json -Compress -Depth 20)"
@@ -405,15 +379,12 @@ try {
         throw "HSS 6.98a 时间单位证据不符：$($terminal.quality.clock | ConvertTo-Json -Compress)"
     }
 
-    # The original Worker may exit after completion because its original parent is gone.
-    # A connect here proves that the recovery MCP can continue with the same frozen target.
-    $null = Invoke-McpTool -Process $recoveryProcess -Id 600 -Name 'jlink_target' -Arguments @{ action = 'connect' }
-    $finalConnectStatus = Invoke-McpTool -Process $recoveryProcess -Id 601 -Name 'jlink_target' -Arguments @{ action = 'status' }
+    $finalConnectStatus = Invoke-McpTool -Process $ownerProcess -Id 601 -Name 'jlink_target' -Arguments @{ action = 'status' }
     if ($finalConnectStatus.result.structuredContent.connection -ne 'connected' -or
         $finalConnectStatus.result.structuredContent.state -ne 'running') {
         throw "HSS 后目标未恢复 connected/running：$($finalConnectStatus.result.structuredContent | ConvertTo-Json -Compress)"
     }
-    $restoredMemory = Invoke-McpTool -Process $recoveryProcess -Id 602 -Name 'jlink_inspect' -Arguments @{
+    $restoredMemory = Invoke-McpTool -Process $ownerProcess -Id 602 -Name 'jlink_inspect' -Arguments @{
         action = 'memory'
         address = $writableAddress
         length = 4
@@ -421,18 +392,18 @@ try {
     if ($restoredMemory.result.structuredContent.data -ne $originalBytes) {
         throw "HSS 后测试变量未恢复：$($restoredMemory.result.structuredContent.data)"
     }
-    $finalStatus = Invoke-McpTool -Process $recoveryProcess -Id 603 -Name 'jlink_target' -Arguments @{ action = 'status' }
+    $finalStatus = Invoke-McpTool -Process $ownerProcess -Id 603 -Name 'jlink_target' -Arguments @{ action = 'status' }
     if ($finalStatus.result.structuredContent.connection -ne 'connected' -or
         $finalStatus.result.structuredContent.state -ne 'running') {
         throw "HSS 后 CPU 状态不安全：$($finalStatus.result.structuredContent | ConvertTo-Json -Compress)"
     }
-    $disconnect = Invoke-McpTool -Process $recoveryProcess -Id 604 -Name 'jlink_target' -Arguments @{ action = 'disconnect' }
+    $disconnect = Invoke-McpTool -Process $ownerProcess -Id 604 -Name 'jlink_target' -Arguments @{ action = 'disconnect' }
     Assert-EmptyToolResult -Response $disconnect -Description 'P3 disconnect'
     $safeStateConfirmed = $true
 
-    $recoveryProcess.StandardInput.Close()
-    if (-not $recoveryProcess.WaitForExit(5000) -or $recoveryProcess.ExitCode -ne 0) {
-        throw '恢复 MCP 未在 disconnect 后正常退出'
+    $ownerProcess.StandardInput.Close()
+    if (-not $ownerProcess.WaitForExit(5000) -or $ownerProcess.ExitCode -ne 0) {
+        throw '当前 MCP 未在 disconnect 后正常退出'
     }
     Start-Sleep -Milliseconds 250
     if (Get-Process -Name 'jlink-mcp', 'jlink-worker', 'JLink' -ErrorAction SilentlyContinue) {
@@ -514,10 +485,10 @@ try {
 } catch {
     $testError = $_
 } finally {
-    if ($testError -and $recoveryProcess -and -not $recoveryProcess.HasExited) {
+    if ($testError -and $ownerProcess -and -not $ownerProcess.HasExited) {
         try {
             if ($variableDirty) {
-                $restore = Invoke-McpTool -Process $recoveryProcess -Id 900 -Name 'jlink_write' -Arguments @{
+                $restore = Invoke-McpTool -Process $ownerProcess -Id 900 -Name 'jlink_write' -Arguments @{
                     action = 'memory'
                     address = $writableAddress
                     data = $originalBytes
@@ -527,20 +498,19 @@ try {
                 $variableDirty = $false
             }
             if ($captureStarted -and -not $captureTerminal) {
-                $cleanupTerminal = Wait-HssTerminal -Process $recoveryProcess -CaptureKey $captureKey -FirstId 910
+                $cleanupTerminal = Wait-HssTerminal -Process $ownerProcess -CaptureKey $captureKey -FirstId 910
                 if ($cleanupTerminal.state -notin @('completed', 'failed', 'aborted')) {
                     throw "失败清理未取得 HSS 终态：$($cleanupTerminal.state)"
                 }
                 $captureTerminal = $true
             }
             if ($captureTerminal) {
-                $null = Invoke-McpTool -Process $recoveryProcess -Id 1200 -Name 'jlink_target' -Arguments @{ action = 'connect' }
-                $resetRun = Invoke-McpTool -Process $recoveryProcess -Id 1201 -Name 'jlink_control' -Arguments @{
+                $resetRun = Invoke-McpTool -Process $ownerProcess -Id 1201 -Name 'jlink_control' -Arguments @{
                     action = 'reset'
                     after = 'run'
                 }
                 Assert-EmptyToolResult -Response $resetRun -Description '失败清理 reset_run'
-                $disconnect = Invoke-McpTool -Process $recoveryProcess -Id 1202 -Name 'jlink_target' -Arguments @{ action = 'disconnect' }
+                $disconnect = Invoke-McpTool -Process $ownerProcess -Id 1202 -Name 'jlink_target' -Arguments @{ action = 'disconnect' }
                 Assert-EmptyToolResult -Response $disconnect -Description '失败清理 disconnect'
                 $safeStateConfirmed = $true
             }
@@ -549,7 +519,7 @@ try {
         }
     }
 
-    foreach ($process in @($ownerProcess, $recoveryProcess)) {
+    foreach ($process in @($ownerProcess)) {
         if ($process -and -not $process.HasExited) {
             try {
                 $process.StandardInput.Close()
@@ -601,4 +571,4 @@ if (-not $safeStateConfirmed) {
     throw 'P3 smoke 未确认 CPU 安全运行状态'
 }
 
-Write-Output 'P3 10x32-bit/1kHz/300s HSS、父进程续行、交错写入、尾排空和安全恢复：PASS'
+Write-Output 'P3 10x32-bit/1kHz/300s HSS、单一 MCP 生命周期、交错写入、尾排空和安全恢复：PASS'

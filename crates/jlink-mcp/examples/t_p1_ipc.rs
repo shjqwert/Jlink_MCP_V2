@@ -13,7 +13,6 @@ use jlink_domain::ErrorCode;
 use jlink_mcp::worker_client::{WorkerClient, WorkerLaunchSpec, attach_or_spawn};
 
 const DLL_PATH: &str = r"C:\Program Files (x86)\SEGGER\JLink\JLink_x64.dll";
-
 fn verify_idle_orphan_exit(
     worker: &std::path::Path,
     lease_root: &std::path::Path,
@@ -58,6 +57,12 @@ fn verify_idle_orphan_exit(
             }
             Err(error) => return Err(error.into()),
         }
+    }
+    let Err(takeover) = attach_or_spawn(&orphan_spec) else {
+        return Err("当前进程接管了另一个父 MCP 所有的 Worker".into());
+    };
+    if takeover.code != ErrorCode::ProbeBusy {
+        return Err(format!("跨 MCP 接管未返回 PROBE_BUSY：{takeover}").into());
     }
     parent.kill()?;
     parent.wait()?;
@@ -170,21 +175,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     verify_competing_worker_rejected(&worker, &spec, &probe_identity)?;
-
     let child = first.spawned_child_mut().ok_or("首次附着缺少子进程句柄")?;
     child.kill()?;
     child.wait()?;
     thread::sleep(Duration::from_millis(50));
-
     let mut after_crash = attach_or_spawn(&spec)?;
     if !after_crash.spawned || after_crash.status.worker_pid == authoritative_pid {
         return Err("Worker 崩溃后未释放探针租约".into());
     }
-    after_crash.client.disconnect()?;
-    after_crash
+    after_crash.shutdown()?;
+    if after_crash
         .spawned_child_mut()
         .ok_or("崩溃恢复 Worker 缺少子进程句柄")?
-        .wait()?;
+        .try_wait()?
+        .is_none()
+    {
+        return Err("内部 shutdown 返回后 Worker 仍在运行".into());
+    }
 
     let mut after_disconnect = attach_or_spawn(&spec)?;
     if !after_disconnect.spawned {
@@ -199,7 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_idle_orphan_exit(&worker, directory.path())?;
 
     println!(
-        "T-P1-IPC 通过：附着优先、单 Worker、探针互斥、崩溃、正常退出和无活动 HSS 的父进程退出释放租约均符合预期"
+        "T-P1-IPC 通过：当前 MCP 单 Worker、跨 MCP 不接管、探针互斥、崩溃、正常退出和父进程退出释放租约均符合预期"
     );
     Ok(())
 }

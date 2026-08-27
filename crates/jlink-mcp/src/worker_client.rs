@@ -62,6 +62,42 @@ impl WorkerAttachment {
     pub fn spawned_child_mut(&mut self) -> Option<&mut Child> {
         self.child.as_mut()
     }
+
+    /// Requests bounded graceful cleanup and waits for an owned Worker to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable cleanup, transport, protocol, or process-wait error.
+    pub fn shutdown(&mut self) -> Result<(), JlinkError> {
+        self.client.shutdown()?;
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if child
+                .try_wait()
+                .map_err(|error| {
+                    JlinkError::new(
+                        ErrorCode::WorkerUnavailable,
+                        format!("无法检查关闭中的 jlink-worker：{error}"),
+                        false,
+                    )
+                })?
+                .is_some()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(JlinkError::new(
+                    ErrorCode::WorkerUnavailable,
+                    "jlink-worker 未在两秒正常关闭边界内退出",
+                    false,
+                ));
+            }
+            thread::sleep(ATTACH_POLL);
+        }
+    }
 }
 
 /// Stateless request client for one stable Worker named-pipe endpoint.
@@ -261,6 +297,23 @@ impl WorkerClient {
         Ok(())
     }
 
+    /// Stops active HSS safely, disconnects the target, and terminates the Worker.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable transport, protocol, HSS cleanup, or target disconnect error.
+    pub fn shutdown(&self) -> Result<(), JlinkError> {
+        let value = response_result(self.request(SessionCommand::Shutdown, |request| request)?)?;
+        if value.as_object().is_none_or(|object| !object.is_empty()) {
+            return Err(JlinkError::new(
+                ErrorCode::IpcProtocolError,
+                "Worker 关闭响应必须是空对象",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
     /// Starts one fixed-duration HSS plan or recovers its idempotent identity.
     ///
     /// # Errors
@@ -360,6 +413,7 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
     let client = WorkerClient::for_probe(&spec.probe_identity)?;
     match client.status() {
         Ok(status) => {
+            ensure_current_parent(&status)?;
             return Ok(WorkerAttachment {
                 client,
                 status,
@@ -399,6 +453,7 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
             Ok(status) => {
                 if status.worker_pid != child.id() {
                     stop_non_authoritative_child(&mut child)?;
+                    ensure_current_parent(&status)?;
                     return Ok(WorkerAttachment {
                         client,
                         status,
@@ -440,6 +495,20 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         }
         thread::sleep(ATTACH_POLL);
     }
+}
+
+fn ensure_current_parent(status: &WorkerStatus) -> Result<(), JlinkError> {
+    let current_pid = std::process::id();
+    if status.parent_pid == current_pid {
+        return Ok(());
+    }
+    Err(JlinkError::new(
+        ErrorCode::ProbeBusy,
+        "该探针由另一个 MCP/Worker 生命周期占用，不支持接管",
+        true,
+    )
+    .with_detail("owner_parent_pid", json!(status.parent_pid))
+    .with_detail("requester_pid", json!(current_pid)))
 }
 
 /// Ensures a process that lost the endpoint race cannot outlive its attachment attempt.

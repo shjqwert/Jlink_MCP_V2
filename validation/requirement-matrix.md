@@ -34,13 +34,13 @@ public contract and is recorded in the implementation constraints.
 | CFG-003 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
 | CFG-004 | T-P1-CFG | `validation/p1-stage.md` DLL identity fixture | F0-A identity |
 | CFG-005 | T-P1-CFG | `validation/p1-stage.md` repository/config fixture | None |
-| RUN-001 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
+| RUN-001 | T-P1-IPC | `validation/p3-recover.md` MCP-owned Worker process integration + prior `validation/p1-stage.md` child-process evidence | F0-B IPC/lease subset |
 | RUN-002 | T-P3-RUN | `validation/p3-run.md` scheduler trace + `validation/p3-stage.md` J-Link hardware timeline | F0-A |
-| RUN-003 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
-| RUN-004 | T-P3-RECOVER | `validation/p3-recover.md` parent-handle/process integration + `validation/p3-stage.md` hardware smoke | F0-B |
+| RUN-003 | T-P1-IPC | `validation/p3-recover.md` no-takeover/lease process integration + existing kernel lease evidence | F0-B lease subset |
+| RUN-004 | T-P3-RECOVER | `validation/p3-recover.md` normal-shutdown cleanup + parent-exit termination + non-completed partial recovery | F0-B IPC/recovery subset |
 | RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
 | RUN-006 | T-P3-ABI | `validation/p3-abi.md` frozen DLL exports/ABI/raw-frame fixture | F0-A |
-| SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A identity |
+| SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` single-target hardware integration | F0-A identity |
 | SES-002 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A |
 | SES-003 | T-P1-SES | `validation/p1-ses.md` hardware state recovery | F0-A |
 | SES-004 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
@@ -75,7 +75,7 @@ public contract and is recorded in the implementation constraints.
 | HSSA-006 | T-P3-STORE | `validation/p3-store.md` Store fixture + `validation/p3-stage.md` 300-second atomic resource | F0-A throughput |
 | HSSA-007 | T-P3-QUALITY | `validation/p3-quality.md` classifier + `validation/p3-stage.md` hardware quality | F0-A |
 | HSSA-008 | T-P3-RUN | `validation/p3-run.md` write trace + `validation/p3-stage.md` J-Link interleaving | F0-A |
-| HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` target-bound recovery + `validation/p3-stage.md` parent-exit hardware smoke | F0-B |
+| HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` lifecycle-local key retirement + aborted/unknown partial recovery | F0-B recovery subset |
 | HSSA-010 | T-P3-QUALITY | `validation/p3-quality.md` rate/interval fixture + `validation/p3-stage.md` hardware rate | F0-A |
 | HSSA-011 | T-P3-QUALITY | `validation/p3-quality.md` clock fixture + `validation/p3-stage.md` hardware clock | F0-A |
 | HSSQ-001 | T-P4-OVERVIEW | `validation/p4-overview.md` status range + immutable lookup | None |

@@ -270,6 +270,8 @@ pub enum SessionCommand {
     Connect,
     /// Release the current worker connection.
     Disconnect,
+    /// Gracefully stop active work and terminate the MCP-owned Worker.
+    Shutdown,
     /// Read the worker's observed session status.
     Status,
     /// Perform an observational or explicitly finalized validation pass.
@@ -313,6 +315,7 @@ impl SessionCommand {
             | Self::HssStatus => ExecutionKind::ReadOnly,
             Self::Connect
             | Self::Disconnect
+            | Self::Shutdown
             | Self::Validate
             | Self::Flash
             | Self::Erase
@@ -474,6 +477,8 @@ pub struct IpcResponse {
 pub struct WorkerStatus {
     /// Operating-system process identifier of the authoritative Worker.
     pub worker_pid: u32,
+    /// MCP process identifier that owns this Worker's lifecycle.
+    pub parent_pid: u32,
     /// Stable hash used by the endpoint and probe lease without exposing the serial.
     pub probe_identity_hash: String,
     /// Whether the validated DLL is currently held by the unique gateway.
