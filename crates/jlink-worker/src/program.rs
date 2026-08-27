@@ -36,7 +36,14 @@ pub(crate) fn execute_program(
                 )?;
                 return Err(error);
             }
-            if verify && let Err(error) = verify_image(gateway, &image) {
+            let verify_result = if verify {
+                gateway
+                    .reset_halt_for_flash()
+                    .and_then(|()| verify_image(gateway, &image))
+            } else {
+                Ok(())
+            };
+            if let Err(error) = verify_result {
                 let state = gateway
                     .observe_target_state()
                     .unwrap_or(TargetState::Unknown);

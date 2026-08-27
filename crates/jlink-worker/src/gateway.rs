@@ -496,12 +496,9 @@ impl DllGateway {
     /// before invoking this method. Any failure after `BeginDownload` is reported
     /// as execution-uncertain because target side effects may already exist.
     pub(crate) fn program_image(&mut self, image: &FirmwareImage) -> Result<(), JlinkError> {
-        if self.connected_spec.is_none() || !self.is_connected()? {
-            return Err(target_connection_error(
-                "Flash 下载要求同一 DLL 会话已确认具体器件选择和目标连接",
-            ));
-        }
         reset_dll_diagnostics();
+        self.prepare_flash_operation()
+            .map_err(attach_dll_diagnostics)?;
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
@@ -527,13 +524,17 @@ impl DllGateway {
 
     /// Erases all always-present device Flash banks through the J-Link algorithm.
     pub(crate) fn erase_chip(&mut self) -> Result<(), JlinkError> {
+        reset_dll_diagnostics();
+        self.prepare_flash_operation()
+            .map_err(attach_dll_diagnostics)?;
         // SAFETY: the connected target is uniquely owned by this gateway.
         let result = unsafe { (self.api.erase_chip)() };
         if result < 0 {
-            return Err(execution_uncertain_error(format!(
+            return Err(attach_dll_diagnostics(execution_uncertain_error(format!(
                 "JLINK_EraseChip 返回 {result}"
-            )));
+            ))));
         }
+        let _ = take_dll_diagnostics();
         Ok(())
     }
 
@@ -544,6 +545,9 @@ impl DllGateway {
     /// device algorithm. Hardware evidence must confirm this behavior for each
     /// frozen DLL/device fingerprint before release.
     pub(crate) fn erase_range(&mut self, address: u64, length: u64) -> Result<(), JlinkError> {
+        reset_dll_diagnostics();
+        self.prepare_flash_operation()
+            .map_err(attach_dll_diagnostics)?;
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
@@ -567,13 +571,16 @@ impl DllGateway {
         // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
         let end_result = unsafe { (self.api.end_download)() };
         match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => Ok(()),
-            (Err(error), value) => Err(execution_uncertain_error(format!(
+            (Ok(()), value) if value >= 0 => {
+                let _ = take_dll_diagnostics();
+                Ok(())
+            }
+            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
                 "范围擦除未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            ))),
-            (Ok(()), value) => Err(execution_uncertain_error(format!(
+            )))),
+            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
                 "范围擦除的 JLINKARM_EndDownload 返回 {value}"
-            ))),
+            )))),
         }
     }
 
@@ -605,16 +612,7 @@ impl DllGateway {
             // connected target is uniquely owned by this gateway.
             let result =
                 unsafe { (self.api.read_mem)(current, count_u32, output[offset..].as_mut_ptr()) };
-            if result != i32::try_from(count).expect("fixed read chunk fits i32") {
-                return Err(JlinkError::new(
-                    ErrorCode::TargetConnectFailed,
-                    format!("JLINKARM_ReadMem(0x{current:08X}, {count}) 返回 {result}"),
-                    true,
-                )
-                .with_detail("address", serde_json::json!(format!("0x{current:08X}")))
-                .with_detail("requested_length", serde_json::json!(count))
-                .with_detail("actual_length", serde_json::json!(result)));
-            }
+            validate_read_mem_result(current, count, result)?;
             offset += count;
         }
         Ok(output)
@@ -672,6 +670,20 @@ impl DllGateway {
             )));
         }
         Ok(actual)
+    }
+
+    fn prepare_flash_operation(&mut self) -> Result<(), JlinkError> {
+        if self.connected_spec.is_none() || !self.is_connected()? {
+            return Err(target_connection_error(
+                "Flash 操作要求同一 DLL 会话已确认具体器件选择和目标连接",
+            ));
+        }
+        self.reset_halt_for_flash()
+    }
+
+    /// Establishes the deterministic halted boundary required around Flash work.
+    pub(crate) fn reset_halt_for_flash(&mut self) -> Result<(), JlinkError> {
+        require_flash_reset_halted(self.reset_halt_and_observe()?)
     }
 
     fn write_download_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
@@ -834,14 +846,7 @@ impl DllGateway {
                 "JLINKARM_IsHalted 返回 {halted}"
             )));
         }
-        let ipsr = self.read_word(ICSR)? & 0x1ff;
-        if ipsr == 3 {
-            Ok(TargetState::HardFault)
-        } else if halted > 0 {
-            Ok(TargetState::Halted)
-        } else {
-            Ok(TargetState::Running)
-        }
+        classify_observed_target_state(halted > 0, || self.read_word(ICSR))
     }
 
     /// Returns the register indices and names reported by the active target.
@@ -1334,6 +1339,35 @@ impl Drop for DllGateway {
     }
 }
 
+/// Classifies one halt observation without reading Cortex-M PPB state while running.
+///
+/// J-Link 6.98a may reject ICSR reads from a running S32K144. A caught
+/// `HardFault` is distinguished only after the DLL reports the core halted.
+fn classify_observed_target_state(
+    halted: bool,
+    read_icsr: impl FnOnce() -> Result<u32, JlinkError>,
+) -> Result<TargetState, JlinkError> {
+    if !halted {
+        return Ok(TargetState::Running);
+    }
+    if read_icsr()? & 0x1ff == 3 {
+        Ok(TargetState::HardFault)
+    } else {
+        Ok(TargetState::Halted)
+    }
+}
+
+/// Requires the reset-halt preparation established for the frozen Flash algorithm.
+fn require_flash_reset_halted(state: TargetState) -> Result<(), JlinkError> {
+    if state == TargetState::Halted {
+        Ok(())
+    } else {
+        Err(target_recovery_error(format!(
+            "Flash 操作前未能确认目标 halted：实际={state:?}"
+        )))
+    }
+}
+
 fn passed_check(kind: ValidationCheckKind, detail: impl Into<String>) -> ValidationCheck {
     ValidationCheck {
         kind,
@@ -1367,6 +1401,23 @@ fn check(
     } else {
         failed_check(kind, detail, recommendation)
     }
+}
+
+/// Interprets the frozen 6.98a byte-oriented memory-read status.
+///
+/// `JLINKARM_ReadMem` returns zero only after its internal transfer completed
+/// the requested byte count. Unlike the typed memory-read exports, its return
+/// value is a status and must not be compared with the requested length.
+fn validate_read_mem_result(address: u32, length: usize, result: i32) -> Result<(), JlinkError> {
+    if result == 0 {
+        return Ok(());
+    }
+    Err(target_connection_error(format!(
+        "JLINKARM_ReadMem(0x{address:08X}, {length}) 返回错误状态 {result}"
+    ))
+    .with_detail("address", serde_json::json!(format!("0x{address:08X}")))
+    .with_detail("requested_length", serde_json::json!(length))
+    .with_detail("dll_status", serde_json::json!(result)))
 }
 
 fn target_connection_error(message: impl Into<String>) -> JlinkError {
@@ -1405,7 +1456,7 @@ fn test_injection_error(message: impl Into<String>) -> JlinkError {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, path::PathBuf};
+    use std::{cell::Cell, env, path::PathBuf};
 
     use jlink_domain::{
         CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
@@ -1414,7 +1465,8 @@ mod tests {
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway,
-        validate_exec_command_result,
+        classify_observed_target_state, require_flash_reset_halted, validate_exec_command_result,
+        validate_read_mem_result,
     };
 
     #[test]
@@ -1442,6 +1494,53 @@ mod tests {
         let failed = validate_exec_command_result("device = S32K144", -1, "")
             .expect_err("negative return code must reject the command");
         assert_eq!(failed.code, ErrorCode::TargetConnectFailed);
+    }
+
+    #[test]
+    fn running_observation_skips_icsr_but_halted_hardfault_reads_it() {
+        let read_attempted = Cell::new(false);
+        let running = classify_observed_target_state(false, || {
+            read_attempted.set(true);
+            Ok(3)
+        })
+        .expect("running state does not require ICSR");
+        assert_eq!(running, TargetState::Running);
+        assert!(!read_attempted.get());
+
+        let hardfault = classify_observed_target_state(true, || Ok(3))
+            .expect("halted HardFault is classified from ICSR");
+        assert_eq!(hardfault, TargetState::HardFault);
+    }
+
+    #[test]
+    fn flash_operation_requires_confirmed_reset_halted_state() {
+        require_flash_reset_halted(TargetState::Halted)
+            .expect("reset-halted target is ready for Flash");
+        for state in [
+            TargetState::Running,
+            TargetState::HardFault,
+            TargetState::Unknown,
+        ] {
+            let error =
+                require_flash_reset_halted(state).expect_err("non-halted state is rejected");
+            assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
+        }
+    }
+
+    #[test]
+    fn generic_read_mem_uses_zero_success_status() {
+        validate_read_mem_result(0, 784, 0).expect("zero is the frozen success status");
+
+        let error =
+            validate_read_mem_result(0, 784, 1).expect_err("non-zero status must reject the read");
+        assert_eq!(error.code, ErrorCode::TargetConnectFailed);
+        let details = error.details.expect("read failure details");
+        assert_eq!(
+            details.get("requested_length"),
+            Some(&serde_json::json!(784))
+        );
+        assert_eq!(details.get("dll_status"), Some(&serde_json::json!(1)));
+        assert!(!details.contains_key("actual_length"));
     }
 
     #[test]

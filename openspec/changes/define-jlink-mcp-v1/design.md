@@ -88,15 +88,15 @@ Worker 使用探针身份派生的跨进程租约和可发现端点。MCP 启动
 
 这保留了未来在有可靠证据后增加并行会话的空间，但 V1 不以未经证实的 DLL 并发安全为前提。
 
-gateway 的每个动态函数指针必须逐项匹配冻结 J-Link 6.98a SDK 的参数、返回类型和 Windows x64 调用约定，不得把 P0 实验中的简化声明直接当作生产 ABI。特别是指针错误结果、`char` 状态结果和 `int` 执行结果必须按各自原始类型解释，不能用统一的 `i32` 或 `void` 声明吞掉返回事实。打开 DLL 会话时使用支持日志与错误回调的入口，把单次会话诊断收集到有界本地缓冲；该诊断只用于失败根因和验证证据，不进入普通 MCP 成功结果，回调不得重入 DLL 或拥有业务状态。
+gateway 的每个动态函数指针必须逐项匹配冻结 J-Link 6.98a SDK 的参数、返回类型和 Windows x64 调用约定，不得把 P0 实验中的简化声明直接当作生产 ABI。特别是指针错误结果、`char` 状态结果和 `int` 执行结果必须按各自原始类型解释，不能用统一的 `i32` 或 `void` 声明吞掉返回事实。冻结 6.98a 的通用 `JLINKARM_ReadMem` 在内部完整传输请求字节后返回状态 `0`，非零表示失败；`JLINKARM_ReadMemU32` 等类型化读取则返回完成项目数，两类返回语义不得混用。打开 DLL 会话时使用支持日志与错误回调的入口，把单次会话诊断收集到有界本地缓冲；该诊断只用于失败根因和验证证据，不进入普通 MCP 成功结果，回调不得重入 DLL 或拥有业务状态。
 
-具体器件命令必须在同一 DLL 会话内得到确定接受后才能建立活动目标身份。gateway 必须同时检查命令返回码及冻结 API 定义的错误输出，不能在 `device = ...` 被拒绝后仅凭通用 Cortex-M 连接或静态器件数据库查询继续。进入 `BeginDownload` 前，活动 gateway 必须已经保存经确认的具体器件选择；否则在首个 Flash 副作用前失败。3.7 首次真机下载出现 `JLINKARM_EndDownload = -3` 时，冻结 SDK 将其解释为没有匹配 Flash bank，因此先修正 ABI、器件命令错误观测和有界日志，再依据实际日志决定是否需要下载前 reset/halt；不得把未经证明的 reset/halt、Commander 或降速作为补丁。
+具体器件命令必须在同一 DLL 会话内得到确定接受后才能建立活动目标身份。gateway 必须同时检查命令返回码及冻结 API 定义的错误输出，不能在 `device = ...` 被拒绝后仅凭通用 Cortex-M 连接或静态器件数据库查询继续。进入 `BeginDownload` 前，活动 gateway 必须已经保存经确认的具体器件选择；否则在首个 Flash 副作用前失败。3.7 真机诊断先通过冻结 J-Link 6.98a SDK 修正 ABI、器件命令错误观测和有界日志，再确认单独 `halt` 无法使目标进入 Flash RAMCode 所需状态；目标 IAR 工程的 `--jlink_reset_strategy=0,0` 与 IAR Cortex-M Normal(0) 下载流程证据则表明下载前应执行复位并暂停。因此 flash、整片 erase 和范围 erase 在所有输入及 Flash 边界校验通过后，必须通过唯一 gateway 执行一次 `reset_halt` 并确认 `halted`，再进入 `BeginDownload` 或 `JLINK_EraseChip`。准备失败必须在首个 Flash 修改调用前返回 `TARGET_RECOVERY_FAILED`；不得降速、重试、调用 Commander 或增加其他 fallback。`EndDownload` 成功只证明下载事务完成，不能作为目标仍处于可读状态的证据；flash 请求启用默认校验时，必须再次执行一次 `reset_halt` 并确认 `halted`，随后完成读回校验，最后才应用请求的 `after`。该下载后准备只属于 flash 内部默认校验；独立 `verify` 保持只读，不增加隐式复位、暂停、恢复运行或新的公共字段。
 
 器件专用 J-Link 首次建连初始化可能复位或暂停内核，从而清除连接前的 HardFault。Worker 只对建立目标会话后的首个可观察状态及同一活动会话内的后续状态负责，不得根据连接前测试夹具状态伪造恢复通知。T-P1-SES 的 HardFault 真机证据必须在同一 Worker/DLL 会话内注入真实内核异常，再调用生产恢复状态机；注入入口只在测试编译中存在，不进入生产二进制、IPC 或 MCP 合同，不修改 Flash 或冻结 OUT。
 
 断开状态的显式 validate 无法根据器件初始化后的状态可靠恢复建连前的运行意图，因此必须要求 `after: run | halt`。临时会话先复用 SES-003 的唯一恢复流程，再显式收口到请求状态，并报告最终状态和恢复通知；不得建立第二套恢复规则。活动连接中的 validate 不接受 `after`，只观察当前会话且不改变状态。两种模式都不得把临时建连后的 halted 状态表述为建连前事实。
 
-Flash 边界不得硬编码为当前 S32K144 地址。Worker 先通过冻结 DLL 的 `JLINKARM_DEVICE_GetIndex/GetInfo` 读取器件数据库 Flash 区域，镜像段和范围擦除请求必须在首个目标副作用前完整通过 `jlink-domain` 的统一半开区间校验；器件不存在、区域为空或跨区时停止，不从 IAR 文件名、芯片常识或测试地址兜底。整片擦除使用 `JLINK_EraseChip`；范围擦除使用同一器件算法的 `BeginDownload → WriteMem(0xFF) → EndDownload` read-modify-write 路线，只允许在 3.7 真机证明请求区间擦除、相邻字节保留和目标最终状态后形成硬件能力证据，失败时不得改用普通 RAM 写入或 Commander fallback。只有完整写入、所请求的校验和显式 `after` 全部成功才返回空成功；失败路径不隐式 reset/run。Flash 修改只使固件/验证缓存失效，不丢失持续到 disconnect 的活动目标配置身份，因此同一连接仍可执行后续独立 verify 或再次烧录。
+Flash 边界不得硬编码为当前 S32K144 地址。Worker 先通过冻结 DLL 的 `JLINKARM_DEVICE_GetIndex/GetInfo` 读取器件数据库 Flash 区域，镜像段和范围擦除请求必须在首个目标副作用前完整通过 `jlink-domain` 的统一半开区间校验；器件不存在、区域为空或跨区时停止，不从 IAR 文件名、芯片常识或测试地址兜底。整片擦除使用 `JLINK_EraseChip`；范围擦除使用同一器件算法的 `BeginDownload → WriteMem(0xFF) → EndDownload` read-modify-write 路线，只允许在 3.7 真机证明请求区间擦除、相邻字节保留和目标最终状态后形成硬件能力证据，失败时不得改用普通 RAM 写入或 Commander fallback。下载前及默认校验前的 `reset_halt` 都是 Flash 算法和读回的内部准备动作，不属于成功后的 `after` 处理；因此 `after: none` 只表示成功修改及校验后不再执行额外状态转换，不能解释为整个请求都不改变目标状态。只有完整写入、所请求的校验和显式 `after` 全部成功才返回空成功；进入 Flash 修改调用后的失败路径不再执行 `after` 或隐式 reset/run。Flash 修改只使固件/验证缓存失效，不丢失持续到 disconnect 的活动目标配置身份，因此同一连接仍可执行后续独立 verify 或再次烧录。
 
 ### 6. 符号解析生成不可变访问计划
 
