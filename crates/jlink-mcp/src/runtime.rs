@@ -5,8 +5,8 @@ use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
-    MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
+    HssDataIntegrity, HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule,
+    JlinkError, MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
     ValidationAfter, VariableSelector, WriteVerify,
 };
 use serde_json::{Map, Value, json};
@@ -787,6 +787,31 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
     ]);
     if snapshot.state == HssRunState::Completed {
         result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
+        if snapshot.integrity != HssDataIntegrity::Complete {
+            result.insert(
+                "quality".to_owned(),
+                json!({ "integrity": snapshot.integrity }),
+            );
+        }
+    } else if snapshot.state == HssRunState::Failed {
+        if let Some(code) = snapshot.failure_code {
+            result.insert("failure_code".to_owned(), json!(code.as_str()));
+        }
+        result.insert(
+            "partial_available".to_owned(),
+            json!(snapshot.partial_available),
+        );
+    } else if snapshot.state == HssRunState::Aborted {
+        if let Some(reason) = &snapshot.reason {
+            result.insert("reason".to_owned(), json!(reason));
+        }
+        if let Some(recoverable) = snapshot.recoverable {
+            result.insert("recoverable".to_owned(), json!(recoverable));
+        }
+        result.insert(
+            "partial_available".to_owned(),
+            json!(snapshot.partial_available),
+        );
     }
     Value::Object(result)
 }
@@ -1153,4 +1178,49 @@ fn config_value_error(name: &str) -> JlinkError {
         format!("配置字段 {name} 的值无效"),
         false,
     )
+}
+
+#[cfg(test)]
+mod hss_state_tests {
+    use jlink_domain::{ErrorCode, HssDataIntegrity, HssDrainTiming, HssRunSnapshot, HssRunState};
+
+    use super::hss_start_result;
+
+    fn snapshot(state: HssRunState, integrity: HssDataIntegrity) -> HssRunSnapshot {
+        HssRunSnapshot {
+            capture_id: "cap-state".to_owned(),
+            state,
+            integrity,
+            elapsed_us: 10,
+            complete_records: 1,
+            drain: HssDrainTiming::default(),
+            writes: Vec::new(),
+            failure_code: None,
+            partial_available: false,
+            reason: None,
+            recoverable: None,
+            recovery_notifications: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn failed_start_result_returns_terminal_facts_without_tool_error() {
+        let mut failed = snapshot(HssRunState::Failed, HssDataIntegrity::Unknown);
+        failed.failure_code = Some(ErrorCode::FrameInvalid);
+        failed.partial_available = true;
+        let result = hss_start_result(&failed);
+        assert_eq!(result["state"], "failed");
+        assert_eq!(result["failure_code"], "FRAME_INVALID");
+        assert_eq!(result["partial_available"], true);
+    }
+
+    #[test]
+    fn completed_degraded_start_result_exposes_integrity_quality() {
+        let result = hss_start_result(&snapshot(
+            HssRunState::Completed,
+            HssDataIntegrity::Degraded,
+        ));
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["quality"]["integrity"], "degraded");
+    }
 }

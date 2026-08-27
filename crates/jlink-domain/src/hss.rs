@@ -164,6 +164,208 @@ pub enum HssRunState {
     Aborted,
 }
 
+/// Data-integrity assessment kept independent from capture lifecycle.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssDataIntegrity {
+    /// Available evidence proves the persisted capture is complete.
+    Complete,
+    /// Quality evidence proves that retained data is incomplete or impaired.
+    Degraded,
+    /// Available evidence cannot prove either completeness or degradation.
+    Unknown,
+}
+
+/// Observable recovery facts retained when a capture cannot follow the normal path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HssRecoveryNotification {
+    /// Internal Stop completed after an acquisition failure.
+    StopCompletedAfterFailure,
+    /// Valid bytes were retained instead of being discarded with a failure.
+    PartialDataRetained {
+        /// Complete records retained at the failure boundary.
+        complete_records: u64,
+        /// Trailing bytes that cannot yet form a complete record.
+        trailing_bytes: u64,
+    },
+    /// A later startup scan classified an interrupted capture as aborted.
+    AbortedCaptureRecovered,
+}
+
+/// Pure lifecycle and integrity state machine shared by acquisition and recovery.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HssCaptureState {
+    lifecycle: HssRunState,
+    integrity: HssDataIntegrity,
+    failure_code: Option<ErrorCode>,
+    partial_available: bool,
+    reason: Option<String>,
+    recoverable: Option<bool>,
+    recovery_notifications: Vec<HssRecoveryNotification>,
+}
+
+impl HssCaptureState {
+    /// Creates the only valid initial state.
+    #[must_use]
+    pub const fn starting() -> Self {
+        Self {
+            lifecycle: HssRunState::Starting,
+            integrity: HssDataIntegrity::Unknown,
+            failure_code: None,
+            partial_available: false,
+            reason: None,
+            recoverable: None,
+            recovery_notifications: Vec::new(),
+        }
+    }
+
+    /// Moves a successful hardware Start into `running`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidStateTransition`] unless the state is `starting`.
+    pub fn mark_running(&mut self) -> Result<(), JlinkError> {
+        self.require(HssRunState::Starting, "HSS 只有 starting 可以进入 running")?;
+        self.lifecycle = HssRunState::Running;
+        Ok(())
+    }
+
+    /// Moves an active capture into internal Stop/tail drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidStateTransition`] unless the state is `running`.
+    pub fn mark_stopping(&mut self) -> Result<(), JlinkError> {
+        self.require(HssRunState::Running, "HSS 只有 running 可以进入 stopping")?;
+        self.lifecycle = HssRunState::Stopping;
+        Ok(())
+    }
+
+    /// Completes tail handling while retaining an independent integrity result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidStateTransition`] unless the state is `stopping`.
+    pub fn mark_completed(&mut self, integrity: HssDataIntegrity) -> Result<(), JlinkError> {
+        self.require(
+            HssRunState::Stopping,
+            "HSS 只有 stopping 可以进入 completed",
+        )?;
+        self.lifecycle = HssRunState::Completed;
+        self.integrity = integrity;
+        Ok(())
+    }
+
+    /// Records a controlled terminal failure and any retained partial data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::InvalidStateTransition`] for an existing terminal state.
+    pub fn mark_failed(
+        &mut self,
+        code: ErrorCode,
+        partial_available: bool,
+        notifications: Vec<HssRecoveryNotification>,
+    ) -> Result<(), JlinkError> {
+        if matches!(
+            self.lifecycle,
+            HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+        ) {
+            return Err(invalid_hss_transition("HSS 终态不能再次转换为 failed"));
+        }
+        self.lifecycle = HssRunState::Failed;
+        self.integrity = HssDataIntegrity::Unknown;
+        self.failure_code = Some(code);
+        self.partial_available = partial_available;
+        self.recovery_notifications = notifications;
+        Ok(())
+    }
+
+    /// Classifies an interrupted or recovered partial capture as `aborted`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ValueInvalid`] for a blank reason, or
+    /// [`ErrorCode::InvalidStateTransition`] for an existing terminal state.
+    pub fn mark_aborted(
+        &mut self,
+        reason: impl Into<String>,
+        recoverable: bool,
+        partial_available: bool,
+        mut notifications: Vec<HssRecoveryNotification>,
+    ) -> Result<(), JlinkError> {
+        if matches!(
+            self.lifecycle,
+            HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+        ) {
+            return Err(invalid_hss_transition("HSS 终态不能再次转换为 aborted"));
+        }
+        let reason = reason.into();
+        if reason.trim().is_empty() {
+            return Err(hss_value_invalid("aborted reason 不能为空或仅包含空白"));
+        }
+        notifications.push(HssRecoveryNotification::AbortedCaptureRecovered);
+        self.lifecycle = HssRunState::Aborted;
+        self.integrity = HssDataIntegrity::Unknown;
+        self.partial_available = partial_available;
+        self.reason = Some(reason);
+        self.recoverable = Some(recoverable);
+        self.recovery_notifications = notifications;
+        Ok(())
+    }
+
+    /// Returns the current lifecycle state.
+    #[must_use]
+    pub const fn lifecycle(&self) -> HssRunState {
+        self.lifecycle
+    }
+
+    /// Returns the independent data-integrity state.
+    #[must_use]
+    pub const fn integrity(&self) -> HssDataIntegrity {
+        self.integrity
+    }
+
+    /// Returns the terminal failure code, when state is `failed`.
+    #[must_use]
+    pub const fn failure_code(&self) -> Option<ErrorCode> {
+        self.failure_code
+    }
+
+    /// Returns whether retained partial data is available.
+    #[must_use]
+    pub const fn partial_available(&self) -> bool {
+        self.partial_available
+    }
+
+    /// Returns the interruption reason, when state is `aborted`.
+    #[must_use]
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// Returns whether an aborted capture can be recovered further.
+    #[must_use]
+    pub const fn recoverable(&self) -> Option<bool> {
+        self.recoverable
+    }
+
+    /// Returns ordered recovery facts retained with this state.
+    #[must_use]
+    pub fn recovery_notifications(&self) -> &[HssRecoveryNotification] {
+        &self.recovery_notifications
+    }
+
+    fn require(&self, expected: HssRunState, message: &str) -> Result<(), JlinkError> {
+        if self.lifecycle == expected {
+            Ok(())
+        } else {
+            Err(invalid_hss_transition(message).with_detail("actual_state", json!(self.lifecycle)))
+        }
+    }
+}
+
 /// Aggregate timing evidence for serialized HSS drain calls.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +420,8 @@ pub struct HssRunSnapshot {
     pub capture_id: String,
     /// Current capture lifecycle state.
     pub state: HssRunState,
+    /// Data-integrity state assessed independently from lifecycle.
+    pub integrity: HssDataIntegrity,
     /// Monotonic time since the successful Start call.
     pub elapsed_us: u64,
     /// Number of complete frozen-layout records drained so far.
@@ -226,6 +430,20 @@ pub struct HssRunSnapshot {
     pub drain: HssDrainTiming,
     /// Ordered write-interleaving evidence.
     pub writes: Vec<HssWriteTiming>,
+    /// Stable failure code present only for controlled `failed` captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<ErrorCode>,
+    /// Whether valid partial data was retained for failed or aborted captures.
+    pub partial_available: bool,
+    /// Stable interruption reason present only for `aborted` captures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Whether an aborted partial capture can be recovered further.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recoverable: Option<bool>,
+    /// Ordered recovery facts retained with this status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub recovery_notifications: Vec<HssRecoveryNotification>,
 }
 
 /// Direction retained by one declarative threshold-crossing rule.
@@ -819,4 +1037,8 @@ fn hss_value_invalid(message: impl Into<String>) -> JlinkError {
 
 fn hss_unsupported(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::HssUnsupported, message, false)
+}
+
+fn invalid_hss_transition(message: impl Into<String>) -> JlinkError {
+    JlinkError::new(ErrorCode::InvalidStateTransition, message, false)
 }
