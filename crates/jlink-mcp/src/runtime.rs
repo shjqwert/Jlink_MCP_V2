@@ -5,8 +5,9 @@ use std::{fs, path::PathBuf, sync::Arc};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssReturnWhen, HssStartPlan, JlinkError, MemoryRange, ProgramAfter, ProgramRequest,
-    TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector, WriteVerify,
+    HssReturnWhen, HssStartPlan, HssThresholdRule, JlinkError, MemoryRange, ProgramAfter,
+    ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector,
+    WriteVerify,
 };
 use serde_json::{Map, Value, json};
 
@@ -98,12 +99,37 @@ impl Runtime {
                 ));
             }
         };
+        let rules = match arguments.get("rules") {
+            None => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    serde_json::from_value::<HssThresholdRule>(item.clone()).map_err(|error| {
+                        JlinkError::new(
+                            ErrorCode::ValueInvalid,
+                            format!("HSS rules[{index}] 结构无效：{error}"),
+                            false,
+                        )
+                        .with_detail("rule_index", json!(index))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => {
+                return Err(JlinkError::new(
+                    ErrorCode::ValueInvalid,
+                    "HSS rules 必须是数组",
+                    false,
+                ));
+            }
+        };
         HssStartPlan::new(
             capture_key,
             duration_s,
             rate_hz,
             return_when,
             plans,
+            rules,
             firmware,
         )
     }

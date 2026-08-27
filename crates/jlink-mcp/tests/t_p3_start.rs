@@ -58,7 +58,13 @@ fn t_p3_start_expands_iar_structure_member_and_explicit_slice_before_hardware() 
                 { "path": "gstF0cRoot.stNested.ulSequence" },
                 { "path": "gstF0cFlex.aucPayload", "slice": { "start": 1, "count": 3 } }
             ],
-            "return_when": "started"
+            "return_when": "started",
+            "rules": [{
+                "id": "sequence-change",
+                "path": "gstF0cRoot.stNested.ulSequence",
+                "kind": "equals",
+                "value": 1
+            }]
         }))
         .expect("build static IAR HSS plan");
 
@@ -70,6 +76,8 @@ fn t_p3_start_expands_iar_structure_member_and_explicit_slice_before_hardware() 
     assert_eq!(plan.variables()[1].access_plan().byte_size(), 3);
     assert_eq!(plan.variables()[1].sample_offset(), 4);
     assert_eq!(plan.frame_layout().record_bytes(), 11);
+    assert_eq!(plan.rules().len(), 1);
+    assert_eq!(plan.rules()[0].id(), "sequence-change");
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 ## 裁决
 
-P3-4.2 为 `PASS`。生产实现已形成无副作用的规范化 `HssStartPlan`，覆盖固定时长、目标频率、1–10 个顶层 DWARF 选择项、40 字节展开载荷上限、固件身份绑定、稳定请求指纹和 `capture_key` 幂等/冲突。冻结 J-Link 6.98a 真机只读预检确认目标连接、运行态后台访问和 HSS 能力。公共 `jlink_hss start` 尚未接入；实际 Start、持续排空、内部 Stop 和尾排空属于 4.3，不在本任务中声明通过。
+P3-4.2 为 `PASS`。生产实现已形成无副作用的规范化 `HssStartPlan`，覆盖固定时长、目标频率、1–10 个顶层 DWARF 选择项、40 字节展开载荷上限、固件身份绑定、启动规则的类型化保留与确定排序、稳定请求指纹和 `capture_key` 幂等/冲突。冻结 J-Link 6.98a 真机只读预检确认目标连接、运行态后台访问和 HSS 能力。公共 `jlink_hss start` 尚未接入；实际 Start、持续排空、内部 Stop 和尾排空属于 4.3，不在本任务中声明通过。
 
 ## 冻结合同
 
@@ -12,14 +12,14 @@ P3-4.2 为 `PASS`。生产实现已形成无副作用的规范化 `HssStartPlan`
 | 符号计划 | 当前 ELF/DWARF 生成的不可变 `AccessPlan`；动态位置、未定长选择或固件身份不一致在 DLL/目标动作前拒绝 |
 | 帧上限 | 最多 10 个连续块；样本载荷最多 40 字节；加 4 字节毫秒源时间戳后记录最多 44 字节 |
 | 6.98a 能力 | `max_blocks=10`；`max_frequency_hz=1000`；`flags=2`；保留字段全零；源时间 1000 Hz/1000 us、单调；不声明微秒分辨率 |
-| 采集身份 | 探针身份、`capture_key` 和规范化请求指纹确定稳定 `cap_<24 hex>`；等价重试恢复同一身份，非等价复用返回 `CAPTURE_KEY_CONFLICT` |
+| 采集身份 | 探针身份、`capture_key` 和规范化请求指纹确定稳定 `cap_<24 hex>`；规则按唯一 ID 排序并进入指纹，顺序变化等价、内容变化冲突；非等价复用返回 `CAPTURE_KEY_CONFLICT` |
 | 恢复 | 复用 SES-003；halted 先 resume，若进入 HardFault 再 reset_run，并同时保留 `resumed_from_halt` 与 `reset_after_fault` 通知 |
 
 ## 自动验证
 
 | 命令 | 结果 | 覆盖 |
 |---|---|---|
-| `cargo test -p jlink-domain --test t_p3_start` | `PASS`；4/4 | 10×32-bit/44 字节布局、边界与能力拒绝、键幂等/冲突、IPC 后指纹复核 |
+| `cargo test -p jlink-domain --test t_p3_start` | `PASS`；5/5 | 10×32-bit/44 字节布局、边界与能力拒绝、规则排序和指纹绑定、键幂等/冲突、IPC 后指纹复核 |
 | `cargo test -p jlink-mcp --test t_p3_start` | `PASS`；3/3 | 冻结 IAR F0-C 复合成员和显式 slice 的真实 AccessPlan、未定长选择前置拒绝、闭合 Start Schema |
 | `cargo test -p jlink-worker --lib t_p3_start_reuses_session_resume_then_reset_and_preserves_both_notices` | `PASS`；1/1 | HSS 预检复用 SES-003 且保留两阶段恢复通知 |
 | `cargo test -p jlink-mcp --lib p3_start_errors_remain_structured_and_distinct` | `PASS`；1/1 | `HSS_UNSUPPORTED` 与 `CAPTURE_KEY_CONFLICT` 维持结构化且互不混淆 |
@@ -56,11 +56,12 @@ P3-4.2 为 `PASS`。生产实现已形成无副作用的规范化 `HssStartPlan`
 - 硬件任务前后均读取完整 `svn status --depth infinity`；两次均为 612 行，内容 SHA-256 均为 `6827FD361AB388ABB26A6648158B0417CDDB76FAC515F91472C06B5715794685`。
 - 三个受控 `M` 仍为既有 `AppPwrMode.h`、计划内 `AppUserDesc.c` 和重新冻结的 DEP；没有执行 `svn commit`，也没有烧录、擦除、HSS Start 或目标内存写入。
 - Rust 为 `rustc 1.98.0 (88d9e12ae 2026-08-18)`、`cargo 1.98.0 (797e8a9bc 2026-08-05)`、`x86_64-pc-windows-msvc`；系统为 `Microsoft Windows NT 10.0.26200.0`。
-- 源码基线为 `91924759eddd9f988de31da193487dc6821b9f52` 加本记录所在的 `[P3-4.2][开发]` 原子提交。
+- 源码基线为 `[P3-4.2][开发]` 提交 `38823aefd86c1e5e933e974303f7fe73cd809ec4` 加后续规则指纹修复提交。
 
 ## 边界与失效条件
 
 - F0-A 的既有长时结果只作为 6.98a ABI、帧和毫秒时间戳参考；本次使用当前冻结 OUT 重新确认连接、后台访问和 HSS 能力，但没有复用旧固件行为来声明实际采集通过。
+- 规则修复只改变无副作用的请求元数据、规范化和幂等判定；冻结 DLL、Worker gateway、目标连接、OUT 和真机预检路径均未变化，因此既有真机只读预检证据保持有效，无需重复连接。
 - 本证据不证明 HSS Start、自动停止、持续/尾部排空、写入交错、质量事件、Capture Store 或父进程退出恢复；这些分别由 4.3–4.8 的主要测试和阶段纵向验收形成证据。
 - DLL、探针、目标、接口/速度、OUT、DWARF 夹具、AccessPlan 编码、请求规范化、能力字段、恢复状态机、IPC 或预检示例任一变化时，相应证据失效。
 - JTAG、Windows Codex 客户端验收、5.6、5.7、OpenSpec 归档和发布仍待办。

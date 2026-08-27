@@ -3,7 +3,7 @@
 use jlink_domain::{
     AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HSS_MAX_EXPANDED_SAMPLE_BYTES,
     HssCapabilities, HssReservationOutcome, HssReturnWhen, HssStartPlan, HssStartRegistry,
-    ScalarEncoding, VariableSelector,
+    HssThresholdRule, ScalarEncoding, VariableSelector,
 };
 use serde_json::json;
 
@@ -36,12 +36,17 @@ fn scalar_plan(index: u32, byte_size: u64) -> AccessPlan {
 }
 
 fn start_plan(duration_s: u32) -> HssStartPlan {
+    start_plan_with_rules(duration_s, Vec::new())
+}
+
+fn start_plan_with_rules(duration_s: u32, rules: Vec<HssThresholdRule>) -> HssStartPlan {
     HssStartPlan::new(
         "capture-key",
         duration_s,
         1_000,
         HssReturnWhen::Started,
         (0..10).map(|index| scalar_plan(index, 4)).collect(),
+        rules,
         firmware(),
     )
     .expect("valid 10x32-bit start plan")
@@ -72,6 +77,7 @@ fn t_p3_start_rejects_top_level_frame_and_observed_capability_overruns() {
         1,
         HssReturnWhen::Completed,
         (0..11).map(|index| scalar_plan(index, 1)).collect(),
+        Vec::new(),
         firmware(),
     )
     .expect_err("eleven top-level selectors must fail");
@@ -83,6 +89,7 @@ fn t_p3_start_rejects_top_level_frame_and_observed_capability_overruns() {
         1,
         HssReturnWhen::Completed,
         vec![scalar_plan(0, u64::from(HSS_MAX_EXPANDED_SAMPLE_BYTES) + 1)],
+        Vec::new(),
         firmware(),
     )
     .expect_err("expanded frame beyond F0-A evidence must fail");
@@ -105,6 +112,40 @@ fn t_p3_start_rejects_top_level_frame_and_observed_capability_overruns() {
             .code(),
         ErrorCode::HssUnsupported
     );
+}
+
+#[test]
+fn t_p3_start_normalizes_rules_and_binds_them_to_capture_key_idempotency() {
+    let rule = |id: &str, value: u32| {
+        serde_json::from_value::<HssThresholdRule>(json!({
+            "kind": "equals",
+            "id": id,
+            "path": "fixture0",
+            "value": value
+        }))
+        .expect("typed threshold rule")
+    };
+    let first = start_plan_with_rules(3, vec![rule("r1", 2), rule("r0", 1)]);
+    let reordered = start_plan_with_rules(3, vec![rule("r0", 1), rule("r1", 2)]);
+    assert_eq!(first.request_fingerprint(), reordered.request_fingerprint());
+    assert_eq!(first.rules()[0].id(), "r0");
+
+    let mut registry = HssStartRegistry::new();
+    registry
+        .reserve("260106173", &first)
+        .expect("reserve normalized rules");
+    assert!(matches!(
+        registry.reserve("260106173", &reordered),
+        Ok(HssReservationOutcome::Existing(_))
+    ));
+
+    let conflict = registry
+        .reserve(
+            "260106173",
+            &start_plan_with_rules(3, vec![rule("r0", 9), rule("r1", 2)]),
+        )
+        .expect_err("different start rule must conflict under the same key");
+    assert_eq!(conflict.code(), ErrorCode::CaptureKeyConflict);
 }
 
 #[test]

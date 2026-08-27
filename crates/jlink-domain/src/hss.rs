@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fmt::Write as _};
 
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError};
@@ -146,6 +146,115 @@ pub enum HssReturnWhen {
     Completed,
 }
 
+/// Direction retained by one declarative threshold-crossing rule.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssCrossingDirection {
+    /// Match only upward crossings.
+    Up,
+    /// Match only downward crossings.
+    Down,
+    /// Match either crossing direction.
+    Either,
+}
+
+/// One normalized start-time rule retained with the raw capture request.
+///
+/// Evaluation remains a query concern; retaining the typed rule here prevents
+/// capture-key idempotency from silently ignoring different rule sets.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HssThresholdRule {
+    /// Match an absolute adjacent-value delta.
+    AbsDeltaGte {
+        /// Stable caller-provided rule identity.
+        id: String,
+        /// Exact leaf path or array wildcard path evaluated later by the query engine.
+        path: String,
+        /// Closed-contract typed threshold value.
+        value: Value,
+    },
+    /// Match values outside an inclusive numeric interval.
+    Outside {
+        /// Stable caller-provided rule identity.
+        id: String,
+        /// Exact leaf path or array wildcard path evaluated later by the query engine.
+        path: String,
+        /// Inclusive lower bound.
+        min: Number,
+        /// Inclusive upper bound.
+        max: Number,
+    },
+    /// Match equality with one closed-contract typed value.
+    Equals {
+        /// Stable caller-provided rule identity.
+        id: String,
+        /// Exact leaf path or array wildcard path evaluated later by the query engine.
+        path: String,
+        /// Complete comparison value.
+        value: Value,
+    },
+    /// Match one directional threshold crossing.
+    Crosses {
+        /// Stable caller-provided rule identity.
+        id: String,
+        /// Exact leaf path or array wildcard path evaluated later by the query engine.
+        path: String,
+        /// Complete comparison value.
+        value: Value,
+        /// Accepted crossing direction.
+        direction: HssCrossingDirection,
+    },
+}
+
+impl HssThresholdRule {
+    /// Revalidates the strict rule shape retained across local IPC.
+    ///
+    /// Path-to-series resolution and rule evaluation are deliberately deferred
+    /// to the single query implementation, but identity and public value shape
+    /// must already be stable before the request fingerprint is computed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ValueInvalid`] for blank identities or paths and for
+    /// values outside the public boolean/number/object/array contract.
+    pub fn validate(&self) -> Result<(), JlinkError> {
+        let (id, path, value) = match self {
+            Self::AbsDeltaGte { id, path, value }
+            | Self::Equals { id, path, value }
+            | Self::Crosses {
+                id, path, value, ..
+            } => (id, path, Some(value)),
+            Self::Outside { id, path, .. } => (id, path, None),
+        };
+        if id.trim().is_empty() {
+            return Err(hss_value_invalid("HSS 规则 id 不能为空或仅包含空白"));
+        }
+        if path.trim().is_empty() {
+            return Err(hss_value_invalid("HSS 规则 path 不能为空或仅包含空白")
+                .with_detail("rule_id", json!(id)));
+        }
+        if value.is_some_and(|item| matches!(item, Value::Null | Value::String(_))) {
+            return Err(hss_value_invalid(
+                "HSS 规则 value 必须是 boolean、number、object 或 array",
+            )
+            .with_detail("rule_id", json!(id)));
+        }
+        Ok(())
+    }
+
+    /// Returns the stable rule identity used for deterministic normalization.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::AbsDeltaGte { id, .. }
+            | Self::Outside { id, .. }
+            | Self::Equals { id, .. }
+            | Self::Crosses { id, .. } => id,
+        }
+    }
+}
+
 /// One top-level DWARF selector placed at a fixed offset in every HSS sample.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -177,6 +286,7 @@ pub struct HssStartPlan {
     rate_hz: u32,
     return_when: HssReturnWhen,
     variables: Vec<HssVariablePlan>,
+    rules: Vec<HssThresholdRule>,
     firmware: FirmwareIdentityPlan,
     frame_layout: HssFrameLayout,
     request_fingerprint: String,
@@ -195,6 +305,7 @@ impl HssStartPlan {
         rate_hz: u32,
         return_when: HssReturnWhen,
         plans: Vec<AccessPlan>,
+        rules: Vec<HssThresholdRule>,
         firmware: FirmwareIdentityPlan,
     ) -> Result<Self, JlinkError> {
         let capture_key = capture_key.into();
@@ -251,14 +362,22 @@ impl HssStartPlan {
             sample_offset = next_offset;
         }
         let frame_layout = HssFrameLayout::new(&byte_counts)?;
-        let request_fingerprint =
-            request_fingerprint(duration_s, rate_hz, return_when, &variables, &firmware)?;
+        let rules = normalize_rules(rules)?;
+        let request_fingerprint = request_fingerprint(
+            duration_s,
+            rate_hz,
+            return_when,
+            &variables,
+            &rules,
+            &firmware,
+        )?;
         Ok(Self {
             capture_key,
             duration_s,
             rate_hz,
             return_when,
             variables,
+            rules,
             firmware,
             frame_layout,
             request_fingerprint,
@@ -281,6 +400,7 @@ impl HssStartPlan {
                 .iter()
                 .map(|variable| variable.plan.clone())
                 .collect(),
+            self.rules.clone(),
             self.firmware.clone(),
         )?;
         if rebuilt == *self {
@@ -324,6 +444,12 @@ impl HssStartPlan {
     #[must_use]
     pub fn variables(&self) -> &[HssVariablePlan] {
         &self.variables
+    }
+
+    /// Returns start-time rules in deterministic rule-id order.
+    #[must_use]
+    pub fn rules(&self) -> &[HssThresholdRule] {
+        &self.rules
     }
 
     /// Returns the symbol ELF identity that must be verified before HSS starts.
@@ -533,6 +659,7 @@ struct FingerprintInput<'a> {
     rate_hz: u32,
     return_when: HssReturnWhen,
     variables: &'a [HssVariablePlan],
+    rules: &'a [HssThresholdRule],
     firmware: &'a FirmwareIdentityPlan,
 }
 
@@ -541,6 +668,7 @@ fn request_fingerprint(
     rate_hz: u32,
     return_when: HssReturnWhen,
     variables: &[HssVariablePlan],
+    rules: &[HssThresholdRule],
     firmware: &FirmwareIdentityPlan,
 ) -> Result<String, JlinkError> {
     let bytes = serde_json::to_vec(&FingerprintInput {
@@ -548,10 +676,23 @@ fn request_fingerprint(
         rate_hz,
         return_when,
         variables,
+        rules,
         firmware,
     })
     .map_err(|error| hss_value_invalid(format!("HSS 请求无法规范化：{error}")))?;
     Ok(sha256(&bytes))
+}
+
+fn normalize_rules(mut rules: Vec<HssThresholdRule>) -> Result<Vec<HssThresholdRule>, JlinkError> {
+    for rule in &rules {
+        rule.validate()?;
+    }
+    rules.sort_by(|left, right| left.id().cmp(right.id()));
+    if let Some(duplicate) = rules.windows(2).find(|pair| pair[0].id() == pair[1].id()) {
+        return Err(hss_value_invalid("HSS 规则 id 必须唯一")
+            .with_detail("rule_id", json!(duplicate[0].id())));
+    }
+    Ok(rules)
 }
 
 fn capture_id(probe_identity: &str, plan: &HssStartPlan) -> String {
