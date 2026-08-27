@@ -7,7 +7,15 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+crc32fast.workspace = true
 jlink-domain = { path = "../jlink-domain" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

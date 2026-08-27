@@ -455,7 +455,7 @@ impl Runtime {
             .expect("attachment was established")
             .client
             .clone();
-        let result = client.start_hss(&target, &plan);
+        let result = client.start_hss(&target, &plan, resolved.capture.max_bytes.value);
         if result
             .as_ref()
             .is_err_and(|error| error.code == ErrorCode::WorkerUnavailable)

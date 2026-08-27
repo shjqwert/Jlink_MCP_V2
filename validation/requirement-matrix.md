@@ -72,7 +72,7 @@ public contract and is recorded in the implementation constraints.
 | HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
 | HSSA-004 | T-P3-RUN | Production automatic Stop/tail-drain trace + timed J-Link capture | F0-A |
 | HSSA-005 | T-P3-STATE | Production state-machine/fault-retention fixture | F0-A + F0-B |
-| HSSA-006 | T-P3-STORE | Local storage integration | F0-A throughput |
+| HSSA-006 | T-P3-STORE | Production Capture Store limit/CRC/atomic-publish fixture + Worker restart recovery | F0-A throughput |
 | HSSA-007 | T-P3-QUALITY | J-Link raw-frame fixture/hardware | F0-A |
 | HSSA-008 | T-P3-RUN | Production write event trace + J-Link write-interleaving timeline | F0-A |
 | HSSA-009 | T-P3-RECOVER | Windows process + hardware integration | F0-B |

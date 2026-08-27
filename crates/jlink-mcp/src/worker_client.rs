@@ -270,11 +270,13 @@ impl WorkerClient {
         &self,
         target: &TargetConnectionSpec,
         plan: &HssStartPlan,
+        capture_max_bytes: u64,
     ) -> Result<HssRunSnapshot, JlinkError> {
         let response = self.request(SessionCommand::HssStart, |request| {
             request
                 .with_target(target.clone())
                 .with_hss_start(plan.clone())
+                .with_capture_max_bytes(capture_max_bytes)
         })?;
         response_result(response).and_then(parse_hss_snapshot)
     }

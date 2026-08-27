@@ -353,6 +353,9 @@ pub struct IpcRequest {
     /// Typed HSS start plan required only by `hss_start`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hss_start: Option<crate::HssStartPlan>,
+    /// Resolved Capture Store limit required only by `hss_start`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_max_bytes: Option<u64>,
     /// Stable capture identity required only by `hss_status`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_id: Option<String>,
@@ -376,6 +379,7 @@ impl IpcRequest {
             debug: None,
             control: None,
             hss_start: None,
+            capture_max_bytes: None,
             capture_id: None,
         }
     }
@@ -419,6 +423,13 @@ impl IpcRequest {
     #[must_use]
     pub fn with_hss_start(mut self, plan: crate::HssStartPlan) -> Self {
         self.hss_start = Some(plan);
+        self
+    }
+
+    /// Attaches the resolved positive Capture Store limit to an HSS start.
+    #[must_use]
+    pub const fn with_capture_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.capture_max_bytes = Some(max_bytes);
         self
     }
 

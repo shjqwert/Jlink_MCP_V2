@@ -1,8 +1,10 @@
 use std::{
     collections::BTreeMap,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
+use jlink_capture::{CapturePhase, CaptureRecovery, CaptureSnapshot, CaptureStore, CaptureWriter};
 use jlink_domain::{
     ErrorCode, HssCaptureReservation, HssCaptureState, HssDataIntegrity, HssDrainTiming,
     HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState, HssStartPlan,
@@ -56,7 +58,7 @@ struct ActiveCapture {
     tail_started: Option<Instant>,
     consecutive_empty_tail_reads: u32,
     buffer: Vec<u8>,
-    raw_bytes: Vec<u8>,
+    writer: Option<CaptureWriter>,
     incomplete_tail: Vec<u8>,
     complete_records: u64,
     drain: HssDrainTiming,
@@ -66,25 +68,60 @@ struct ActiveCapture {
 
 struct TerminalCapture {
     snapshot: HssRunSnapshot,
-    _plan: HssStartPlan,
-    _raw_bytes: Vec<u8>,
+    _plan: Option<HssStartPlan>,
+    _store: Option<CaptureSnapshot>,
     _failure: Option<JlinkError>,
 }
 
 /// Worker-owned fixed-duration scheduler; all methods run on the DLL thread.
 pub(crate) struct HssCoordinator {
+    store: CaptureStore,
     registry: HssStartRegistry,
     active: Option<ActiveCapture>,
     terminal: BTreeMap<String, TerminalCapture>,
 }
 
 impl HssCoordinator {
-    pub(crate) const fn new() -> Self {
-        Self {
+    pub(crate) fn open(root: impl Into<PathBuf>) -> Result<Self, JlinkError> {
+        let store = CaptureStore::open(root)?;
+        let mut terminal = BTreeMap::new();
+        for recovery in store.recover_partials()? {
+            match recovery {
+                CaptureRecovery::Published(snapshot) => {
+                    terminal.insert(
+                        snapshot.capture_id().to_owned(),
+                        TerminalCapture {
+                            snapshot: snapshot.status().clone(),
+                            _plan: Some(snapshot.plan().clone()),
+                            _store: Some(snapshot),
+                            _failure: None,
+                        },
+                    );
+                }
+                CaptureRecovery::Aborted {
+                    capture_id,
+                    plan,
+                    status,
+                    ..
+                } => {
+                    terminal.insert(
+                        capture_id,
+                        TerminalCapture {
+                            snapshot: status,
+                            _plan: plan,
+                            _store: None,
+                            _failure: None,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            store,
             registry: HssStartRegistry::new(),
             active: None,
-            terminal: BTreeMap::new(),
-        }
+            terminal,
+        })
     }
 
     pub(crate) fn is_active(&self) -> bool {
@@ -99,6 +136,7 @@ impl HssCoordinator {
         &mut self,
         probe_identity: &str,
         plan: HssStartPlan,
+        capture_max_bytes: u64,
         io: &mut I,
         preflight: F,
     ) -> Result<HssStartOutcome, JlinkError>
@@ -128,42 +166,57 @@ impl HssCoordinator {
             self.registry.rollback_created(&plan, &reservation);
             return Err(error);
         }
+        let capture_id = reservation.capture_id().to_owned();
+        let writer = match self
+            .store
+            .create_writer(&capture_id, &plan, capture_max_bytes)
+        {
+            Ok(writer) => writer,
+            Err(error) => {
+                self.registry.rollback_created(&plan, &reservation);
+                return Err(error);
+            }
+        };
         if let Err(error) = io.start_hss(&plan) {
             let mut status = HssCaptureState::starting();
             status
                 .mark_failed(error.code, false, Vec::new())
                 .expect("a controlled Start failure can terminate starting");
-            let capture_id = reservation.capture_id().to_owned();
+            let snapshot = HssRunSnapshot {
+                capture_id: capture_id.clone(),
+                state: status.lifecycle(),
+                integrity: status.integrity(),
+                elapsed_us: 0,
+                complete_records: 0,
+                drain: HssDrainTiming::default(),
+                writes: Vec::new(),
+                failure_code: status.failure_code(),
+                partial_available: false,
+                reason: None,
+                recoverable: None,
+                recovery_notifications: Vec::new(),
+            };
+            let store_result = writer.finish(&snapshot);
             self.terminal.insert(
                 capture_id.clone(),
                 TerminalCapture {
-                    snapshot: HssRunSnapshot {
-                        capture_id: capture_id.clone(),
-                        state: status.lifecycle(),
-                        integrity: status.integrity(),
-                        elapsed_us: 0,
-                        complete_records: 0,
-                        drain: HssDrainTiming::default(),
-                        writes: Vec::new(),
-                        failure_code: status.failure_code(),
-                        partial_available: false,
-                        reason: None,
-                        recoverable: None,
-                        recovery_notifications: Vec::new(),
-                    },
-                    _plan: plan,
-                    _raw_bytes: Vec::new(),
+                    snapshot,
+                    _plan: Some(plan),
+                    _store: store_result.as_ref().ok().cloned(),
                     _failure: Some(error.clone()),
                 },
             );
-            return Err(error
+            let mut error = error
                 .with_detail("capture_id", json!(capture_id))
                 .with_detail("state", json!(HssRunState::Failed))
-                .with_detail("partial_available", json!(false)));
+                .with_detail("partial_available", json!(false));
+            if let Err(store_error) = store_result {
+                error = error.with_detail("capture_store_publish", json!(store_error.to_string()));
+            }
+            return Err(error);
         }
         let started = Instant::now();
         let deadline = started + Duration::from_secs(u64::from(plan.duration_s()));
-        let capture_id = reservation.capture_id().to_owned();
         let mut status = HssCaptureState::starting();
         status
             .mark_running()
@@ -177,7 +230,7 @@ impl HssCoordinator {
             tail_started: None,
             consecutive_empty_tail_reads: 0,
             buffer: vec![0; READ_BUFFER_BYTES],
-            raw_bytes: Vec::new(),
+            writer: Some(writer),
             incomplete_tail: Vec::new(),
             complete_records: 0,
             drain: HssDrainTiming::default(),
@@ -239,7 +292,7 @@ impl HssCoordinator {
             active.consecutive_empty_tail_reads = 0;
         }
         if active.consecutive_empty_tail_reads >= TAIL_EMPTY_READS {
-            return Ok(self.complete(now));
+            return self.complete(now);
         }
         if now.saturating_duration_since(tail_started) >= TAIL_DRAIN_TIMEOUT {
             return self.fail(
@@ -255,7 +308,7 @@ impl HssCoordinator {
         Ok(false)
     }
 
-    fn complete(&mut self, now: Instant) -> bool {
+    fn complete(&mut self, now: Instant) -> Result<bool, JlinkError> {
         let mut active = self
             .active
             .take()
@@ -265,22 +318,45 @@ impl HssCoordinator {
         } else {
             HssDataIntegrity::Degraded
         };
-        active
-            .status
+        let mut completed_status = active.status.clone();
+        completed_status
             .mark_completed(integrity)
             .expect("tail completion follows stopping");
         let capture_id = active.reservation.capture_id().to_owned();
-        let snapshot = snapshot(&active, now);
-        self.terminal.insert(
-            capture_id,
-            TerminalCapture {
-                snapshot,
-                _plan: active.plan,
-                _raw_bytes: active.raw_bytes,
-                _failure: None,
-            },
-        );
-        true
+        let snapshot = snapshot_with_status(&active, &completed_status, now);
+        let partial_available = active
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.payload_bytes() > 0);
+        let plan = active.plan.clone();
+        let writer = active.writer.take().expect("active capture owns a writer");
+        match writer.finish(&snapshot) {
+            Ok(store) => {
+                self.terminal.insert(
+                    capture_id,
+                    TerminalCapture {
+                        snapshot,
+                        _plan: Some(plan),
+                        _store: Some(store),
+                        _failure: None,
+                    },
+                );
+            }
+            Err(error) => {
+                let failed =
+                    failed_snapshot_after_store_error(&active, error.code, partial_available, now)?;
+                self.terminal.insert(
+                    capture_id,
+                    TerminalCapture {
+                        snapshot: failed,
+                        _plan: Some(plan),
+                        _store: None,
+                        _failure: Some(error),
+                    },
+                );
+            }
+        }
+        Ok(true)
     }
 
     fn fail(
@@ -290,7 +366,10 @@ impl HssCoordinator {
         stop_completed: bool,
     ) -> Result<bool, JlinkError> {
         let mut active = self.active.take().expect("failure requires active capture");
-        let partial_available = !active.raw_bytes.is_empty();
+        let partial_available = active
+            .writer
+            .as_ref()
+            .is_some_and(|writer| writer.payload_bytes() > 0);
         let mut notifications = Vec::new();
         if stop_completed {
             notifications.push(HssRecoveryNotification::StopCompletedAfterFailure);
@@ -306,12 +385,21 @@ impl HssCoordinator {
             .mark_failed(error.code, partial_available, notifications)?;
         let capture_id = active.reservation.capture_id().to_owned();
         let snapshot = snapshot(&active, now);
+        let plan = active.plan.clone();
+        let writer = active.writer.take().expect("active capture owns a writer");
+        let store_result = writer.finish(&snapshot);
+        let error = match &store_result {
+            Ok(_) => error,
+            Err(store_error) => {
+                error.with_detail("capture_store_publish", json!(store_error.to_string()))
+            }
+        };
         self.terminal.insert(
             capture_id,
             TerminalCapture {
                 snapshot,
-                _plan: active.plan,
-                _raw_bytes: active.raw_bytes,
+                _plan: Some(plan),
+                _store: store_result.ok(),
                 _failure: Some(error),
             },
         );
@@ -419,7 +507,20 @@ fn drain_once<I: HssIo>(
             false,
         ));
     }
-    active.raw_bytes.extend_from_slice(&active.buffer[..read]);
+    let phase = if active.status.lifecycle() == HssRunState::Running {
+        CapturePhase::Live
+    } else {
+        CapturePhase::Tail
+    };
+    active
+        .writer
+        .as_mut()
+        .expect("active capture owns a writer")
+        .append(
+            instant_offset_us(active.started, completed),
+            phase,
+            &active.buffer[..read],
+        )?;
     active
         .incomplete_tail
         .extend_from_slice(&active.buffer[..read]);
@@ -436,20 +537,46 @@ fn drain_once<I: HssIo>(
 }
 
 fn snapshot(active: &ActiveCapture, now: Instant) -> HssRunSnapshot {
+    snapshot_with_status(active, &active.status, now)
+}
+
+fn snapshot_with_status(
+    active: &ActiveCapture,
+    status: &HssCaptureState,
+    now: Instant,
+) -> HssRunSnapshot {
     HssRunSnapshot {
         capture_id: active.reservation.capture_id().to_owned(),
-        state: active.status.lifecycle(),
-        integrity: active.status.integrity(),
+        state: status.lifecycle(),
+        integrity: status.integrity(),
         elapsed_us: instant_offset_us(active.started, now),
         complete_records: active.complete_records,
         drain: active.drain,
         writes: active.writes.clone(),
-        failure_code: active.status.failure_code(),
-        partial_available: active.status.partial_available(),
-        reason: active.status.reason().map(str::to_owned),
-        recoverable: active.status.recoverable(),
-        recovery_notifications: active.status.recovery_notifications().to_vec(),
+        failure_code: status.failure_code(),
+        partial_available: status.partial_available(),
+        reason: status.reason().map(str::to_owned),
+        recoverable: status.recoverable(),
+        recovery_notifications: status.recovery_notifications().to_vec(),
     }
+}
+
+fn failed_snapshot_after_store_error(
+    active: &ActiveCapture,
+    code: ErrorCode,
+    partial_available: bool,
+    now: Instant,
+) -> Result<HssRunSnapshot, JlinkError> {
+    let mut status = active.status.clone();
+    let notifications = partial_available
+        .then(|| HssRecoveryNotification::PartialDataRetained {
+            complete_records: active.complete_records,
+            trailing_bytes: u64::try_from(active.incomplete_tail.len()).unwrap_or(u64::MAX),
+        })
+        .into_iter()
+        .collect();
+    status.mark_failed(code, partial_available, notifications)?;
+    Ok(snapshot_with_status(active, &status, now))
 }
 
 fn instant_offset_us(start: Instant, value: Instant) -> u64 {
@@ -470,8 +597,11 @@ mod tests {
         ScalarEncoding, VariableSelector,
     };
     use serde_json::json;
+    use tempfile::{TempDir, tempdir};
 
     use super::{HssCoordinator, HssIo, Instant, JlinkError};
+
+    const TEST_CAPTURE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
     struct ScriptedHss {
         start_error: Option<JlinkError>,
@@ -555,14 +685,26 @@ mod tests {
         .expect("start plan")
     }
 
+    fn coordinator() -> (TempDir, HssCoordinator) {
+        let root = tempdir().expect("capture store root");
+        let coordinator = HssCoordinator::open(root.path()).expect("capture store opens");
+        (root, coordinator)
+    }
+
     #[test]
     fn t_p3_run_prioritizes_drain_records_failed_write_and_completes_tail() {
         let first_record = [1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat();
         let second_record = [2_u32.to_le_bytes(), 20_u32.to_le_bytes()].concat();
         let mut io = ScriptedHss::healthy([first_record, second_record]);
-        let mut coordinator = HssCoordinator::new();
+        let (store_root, mut coordinator) = coordinator();
         let outcome = coordinator
-            .start("260106173", start_plan(), &mut io, |_| Ok(()))
+            .start(
+                "260106173",
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
         let started = coordinator.active.as_ref().expect("active capture").started;
@@ -622,6 +764,12 @@ mod tests {
         assert_eq!(&io.calls[..4], ["start", "drain", "write", "drain"]);
         assert_eq!(io.calls.iter().filter(|call| **call == "stop").count(), 1);
         assert!(snapshot.drain.calls >= 23);
+        assert!(
+            store_root
+                .path()
+                .join(format!("capture-{capture_id}.capture"))
+                .is_file()
+        );
     }
 
     #[test]
@@ -639,9 +787,15 @@ mod tests {
             ]),
             calls: Vec::new(),
         };
-        let mut coordinator = HssCoordinator::new();
+        let (_store_root, mut coordinator) = coordinator();
         let outcome = coordinator
-            .start("260106173", start_plan(), &mut io, |_| Ok(()))
+            .start(
+                "260106173",
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect("capture starts");
         coordinator.advance(&mut io).expect("first record retained");
         assert!(
@@ -682,9 +836,15 @@ mod tests {
             reads: VecDeque::new(),
             calls: Vec::new(),
         };
-        let mut coordinator = HssCoordinator::new();
+        let (store_root, mut coordinator) = coordinator();
         let error = coordinator
-            .start("260106173", plan.clone(), &mut io, |_| Ok(()))
+            .start(
+                "260106173",
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect_err("DLL Start failure remains a tool error");
         let capture_id = error
             .details
@@ -698,9 +858,17 @@ mod tests {
         assert_eq!(failed.state, HssRunState::Failed);
         assert_eq!(failed.failure_code, Some(ErrorCode::HssStartFailed));
         assert!(!failed.partial_available);
+        assert!(
+            store_root
+                .path()
+                .join(format!("capture-{capture_id}.capture"))
+                .is_file()
+        );
 
         let recovered = coordinator
-            .start("260106173", plan, &mut io, |_| Ok(()))
+            .start("260106173", plan, TEST_CAPTURE_MAX_BYTES, &mut io, |_| {
+                Ok(())
+            })
             .expect("same key and request recover the failed identity");
         assert!(!recovered.started_new);
         assert_eq!(recovered.snapshot.capture_id, failed.capture_id);
@@ -719,9 +887,15 @@ mod tests {
             reads: VecDeque::new(),
             calls: Vec::new(),
         };
-        let mut coordinator = HssCoordinator::new();
-        coordinator
-            .start("260106173", start_plan(), &mut io, |_| Ok(()))
+        let (store_root, mut coordinator) = coordinator();
+        let outcome = coordinator
+            .start(
+                "260106173",
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
         let error = coordinator
@@ -730,6 +904,14 @@ mod tests {
         assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
         assert!(coordinator.is_active());
         assert_eq!(io.calls, ["start", "drain", "stop"]);
+        let capture_id = outcome.snapshot.capture_id;
+        drop(coordinator);
+        let recovered = HssCoordinator::open(store_root.path()).expect("partial recovery scan");
+        let snapshot = recovered
+            .status(&capture_id, Instant::now())
+            .expect("aborted partial remains queryable after restart");
+        assert_eq!(snapshot.state, HssRunState::Aborted);
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
     }
 
     #[test]
@@ -737,9 +919,15 @@ mod tests {
         let mut bytes = [1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat();
         bytes.push(0xAA);
         let mut io = ScriptedHss::healthy([bytes]);
-        let mut coordinator = HssCoordinator::new();
+        let (_store_root, mut coordinator) = coordinator();
         let outcome = coordinator
-            .start("260106173", start_plan(), &mut io, |_| Ok(()))
+            .start(
+                "260106173",
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
         coordinator

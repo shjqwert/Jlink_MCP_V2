@@ -264,15 +264,26 @@ fn validate_control_payload(request: &IpcRequest) -> Result<(), JlinkError> {
 
 fn validate_hss_payload(request: &IpcRequest) -> Result<(), JlinkError> {
     let valid = match request.command {
-        SessionCommand::HssStart => request.hss_start.is_some() && request.capture_id.is_none(),
+        SessionCommand::HssStart => {
+            request.hss_start.is_some()
+                && request
+                    .capture_max_bytes
+                    .is_some_and(|max_bytes| max_bytes > 0)
+                && request.capture_id.is_none()
+        }
         SessionCommand::HssStatus => {
             request.hss_start.is_none()
+                && request.capture_max_bytes.is_none()
                 && request
                     .capture_id
                     .as_deref()
                     .is_some_and(|capture_id| !capture_id.trim().is_empty())
         }
-        _ => request.hss_start.is_none() && request.capture_id.is_none(),
+        _ => {
+            request.hss_start.is_none()
+                && request.capture_max_bytes.is_none()
+                && request.capture_id.is_none()
+        }
     };
     if valid {
         Ok(())
@@ -389,6 +400,7 @@ impl WorkerRuntime {
         request_id: jlink_domain::RequestId,
         target: Option<jlink_domain::TargetConnectionSpec>,
         plan: Option<jlink_domain::HssStartPlan>,
+        capture_max_bytes: Option<u64>,
     ) -> (IpcResponse, bool) {
         let result = target
             .ok_or_else(|| {
@@ -398,10 +410,18 @@ impl WorkerRuntime {
                 let plan = plan.ok_or_else(|| {
                     JlinkError::new(ErrorCode::IpcProtocolError, "HSS start 缺少启动计划", false)
                 })?;
+                let capture_max_bytes = capture_max_bytes.ok_or_else(|| {
+                    JlinkError::new(
+                        ErrorCode::IpcProtocolError,
+                        "HSS start 缺少 Capture Store 上限",
+                        false,
+                    )
+                })?;
                 let session = &mut self.session;
                 let outcome = self.hss.start(
                     &self.probe_identity,
                     plan.clone(),
+                    capture_max_bytes,
                     &mut self.gateway,
                     |gateway| {
                         session.ensure_hss_start_allowed(&target)?;
@@ -580,9 +600,12 @@ impl WorkerRuntime {
             SessionCommand::Control => {
                 self.handle_control(request_id, request.target, request.control)
             }
-            SessionCommand::HssStart => {
-                self.handle_hss_start(request_id, request.target, request.hss_start)
-            }
+            SessionCommand::HssStart => self.handle_hss_start(
+                request_id,
+                request.target,
+                request.hss_start,
+                request.capture_max_bytes,
+            ),
             SessionCommand::HssStatus => self.handle_hss_status(request_id, request.capture_id),
         }
     }
@@ -646,14 +669,16 @@ fn listen_for_requests(
 pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     let endpoint = worker_endpoint_name(&options.probe_identity)?;
     let lease = ProbeLease::acquire(&options.lease_root, &options.probe_identity)?;
+    let identity_hash = probe_identity_hash(&options.probe_identity)?;
+    let hss = HssCoordinator::open(options.lease_root.join("captures").join(&identity_hash))?;
     let gateway = DllGateway::load(&options.dll_path)?;
     let mut runtime = WorkerRuntime {
         probe_identity: options.probe_identity.clone(),
-        probe_identity_hash: probe_identity_hash(&options.probe_identity)?,
+        probe_identity_hash: identity_hash,
         _lease: lease,
         gateway,
         session: TargetSessionManager::new(),
-        hss: HssCoordinator::new(),
+        hss,
     };
     let (request_tx, request_rx) = mpsc::channel();
     let listener = thread::spawn(move || listen_for_requests(&endpoint, &request_tx));

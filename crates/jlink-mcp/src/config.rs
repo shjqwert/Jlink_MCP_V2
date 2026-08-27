@@ -11,12 +11,10 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+pub use jlink_capture::DEFAULT_CAPTURE_MAX_BYTES;
 use jlink_domain::{ErrorCode, JlinkError, TargetInterface};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-/// The default capture size limit, in bytes.
-pub const DEFAULT_CAPTURE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 /// The source from which a resolved field was selected.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

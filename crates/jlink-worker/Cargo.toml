@@ -12,5 +12,8 @@ jlink-domain = { path = "../jlink-domain" }
 serde_json.workspace = true
 windows-sys.workspace = true
 
+[dev-dependencies]
+tempfile = "=3.27.0"
+
 [lints]
 workspace = true
