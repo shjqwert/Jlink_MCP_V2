@@ -527,7 +527,7 @@ fn hss_tool() -> Value {
         "query",
         &[
             ("view", json!({ "const": "changes" })),
-            ("series", string_array()),
+            ("series", non_empty_unique_string_array()),
             ("from_us", non_negative_integer()),
             ("to_us", positive_integer()),
             (
@@ -698,6 +698,7 @@ fn hss_output_schema() -> Value {
     closed_schema_union(&[
         hss_status_output_schema(),
         hss_overview_output_schema(),
+        hss_changes_output_schema(),
         hss_completed_start_output_schema(),
         closed_object(vec![("error", error_schema())], &["error"]),
     ])
@@ -720,6 +721,7 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
             .expect("non-cursor query Schema guarantees hss.view")
         {
             "overview" => hss_overview_output_schema(),
+            "changes" => hss_changes_output_schema(),
             _ => hss_output_schema(),
         },
         _ => unreachable!("HSS action was validated against the closed catalog"),
@@ -788,6 +790,50 @@ fn hss_completed_start_output_schema() -> Value {
     required.push(json!("state"));
     required.push(json!("elapsed_us"));
     schema
+}
+
+fn hss_changes_output_schema() -> Value {
+    closed_object(
+        vec![
+            (
+                "dictionary",
+                json!({ "type": "object", "additionalProperties": non_empty_string() }),
+            ),
+            (
+                "changes",
+                json!({
+                    "type": "array",
+                    "items": closed_object(
+                        vec![
+                            ("series", non_empty_string()),
+                            ("after_us", non_negative_integer()),
+                            ("observed_by_us", non_negative_integer()),
+                            ("from", typed_value_schema()),
+                            ("to", typed_value_schema()),
+                        ],
+                        &["series", "after_us", "observed_by_us", "from", "to"],
+                    )
+                }),
+            ),
+            (
+                "matches",
+                json!({
+                    "type": "array",
+                    "items": closed_object(
+                        vec![
+                            ("rule", non_empty_string()),
+                            ("series", non_empty_string()),
+                            ("after_us", non_negative_integer()),
+                            ("observed_by_us", non_negative_integer()),
+                        ],
+                        &["rule", "series", "after_us", "observed_by_us"],
+                    )
+                }),
+            ),
+            ("truncated", boolean()),
+        ],
+        &["dictionary", "changes", "matches", "truncated"],
+    )
 }
 
 fn hss_overview_variables_schema() -> Value {
@@ -1216,6 +1262,15 @@ fn string_enum(values: &[&str]) -> Value {
 
 fn string_array() -> Value {
     json!({ "type": "array", "items": non_empty_string() })
+}
+
+fn non_empty_unique_string_array() -> Value {
+    json!({
+        "type": "array",
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": non_empty_string()
+    })
 }
 
 fn boolean() -> Value {

@@ -470,7 +470,11 @@ fn t_p1_mcp_runtime_keeps_remaining_future_actions_unavailable() {
                 "arguments": {
                     "action": "query",
                     "capture_id": "future_capture",
-                    "view": "changes"
+                    "view": "window",
+                    "series": ["s0"],
+                    "from_us": 0,
+                    "to_us": 1,
+                    "mode": "raw"
                 }
             }
         })],

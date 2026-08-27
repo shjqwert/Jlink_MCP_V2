@@ -1,10 +1,13 @@
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::{cmp::Ordering, collections::BTreeMap, fmt::Write as _};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError, TargetConnectionSpec};
+use crate::{
+    AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError, SelectorStep, TargetConnectionSpec,
+    VariableSelector,
+};
 
 const HSS_TIMESTAMP_BYTES: u32 = 4;
 const HSS_CAPS_TIMESTAMP_FLAG: u32 = 2;
@@ -1115,11 +1118,33 @@ impl HssThresholdRule {
             return Err(hss_value_invalid("HSS 规则 path 不能为空或仅包含空白")
                 .with_detail("rule_id", json!(id)));
         }
+        parse_rule_path(path).map_err(|error| error.with_detail("rule_id", json!(id)))?;
         if value.is_some_and(|item| matches!(item, Value::Null | Value::String(_))) {
             return Err(hss_value_invalid(
                 "HSS 规则 value 必须是 boolean、number、object 或 array",
             )
             .with_detail("rule_id", json!(id)));
+        }
+        match self {
+            Self::AbsDeltaGte { value, .. } => {
+                if parse_rule_number(value, id, "value")?.is_negative() {
+                    return Err(rule_value_invalid(id, "abs_delta_gte.value 不能为负数"));
+                }
+            }
+            Self::Outside { min, max, .. } => {
+                if compare_rule_numbers(
+                    RuleNumber::from_json_number(min),
+                    RuleNumber::from_json_number(max),
+                    id,
+                )? == Ordering::Greater
+                {
+                    return Err(rule_value_invalid(id, "outside.min 不能大于 outside.max"));
+                }
+            }
+            Self::Equals { .. } => {}
+            Self::Crosses { value, .. } => {
+                parse_rule_number(value, id, "value")?;
+            }
         }
         Ok(())
     }
@@ -1134,6 +1159,366 @@ impl HssThresholdRule {
             | Self::Crosses { id, .. } => id,
         }
     }
+
+    /// Returns the normalized exact or wildcard leaf path.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        match self {
+            Self::AbsDeltaGte { path, .. }
+            | Self::Outside { path, .. }
+            | Self::Equals { path, .. }
+            | Self::Crosses { path, .. } => path,
+        }
+    }
+
+    /// Returns whether one normalized concrete DWARF leaf path matches this rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ValueInvalid`] if either persisted rule data or the
+    /// candidate path violates its respective closed grammar.
+    pub fn matches_path(&self, candidate: &str) -> Result<bool, JlinkError> {
+        let pattern = parse_rule_path(self.path())?;
+        let selector = VariableSelector::new(candidate, None)?;
+        if pattern.root != selector.root() {
+            return Ok(false);
+        }
+        let candidate_steps = selector.steps()?;
+        if pattern.steps.len() != candidate_steps.len() {
+            return Ok(false);
+        }
+        Ok(pattern
+            .steps
+            .iter()
+            .zip(candidate_steps)
+            .all(|(expected, actual)| expected.matches(&actual)))
+    }
+
+    /// Evaluates this rule over one adjacent pair of already decoded leaf values.
+    ///
+    /// Exact changes remain a separate query fact; this method returns only the
+    /// declared threshold match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::ValueInvalid`] when a numeric rule targets a
+    /// non-numeric value or would require an inexact mixed comparison.
+    pub fn matches_values(&self, before: &Value, after: &Value) -> Result<bool, JlinkError> {
+        self.validate()?;
+        match self {
+            Self::AbsDeltaGte { id, value, .. } => {
+                let before = parse_rule_number(before, id, "before")?;
+                let after = parse_rule_number(after, id, "after")?;
+                let threshold = parse_rule_number(value, id, "value")?;
+                absolute_delta_gte(before, after, threshold, id)
+            }
+            Self::Outside { id, min, max, .. } => {
+                let after = parse_rule_number(after, id, "after")?;
+                Ok(
+                    compare_rule_numbers(after, RuleNumber::from_json_number(min), id)?
+                        == Ordering::Less
+                        || compare_rule_numbers(after, RuleNumber::from_json_number(max), id)?
+                            == Ordering::Greater,
+                )
+            }
+            Self::Equals { value, .. } => Ok(before != value && after == value),
+            Self::Crosses {
+                id,
+                value,
+                direction,
+                ..
+            } => {
+                let before = parse_rule_number(before, id, "before")?;
+                let after = parse_rule_number(after, id, "after")?;
+                let threshold = parse_rule_number(value, id, "value")?;
+                let before_cmp = compare_rule_numbers(before, threshold, id)?;
+                let after_cmp = compare_rule_numbers(after, threshold, id)?;
+                let up = before_cmp == Ordering::Less && after_cmp != Ordering::Less;
+                let down = before_cmp == Ordering::Greater && after_cmp != Ordering::Greater;
+                Ok(match direction {
+                    HssCrossingDirection::Up => up,
+                    HssCrossingDirection::Down => down,
+                    HssCrossingDirection::Either => up || down,
+                })
+            }
+        }
+    }
+
+    fn normalize_path(&mut self) -> Result<(), JlinkError> {
+        let normalized = parse_rule_path(self.path())?.normalized;
+        match self {
+            Self::AbsDeltaGte { path, .. }
+            | Self::Outside { path, .. }
+            | Self::Equals { path, .. }
+            | Self::Crosses { path, .. } => *path = normalized,
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RulePathPattern {
+    root: String,
+    steps: Vec<RulePathStep>,
+    normalized: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum RulePathStep {
+    Member(String),
+    Index(u64),
+    Wildcard,
+}
+
+impl RulePathStep {
+    fn matches(&self, candidate: &SelectorStep) -> bool {
+        match (self, candidate) {
+            (Self::Member(expected), SelectorStep::Member(actual)) => expected == actual,
+            (Self::Index(expected), SelectorStep::Index(actual)) => expected == actual,
+            (Self::Wildcard, SelectorStep::Index(_)) => true,
+            (Self::Member(_) | Self::Index(_), _) | (Self::Wildcard, SelectorStep::Member(_)) => {
+                false
+            }
+        }
+    }
+}
+
+fn parse_rule_path(path: &str) -> Result<RulePathPattern, JlinkError> {
+    if path.is_empty() || path.trim() != path || !path.is_ascii() {
+        return Err(hss_value_invalid(
+            "HSS 规则 path 必须是非空、无首尾空白的 ASCII 路径",
+        ));
+    }
+    let bytes = path.as_bytes();
+    let (root, mut cursor) = parse_rule_identifier(path, 0)?;
+    let mut normalized = root.clone();
+    let mut steps = Vec::new();
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'.' => {
+                let (member, next) = parse_rule_identifier(path, cursor + 1)?;
+                normalized.push('.');
+                normalized.push_str(&member);
+                steps.push(RulePathStep::Member(member));
+                cursor = next;
+            }
+            b'[' => {
+                let start = cursor + 1;
+                let Some(relative_end) = bytes[start..].iter().position(|byte| *byte == b']')
+                else {
+                    return Err(hss_value_invalid("HSS 规则数组路径缺少右方括号"));
+                };
+                let end = start + relative_end;
+                let token = &path[start..end];
+                normalized.push('[');
+                if token == "*" {
+                    normalized.push('*');
+                    steps.push(RulePathStep::Wildcard);
+                } else {
+                    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_digit()) {
+                        return Err(hss_value_invalid(
+                            "HSS 规则数组路径只允许非负十进制索引或 *",
+                        ));
+                    }
+                    let index = token
+                        .parse::<u64>()
+                        .map_err(|_| hss_value_invalid("HSS 规则数组索引超出 u64 范围"))?;
+                    normalized.push_str(&index.to_string());
+                    steps.push(RulePathStep::Index(index));
+                }
+                normalized.push(']');
+                cursor = end + 1;
+            }
+            _ => {
+                return Err(hss_value_invalid(
+                    "HSS 规则 path 只允许成员点号、数组索引和 [*]",
+                ));
+            }
+        }
+    }
+    Ok(RulePathPattern {
+        root,
+        steps,
+        normalized,
+    })
+}
+
+fn parse_rule_identifier(path: &str, start: usize) -> Result<(String, usize), JlinkError> {
+    let bytes = path.as_bytes();
+    let Some(first) = bytes.get(start).copied() else {
+        return Err(hss_value_invalid("HSS 规则 path 缺少标识符"));
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return Err(hss_value_invalid(
+            "HSS 规则标识符必须以 ASCII 字母或下划线开头",
+        ));
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+    {
+        end += 1;
+    }
+    Ok((path[start..end].to_owned(), end))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RuleNumber {
+    Integer(i128),
+    Float(f64),
+}
+
+impl RuleNumber {
+    fn from_json_number(number: &Number) -> Self {
+        if let Some(value) = number.as_i64() {
+            Self::Integer(i128::from(value))
+        } else if let Some(value) = number.as_u64() {
+            Self::Integer(i128::from(value))
+        } else {
+            Self::Float(number.as_f64().expect("serde_json number is finite"))
+        }
+    }
+
+    const fn is_negative(self) -> bool {
+        match self {
+            Self::Integer(value) => value < 0,
+            Self::Float(value) => value < 0.0,
+        }
+    }
+}
+
+fn parse_rule_number(value: &Value, rule_id: &str, field: &str) -> Result<RuleNumber, JlinkError> {
+    if let Some(number) = value.as_number() {
+        return Ok(RuleNumber::from_json_number(number));
+    }
+    let Some(object) = value.as_object() else {
+        return Err(rule_value_invalid(
+            rule_id,
+            format!("{field} 必须是数值 TypedValue"),
+        ));
+    };
+    if object.len() != 3 {
+        return Err(rule_value_invalid(
+            rule_id,
+            format!("{field} 的扩展整数必须只含 $int/bits/signed"),
+        ));
+    }
+    let integer = object
+        .get("$int")
+        .and_then(Value::as_str)
+        .ok_or_else(|| rule_value_invalid(rule_id, format!("{field} 缺少 $int 字符串")))?;
+    let bits = object
+        .get("bits")
+        .and_then(Value::as_u64)
+        .filter(|bits| (1..=64).contains(bits))
+        .ok_or_else(|| rule_value_invalid(rule_id, format!("{field}.bits 必须为 1..64")))?;
+    let signed = object
+        .get("signed")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| rule_value_invalid(rule_id, format!("{field}.signed 必须为 boolean")))?;
+    let parsed = if signed {
+        let parsed = integer
+            .parse::<i128>()
+            .map_err(|_| rule_value_invalid(rule_id, format!("{field} 的有符号整数无效")))?;
+        let minimum = -(1_i128 << (bits - 1));
+        let maximum = (1_i128 << (bits - 1)) - 1;
+        (minimum..=maximum)
+            .contains(&parsed)
+            .then_some(parsed)
+            .ok_or_else(|| rule_value_invalid(rule_id, format!("{field} 超出声明位宽")))?
+    } else {
+        let parsed = integer
+            .parse::<u128>()
+            .map_err(|_| rule_value_invalid(rule_id, format!("{field} 的无符号整数无效")))?;
+        let maximum = (1_u128 << bits) - 1;
+        let parsed = (parsed <= maximum)
+            .then_some(parsed)
+            .ok_or_else(|| rule_value_invalid(rule_id, format!("{field} 超出声明位宽")))?;
+        i128::try_from(parsed)
+            .map_err(|_| rule_value_invalid(rule_id, format!("{field} 无法参与数值比较")))?
+    };
+    Ok(RuleNumber::Integer(parsed))
+}
+
+fn compare_rule_numbers(
+    left: RuleNumber,
+    right: RuleNumber,
+    rule_id: &str,
+) -> Result<Ordering, JlinkError> {
+    match (left, right) {
+        (RuleNumber::Integer(left), RuleNumber::Integer(right)) => Ok(left.cmp(&right)),
+        (RuleNumber::Float(left), RuleNumber::Float(right)) => left
+            .partial_cmp(&right)
+            .ok_or_else(|| rule_value_invalid(rule_id, "阈值浮点比较无序")),
+        (RuleNumber::Integer(left), RuleNumber::Float(right)) => {
+            compare_mixed_number(left, right, rule_id)
+        }
+        (RuleNumber::Float(left), RuleNumber::Integer(right)) => {
+            compare_mixed_number(right, left, rule_id).map(Ordering::reverse)
+        }
+    }
+}
+
+fn compare_mixed_number(integer: i128, float: f64, rule_id: &str) -> Result<Ordering, JlinkError> {
+    safe_integer_as_f64(integer, rule_id)?
+        .partial_cmp(&float)
+        .ok_or_else(|| rule_value_invalid(rule_id, "阈值浮点比较无序"))
+}
+
+fn safe_integer_as_f64(integer: i128, rule_id: &str) -> Result<f64, JlinkError> {
+    const JSON_SAFE_INTEGER: u128 = 9_007_199_254_740_991;
+    if integer.unsigned_abs() > JSON_SAFE_INTEGER {
+        return Err(rule_value_invalid(
+            rule_id,
+            "超出 JSON 安全整数范围的整数不能与浮点阈值混合比较",
+        ));
+    }
+    integer
+        .to_string()
+        .parse::<f64>()
+        .map_err(|_| rule_value_invalid(rule_id, "JSON 安全整数无法转换为浮点比较值"))
+}
+
+fn absolute_delta_gte(
+    before: RuleNumber,
+    after: RuleNumber,
+    threshold: RuleNumber,
+    rule_id: &str,
+) -> Result<bool, JlinkError> {
+    if threshold.is_negative() {
+        return Err(rule_value_invalid(
+            rule_id,
+            "abs_delta_gte.value 不能为负数",
+        ));
+    }
+    let delta = match (before, after) {
+        (RuleNumber::Integer(before), RuleNumber::Integer(after)) => RuleNumber::Integer(
+            i128::try_from(before.abs_diff(after))
+                .map_err(|_| rule_value_invalid(rule_id, "相邻整数绝对差超出可比较范围"))?,
+        ),
+        (before, after) => {
+            let before = rule_number_as_f64(before, rule_id)?;
+            let after = rule_number_as_f64(after, rule_id)?;
+            let delta = (after - before).abs();
+            if !delta.is_finite() {
+                return Err(rule_value_invalid(rule_id, "相邻浮点绝对差不是有限值"));
+            }
+            RuleNumber::Float(delta)
+        }
+    };
+    Ok(compare_rule_numbers(delta, threshold, rule_id)? != Ordering::Less)
+}
+
+fn rule_number_as_f64(number: RuleNumber, rule_id: &str) -> Result<f64, JlinkError> {
+    match number {
+        RuleNumber::Float(value) => Ok(value),
+        RuleNumber::Integer(value) => safe_integer_as_f64(value, rule_id),
+    }
+}
+
+fn rule_value_invalid(rule_id: &str, message: impl Into<String>) -> JlinkError {
+    hss_value_invalid(message).with_detail("rule_id", json!(rule_id))
 }
 
 /// One top-level DWARF selector placed at a fixed offset in every HSS sample.
@@ -1243,7 +1628,7 @@ impl HssStartPlan {
             sample_offset = next_offset;
         }
         let frame_layout = HssFrameLayout::new(&byte_counts)?;
-        let rules = normalize_rules(rules)?;
+        let rules = normalize_hss_rules(rules)?;
         let request_fingerprint = request_fingerprint(
             duration_s,
             rate_hz,
@@ -1606,9 +1991,18 @@ fn request_fingerprint(
     Ok(sha256(&bytes))
 }
 
-fn normalize_rules(mut rules: Vec<HssThresholdRule>) -> Result<Vec<HssThresholdRule>, JlinkError> {
-    for rule in &rules {
+/// Validates and sorts one declarative HSS rule set by unique rule ID.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ValueInvalid`] for invalid paths, thresholds, value
+/// shapes, or duplicate rule IDs.
+pub fn normalize_hss_rules(
+    mut rules: Vec<HssThresholdRule>,
+) -> Result<Vec<HssThresholdRule>, JlinkError> {
+    for rule in &mut rules {
         rule.validate()?;
+        rule.normalize_path()?;
     }
     rules.sort_by(|left, right| left.id().cmp(right.id()));
     if let Some(duplicate) = rules.windows(2).find(|pair| pair[0].id() == pair[1].id()) {

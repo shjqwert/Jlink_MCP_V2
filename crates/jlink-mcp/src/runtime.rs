@@ -2,7 +2,7 @@
 
 use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
-use jlink_capture::{CaptureSnapshot, CaptureStore, overview};
+use jlink_capture::{CaptureChangesQuery, CaptureSnapshot, CaptureStore, changes, overview};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
@@ -442,6 +442,9 @@ impl Runtime {
             "query" if arguments.get("view").and_then(Value::as_str) == Some("overview") => {
                 self.overview_hss(arguments)
             }
+            "query" if arguments.get("view").and_then(Value::as_str) == Some("changes") => {
+                self.changes_hss(arguments)
+            }
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
@@ -534,6 +537,61 @@ impl Runtime {
         Ok(ToolCall::with_raw_capture(
             serde_json::to_value(result).map_err(serialization_error)?,
             &capture_id,
+        ))
+    }
+
+    fn changes_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let series = arguments.get("series").map(|value| {
+            value
+                .as_array()
+                .expect("changes.series passed MCP Schema")
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .expect("changes.series item passed MCP Schema")
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        });
+        let rules = arguments
+            .get("rules")
+            .map(|value| {
+                value
+                    .as_array()
+                    .expect("changes.rules passed MCP Schema")
+                    .iter()
+                    .cloned()
+                    .map(|rule| {
+                        serde_json::from_value::<HssThresholdRule>(rule).map_err(|error| {
+                            JlinkError::new(
+                                ErrorCode::ValueInvalid,
+                                format!("changes.rules 结构无效：{error}"),
+                                false,
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let limit =
+            arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(Ok(200_usize), |value| {
+                    usize::try_from(value).map_err(|_| {
+                        JlinkError::new(ErrorCode::ValueInvalid, "changes.limit 超出 usize", false)
+                    })
+                })?;
+        let query = CaptureChangesQuery::new(
+            series,
+            arguments.get("from_us").and_then(Value::as_u64),
+            arguments.get("to_us").and_then(Value::as_u64),
+            rules,
+            limit,
+        )?;
+        let snapshot = self.completed_snapshot(arguments)?;
+        Ok(ToolCall::success(
+            serde_json::to_value(changes(&snapshot, &query)?).map_err(serialization_error)?,
         ))
     }
 

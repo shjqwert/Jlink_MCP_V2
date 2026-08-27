@@ -41,7 +41,7 @@
 ## 5. P4 查询与发布
 
 - [x] 5.1 实现按采集 ID/`capture_key` 的状态、部分范围和只含顶层变量导航计数的 `overview`，并以主要测试 T-P4-OVERVIEW 覆盖 HSSQ-001、HSSQ-002、HSSQ-003
-- [ ] 5.2 实现精确变化、启动时/查询时同义阈值和 `[*]` 路径规则，并以主要测试 T-P4-CHANGES 覆盖 HSSQ-004
+- [x] 5.2 实现精确变化、启动时/查询时同义阈值和 `[*]` 路径规则，并以主要测试 T-P4-CHANGES 覆盖 HSSQ-004
 - [ ] 5.3 实现不丢重复值的 `window raw`、显式 `min_max`/`first_last`/`transitions` 与复用窗口边界的 `around_event`，并以主要测试 T-P4-WINDOW 覆盖 HSSQ-005、HSSQ-006
 - [ ] 5.4 实现变化区间、设备调用区间、跨时钟关系、一次性短 ID 字典和不可变快照游标，并以主要测试 T-P4-TIMELINE 覆盖 HSSQ-007、HSSQ-008、HSSQ-009
 - [ ] 5.5 实现自描述不可变原始资源、固定 MIME、版本/校验和 MCP 资源读取，确保只返回数据而不生成图片，并以主要测试 T-P4-RESOURCE 覆盖 HSSQ-010、HSSQ-011；MCP 资源合同只作为 T-P1-MCP 的端到端复核

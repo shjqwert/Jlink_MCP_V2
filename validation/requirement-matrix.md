@@ -81,7 +81,7 @@ public contract and is recorded in the implementation constraints.
 | HSSQ-001 | T-P4-OVERVIEW | `validation/p4-overview.md` status range + immutable lookup | None |
 | HSSQ-002 | T-P4-OVERVIEW | `validation/p4-overview.md` strict view Schema | None |
 | HSSQ-003 | T-P4-OVERVIEW | `validation/p4-overview.md` navigation counts + raw link | F0-D resource observation |
-| HSSQ-004 | T-P4-CHANGES | Deterministic query fixture | None |
+| HSSQ-004 | T-P4-CHANGES | `validation/p4-changes.md` deterministic Capture Store + stdio MCP fixture | None |
 | HSSQ-005 | T-P4-WINDOW | Deterministic query fixture | None |
 | HSSQ-006 | T-P4-WINDOW | Deterministic query fixture | None |
 | HSSQ-007 | T-P4-TIMELINE | Deterministic timeline fixture | F0-A clock evidence |
