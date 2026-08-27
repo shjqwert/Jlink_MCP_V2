@@ -164,6 +164,32 @@ fn t_p4_changes_keeps_exact_facts_separate_from_start_or_query_thresholds() {
 }
 
 #[test]
+fn t_p4_changes_expands_overview_top_level_series_id_to_all_leaves() {
+    let (_temporary, snapshot) = completed_capture();
+    let selected = changes(
+        &snapshot,
+        &CaptureChangesQuery::new(
+            Some(vec!["s0".to_owned()]),
+            None,
+            None,
+            Some(Vec::new()),
+            200,
+        )
+        .expect("top-level series query"),
+    )
+    .expect("expanded top-level series");
+    assert_eq!(
+        selected
+            .changes
+            .iter()
+            .map(|change| change.series.as_str())
+            .collect::<Vec<_>>(),
+        vec!["s0.0", "s0.1"]
+    );
+    assert_eq!(selected.dictionary.len(), 2);
+}
+
+#[test]
 fn t_p4_changes_evaluates_all_closed_rules_in_stable_wildcard_order() {
     let (_temporary, snapshot) = completed_capture();
     let rules = vec![

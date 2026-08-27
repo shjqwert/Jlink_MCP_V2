@@ -309,27 +309,36 @@ pub(crate) fn resolve_series(
     };
     let mut selected = BTreeSet::new();
     for request in requested {
+        let is_top_level_id = request.strip_prefix('s').is_some_and(|index| {
+            !index.is_empty()
+                && !index.contains('.')
+                && index.bytes().all(|byte| byte.is_ascii_digit())
+        });
         let matches = catalog
             .iter()
             .enumerate()
-            .filter(|(_, descriptor)| descriptor.id == *request || descriptor.path == *request)
+            .filter(|(_, descriptor)| {
+                descriptor.id == *request
+                    || descriptor.path == *request
+                    || (is_top_level_id
+                        && descriptor
+                            .id
+                            .strip_prefix(request.as_str())
+                            .is_some_and(|suffix| suffix.starts_with('.')))
+            })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => {
-                return Err(query_value_invalid("changes.series 未匹配已采集叶路径")
-                    .with_detail("series", serde_json::json!(request)));
-            }
-            [index] => {
-                selected.insert(*index);
-            }
-            _ => {
-                return Err(query_value_invalid(
-                    "changes.series 路径对应多个采集序列，请使用短 series ID",
-                )
+        if matches.is_empty() {
+            return Err(query_value_invalid("changes.series 未匹配已采集叶路径")
                 .with_detail("series", serde_json::json!(request)));
-            }
         }
+        if matches.len() > 1 && !is_top_level_id {
+            return Err(query_value_invalid(
+                "changes.series 路径对应多个采集序列，请使用短 series ID",
+            )
+            .with_detail("series", serde_json::json!(request)));
+        }
+        selected.extend(matches);
     }
     Ok(selected.into_iter().collect())
 }

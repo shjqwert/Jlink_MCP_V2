@@ -43,7 +43,7 @@
 - `openspec validate define-jlink-mcp-v1 --strict`：PASS。
 - `git diff --check`：PASS；仅报告 Git 的既有 LF/CRLF 工作副本提示，无空白错误。
 - P4 纵向 smoke 已包含在 `cargo test -p jlink-mcp --test t_p4_resource` 和 workspace 全量测试中并通过，不额外重复执行。
-- 任务/矩阵范围检查未发现 2.1-5.5 未勾选项、TBD、TODO 或 HSSQ-010/011 占位证据；5.6、5.7 保持待办。
+- 任务/矩阵范围检查未发现 2.1-5.5 未勾选项、TBD、TODO 或 HSSQ-010/011 占位证据；该检查点当时保留 5.6、5.7 待办，5.6 后续结果见 `validation/p4-client.md`。
 
 阶段末只执行一次完整 SVN 状态检查。状态仍由已登记的 IAR 输出/中间文件、计划内 `AppUserDesc.c` 和既有用户修改组成，没有 P4 新增目标工程差异；未执行 `svn commit`。冻结身份全部一致：
 
@@ -59,4 +59,4 @@
 - Capture Store magic/版本、头/块/终态编码、CRC、原始 SHA-256 或原子发布规则变化。
 - `HssStartPlan`/`AccessPlan`/目标/质量终态序列化、`sN` 顺序规则或资源 URI/MIME 变化。
 - MCP `resources/read` 内容形状、Base64 实现、Capture Store 定位或断开态读取路径变化。
-- 5.6 Windows Codex 端到端验收仍为待办；本证据不声明客户端发布验收完成。
+- 5.6 Windows Codex 端到端验收见 `validation/p4-client.md`；5.7 发布门禁仍为待办。

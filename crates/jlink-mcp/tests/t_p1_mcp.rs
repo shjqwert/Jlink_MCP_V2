@@ -151,6 +151,25 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         .iter()
         .find(|tool| tool["name"] == "jlink_hss")
         .expect("HSS tool");
+    let hss_description = hss["description"].as_str().expect("HSS description");
+    for required in [
+        "flat top-level JSON",
+        "never use query or resolution wrapper objects",
+        r#"{"action":"query","capture_id":"...","view":"overview"}"#,
+        r#""view":"changes""#,
+        r#""view":"window""#,
+        r#""mode":"raw""#,
+        r#""mode":"min_max""#,
+        r#""points":100"#,
+        r#""view":"around_event""#,
+        r#"{"action":"query","capture_id":"...","cursor":"..."}"#,
+        "omits view plus every view-specific field",
+    ] {
+        assert!(
+            hss_description.contains(required),
+            "HSS description is missing {required}"
+        );
+    }
     let window = json!({
         "action": "query",
         "capture_id": "cap_contract",

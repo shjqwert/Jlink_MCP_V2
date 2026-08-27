@@ -596,7 +596,7 @@ fn hss_tool() -> Value {
     ));
     tool_definition(
         "jlink_hss",
-        "Start a fixed-duration HSS capture, recover its status, or query immutable captured data.",
+        r#"Start a fixed-duration HSS capture or inspect capture status. All status/query fields are flat top-level JSON; never use query or resolution wrapper objects. Each status/query uses exactly one identity, capture_id or capture_key; examples below use capture_id. Immutable query skeletons: overview={"action":"query","capture_id":"...","view":"overview"}; changes={"action":"query","capture_id":"...","view":"changes","series":["s0"],"from_us":0,"to_us":1000,"rules":[],"limit":100}; raw/transitions window={"action":"query","capture_id":"...","view":"window","series":["s0"],"from_us":0,"to_us":1000,"mode":"raw","limit":100}; min_max/first_last window uses the same flat fields with "mode":"min_max" and required "points":100; around_event={"action":"query","capture_id":"...","view":"around_event","event_id":"e0","before_us":1000,"after_us":1000,"limit":100}; cursor continuation={"action":"query","capture_id":"...","cursor":"..."} and omits view plus every view-specific field."#,
         action_union(variants),
         hss_output_schema(),
         annotations(false, true, true),

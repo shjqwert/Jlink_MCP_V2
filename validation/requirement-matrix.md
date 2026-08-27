@@ -28,7 +28,7 @@ public contract and is recorded in the implementation constraints.
 | MCP-002 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
 | MCP-003 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
 | MCP-004 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | None |
-| MCP-005 | T-P1-MCP | `validation/p1-mcp.md` + Windows Codex | F0-D |
+| MCP-005 | T-P1-MCP | `validation/p1-mcp.md` + `validation/p4-client.md` Windows Codex | F0-D |
 | CFG-001 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
 | CFG-002 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
 | CFG-003 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
@@ -80,15 +80,15 @@ public contract and is recorded in the implementation constraints.
 | HSSA-011 | T-P3-QUALITY | `validation/p3-quality.md` clock fixture + `validation/p3-stage.md` hardware clock | F0-A |
 | HSSQ-001 | T-P4-OVERVIEW | `validation/p4-overview.md` status range + immutable lookup | None |
 | HSSQ-002 | T-P4-OVERVIEW | `validation/p4-overview.md` strict view Schema | None |
-| HSSQ-003 | T-P4-OVERVIEW | `validation/p4-overview.md` navigation counts + raw link | F0-D resource observation |
+| HSSQ-003 | T-P4-OVERVIEW | `validation/p4-overview.md` navigation counts + `validation/p4-client.md` raw link | F0-D resource observation |
 | HSSQ-004 | T-P4-CHANGES | `validation/p4-changes.md` deterministic Capture Store + stdio MCP fixture | None |
 | HSSQ-005 | T-P4-WINDOW | `validation/p4-window.md` raw/transition/aggregate immutable fixture | None |
 | HSSQ-006 | T-P4-WINDOW | `validation/p4-window.md` event-neighborhood + reusable bounds fixture | None |
 | HSSQ-007 | T-P4-TIMELINE | `validation/p4-timeline.md` interval + uncertainty relation fixture | F0-A clock evidence |
 | HSSQ-008 | T-P4-TIMELINE | `validation/p4-timeline.md` incremental dictionary pages | None |
-| HSSQ-009 | T-P4-TIMELINE | `validation/p4-timeline.md` cursor binding/tamper/expiry fixture | None |
-| HSSQ-010 | T-P4-RESOURCE | `validation/p4-resource.md` immutable full-file/read-after-disconnect/checksum fixture | F0-A format + F0-D link |
-| HSSQ-011 | T-P4-RESOURCE | `validation/p4-resource.md` binary-data/no-image + P4 stage smoke | F0-D |
+| HSSQ-009 | T-P4-TIMELINE | `validation/p4-timeline.md` cursor binding/tamper/expiry fixture + `validation/p4-client.md` pagination | None |
+| HSSQ-010 | T-P4-RESOURCE | `validation/p4-resource.md` immutable full-file/read-after-disconnect/checksum fixture + `validation/p4-client.md` | F0-A format + F0-D link |
+| HSSQ-011 | T-P4-RESOURCE | `validation/p4-resource.md` binary-data/no-image + `validation/p4-client.md` | F0-D |
 
 ## Stage smoke and evidence reuse
 
