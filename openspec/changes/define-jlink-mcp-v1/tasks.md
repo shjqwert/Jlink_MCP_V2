@@ -29,7 +29,7 @@
 
 ## 4. P3 HSS 采集
 
-- [ ] 4.1 将 F0-A 冻结的 `GetCaps/Start/Read/Stop` 结构体、标志位和帧解析收敛为最小动态 FFI，并以主要测试 T-P3-ABI 覆盖 RUN-006；HSS 启动能力诊断只作为集成观察
+- [x] 4.1 将 F0-A 冻结的 `GetCaps/Start/Read/Stop` 结构体、标志位和帧解析收敛为最小动态 FFI，并以主要测试 T-P3-ABI 覆盖 RUN-006；HSS 启动能力诊断只作为集成观察，证据见 `validation/p3-abi.md`
 - [ ] 4.2 实现带 `capture_key` 的固定时长请求、1–10 个顶层 DWARF 选择项、1–1000 Hz 目标频率、展开帧上限和启动预检，并以主要测试 T-P3-START 覆盖 HSSA-001、HSSA-002、HSSA-003
 - [ ] 4.3 实现 HSS 优先的串行调度、持续排空、内部 Stop、尾部排空及变量/RAM/MMIO 写入交错，并记录排空、写入排队和执行阶段耗时；以主要测试 T-P3-RUN 覆盖 RUN-002、HSSA-004、HSSA-008、DBG-007
 - [ ] 4.4 实现生命周期与完整性双状态机、确定的 failed/aborted 边界、失败数据保留和恢复通知，并以主要测试 T-P3-STATE 覆盖 HSSA-005

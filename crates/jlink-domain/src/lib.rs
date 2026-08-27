@@ -3,6 +3,7 @@
 mod core;
 mod dwarf;
 mod error;
+mod hss;
 mod image;
 mod ipc;
 mod memory;
@@ -17,6 +18,10 @@ pub use dwarf::{
     ScalarEncoding, SelectorStep, VariableSelector,
 };
 pub use error::{ErrorCode, JlinkError};
+pub use hss::{
+    HSS_BLOCK_FLAGS_DEFAULT, HSS_START_FLAG_TIMESTAMP_US_EXPERIMENTAL,
+    HSS_START_FLAGS_698A_MAINLINE, HssFrameBatch, HssFrameLayout, HssRawFrame,
+};
 pub use image::{
     FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,
     FirmwareSegmentFingerprint,

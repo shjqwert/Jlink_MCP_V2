@@ -262,6 +262,7 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::FlashRangeInvalid => "FLASH_RANGE_INVALID",
         ErrorCode::RegisterNotFound => "REGISTER_NOT_FOUND",
         ErrorCode::VerifyFailed => "VERIFY_FAILED",
+        ErrorCode::FrameInvalid => "FRAME_INVALID",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
@@ -1021,4 +1022,26 @@ fn byte_string_schema() -> Value {
 
 fn typed_value_schema() -> Value {
     json!({ "type": ["boolean", "number", "object", "array"] })
+}
+
+#[cfg(test)]
+mod tests {
+    use jlink_domain::{ErrorCode, JlinkError};
+
+    use super::public_tool_error;
+
+    #[test]
+    fn frame_invalid_remains_a_structured_public_error() {
+        let result = public_tool_error(JlinkError::new(
+            ErrorCode::FrameInvalid,
+            "HSS frame tail is invalid",
+            false,
+        ))
+        .expect("FRAME_INVALID is part of the public error contract");
+
+        assert_eq!(
+            result["structuredContent"]["error"]["code"],
+            "FRAME_INVALID"
+        );
+    }
 }

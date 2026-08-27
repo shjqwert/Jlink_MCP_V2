@@ -67,6 +67,8 @@ pub enum ErrorCode {
     RegisterNotFound,
     /// Target Flash readback differs from the requested image.
     VerifyFailed,
+    /// Raw HSS bytes cannot be interpreted as the frozen frame layout.
+    FrameInvalid,
 }
 
 impl ErrorCode {
@@ -104,6 +106,7 @@ impl ErrorCode {
             Self::FlashRangeInvalid => "FLASH_RANGE_INVALID",
             Self::RegisterNotFound => "REGISTER_NOT_FOUND",
             Self::VerifyFailed => "VERIFY_FAILED",
+            Self::FrameInvalid => "FRAME_INVALID",
         }
     }
 }

@@ -39,7 +39,7 @@ public contract and is recorded in the implementation constraints.
 | RUN-003 | T-P1-IPC | `validation/p1-stage.md` Windows process integration | F0-B |
 | RUN-004 | T-P3-RECOVER | Windows process integration | F0-B |
 | RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
-| RUN-006 | T-P3-ABI | J-Link hardware/DLL exports | F0-A |
+| RUN-006 | T-P3-ABI | `validation/p3-abi.md` frozen DLL exports/ABI/raw-frame fixture | F0-A |
 | SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A identity |
 | SES-002 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A |
 | SES-003 | T-P1-SES | `validation/p1-ses.md` hardware state recovery | F0-A |

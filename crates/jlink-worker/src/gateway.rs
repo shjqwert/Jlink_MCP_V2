@@ -1,5 +1,5 @@
 use std::{
-    ffi::{CStr, CString, c_char},
+    ffi::{CStr, CString, c_char, c_void},
     marker::PhantomData,
     mem,
     os::windows::ffi::OsStrExt,
@@ -74,6 +74,9 @@ type EraseChipFn = unsafe extern "C" fn() -> i32;
 #[cfg(test)]
 type WriteU32Fn = unsafe extern "C" fn(u32, u32) -> i32;
 type HssGetCapsFn = unsafe extern "C" fn(*mut HssCaps) -> i32;
+type HssStartFn = unsafe extern "C" fn(*mut HssBlock, i32, i32, i32) -> i32;
+type HssReadFn = unsafe extern "C" fn(*mut c_void, u32) -> i32;
+type HssStopFn = unsafe extern "C" fn() -> i32;
 
 struct DllDiagnosticBuffer {
     bytes: [u8; DLL_DIAGNOSTIC_BYTES],
@@ -173,11 +176,55 @@ fn attach_dll_diagnostics(mut error: JlinkError) -> JlinkError {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+struct HssBlock {
+    address: u32,
+    byte_count: u32,
+    flags: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 struct HssCaps {
     max_blocks: u32,
     max_frequency_hz: u32,
     flags: u32,
     reserved: [u32; 5],
+}
+
+struct HssApi {
+    get_caps: Option<HssGetCapsFn>,
+    start: Option<HssStartFn>,
+    read: Option<HssReadFn>,
+    stop: Option<HssStopFn>,
+}
+
+impl HssApi {
+    fn load(module: HMODULE) -> Self {
+        Self {
+            get_caps: load_optional_symbol(module, b"JLINK_HSS_GetCaps\0"),
+            start: load_optional_symbol(module, b"JLINK_HSS_Start\0"),
+            read: load_optional_symbol(module, b"JLINK_HSS_Read\0"),
+            stop: load_optional_symbol(module, b"JLINK_HSS_Stop\0"),
+        }
+    }
+
+    fn missing_exports(&self) -> Vec<&'static str> {
+        let mut missing = Vec::new();
+        if self.get_caps.is_none() {
+            missing.push("JLINK_HSS_GetCaps");
+        }
+        if self.start.is_none() {
+            missing.push("JLINK_HSS_Start");
+        }
+        if self.read.is_none() {
+            missing.push("JLINK_HSS_Read");
+        }
+        if self.stop.is_none() {
+            missing.push("JLINK_HSS_Stop");
+        }
+        missing
+    }
 }
 
 #[repr(C)]
@@ -256,7 +303,7 @@ struct Api {
     erase_chip: EraseChipFn,
     #[cfg(test)]
     write_u32: WriteU32Fn,
-    hss_get_caps: HssGetCapsFn,
+    hss: HssApi,
 }
 
 impl Api {
@@ -293,7 +340,7 @@ impl Api {
             erase_chip: load_symbol(module, b"JLINK_EraseChip\0")?,
             #[cfg(test)]
             write_u32: load_symbol(module, b"JLINKARM_WriteU32\0")?,
-            hss_get_caps: load_symbol(module, b"JLINK_HSS_GetCaps\0")?,
+            hss: HssApi::load(module),
         })
     }
 }
@@ -313,6 +360,15 @@ fn load_symbol<T: Copy>(module: HMODULE, name: &'static [u8]) -> Result<T, Jlink
     debug_assert_eq!(mem::size_of::<T>(), mem::size_of_val(&symbol));
     // SAFETY: each call site supplies the ABI exercised by the frozen 6.98a evidence.
     Ok(unsafe { mem::transmute_copy(&symbol) })
+}
+
+fn load_optional_symbol<T: Copy>(module: HMODULE, name: &'static [u8]) -> Option<T> {
+    // SAFETY: `module` is live and `name` is a static NUL-terminated export name.
+    let symbol = unsafe { GetProcAddress(module, name.as_ptr()) }?;
+    debug_assert_eq!(mem::size_of::<T>(), mem::size_of_val(&symbol));
+    // SAFETY: each HSS signature is frozen by F0-A and T-P3-ABI. Absence remains
+    // local to HSS capability instead of preventing ordinary DLL use.
+    Some(unsafe { mem::transmute_copy(&symbol) })
 }
 
 pub(crate) struct TargetObservation {
@@ -1269,18 +1325,32 @@ impl DllGateway {
                 "确认目标正在运行且支持后台内存访问",
             ),
         });
-        let mut caps = HssCaps::default();
-        // SAFETY: `caps` is writable and the frozen 6.98a ABI was verified in F0-A.
-        let hss_result = unsafe { (self.api.hss_get_caps)(&raw mut caps) };
-        checks.push(check(
-            ValidationCheckKind::HssCapability,
-            hss_result >= 0 && caps.max_blocks > 0 && caps.max_frequency_hz > 0,
-            format!(
-                "return={hss_result}，max_blocks={}，max_frequency_hz={}，flags={}",
-                caps.max_blocks, caps.max_frequency_hz, caps.flags
-            ),
-            "确认使用冻结的 J-Link 6.98a DLL、已连接目标和支持 HSS 的探针",
-        ));
+        let missing_hss_exports = self.api.hss.missing_exports();
+        if missing_hss_exports.is_empty() {
+            let mut caps = HssCaps::default();
+            let get_caps = self
+                .api
+                .hss
+                .get_caps
+                .expect("complete HSS export set contains GetCaps");
+            // SAFETY: `caps` is writable and the frozen 6.98a ABI was verified in F0-A.
+            let hss_result = unsafe { get_caps(&raw mut caps) };
+            checks.push(check(
+                ValidationCheckKind::HssCapability,
+                hss_result >= 0 && caps.max_blocks > 0 && caps.max_frequency_hz > 0,
+                format!(
+                    "return={hss_result}，max_blocks={}，max_frequency_hz={}，flags={}",
+                    caps.max_blocks, caps.max_frequency_hz, caps.flags
+                ),
+                "确认使用冻结的 J-Link 6.98a DLL、已连接目标和支持 HSS 的探针",
+            ));
+        } else {
+            checks.push(failed_check(
+                ValidationCheckKind::HssCapability,
+                format!("缺少 HSS 导出：{}", missing_hss_exports.join(", ")),
+                "使用包含 GetCaps/Start/Read/Stop 的冻结 J-Link DLL；普通调试能力不受影响",
+            ));
+        }
         ValidationReport {
             valid: checks.iter().all(|item| item.passed),
             checks,
@@ -1456,7 +1526,7 @@ fn test_injection_error(message: impl Into<String>) -> JlinkError {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, env, path::PathBuf};
+    use std::{cell::Cell, env, ffi::c_void, mem, path::PathBuf};
 
     use jlink_domain::{
         CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
@@ -1464,14 +1534,71 @@ mod tests {
     };
 
     use super::{
-        DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway,
-        classify_observed_target_state, require_flash_reset_halted, validate_exec_command_result,
-        validate_read_mem_result,
+        DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
+        HssCaps, classify_observed_target_state, require_flash_reset_halted,
+        validate_exec_command_result, validate_read_mem_result,
     };
+
+    unsafe extern "C" fn hss_get_caps_stub(_caps: *mut HssCaps) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn hss_start_stub(
+        _blocks: *mut HssBlock,
+        _block_count: i32,
+        _period_us: i32,
+        _flags: i32,
+    ) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn hss_read_stub(_buffer: *mut c_void, _buffer_bytes: u32) -> i32 {
+        0
+    }
+
+    unsafe extern "C" fn hss_stop_stub() -> i32 {
+        0
+    }
 
     #[test]
     fn frozen_x64_device_info_prefix_is_568_bytes() {
         assert_eq!(std::mem::size_of::<DeviceInfo>(), 568);
+    }
+
+    #[test]
+    fn t_p3_abi_matches_frozen_hss_structures_and_function_signatures() {
+        assert_eq!(mem::size_of::<HssBlock>(), 16);
+        assert_eq!(mem::align_of::<HssBlock>(), 4);
+        assert_eq!(mem::offset_of!(HssBlock, address), 0);
+        assert_eq!(mem::offset_of!(HssBlock, byte_count), 4);
+        assert_eq!(mem::offset_of!(HssBlock, flags), 8);
+        assert_eq!(mem::offset_of!(HssBlock, reserved), 12);
+
+        assert_eq!(mem::size_of::<HssCaps>(), 32);
+        assert_eq!(mem::align_of::<HssCaps>(), 4);
+        assert_eq!(mem::offset_of!(HssCaps, max_blocks), 0);
+        assert_eq!(mem::offset_of!(HssCaps, max_frequency_hz), 4);
+        assert_eq!(mem::offset_of!(HssCaps, flags), 8);
+        assert_eq!(mem::offset_of!(HssCaps, reserved), 12);
+
+        let api = HssApi {
+            get_caps: Some(hss_get_caps_stub),
+            start: Some(hss_start_stub),
+            read: Some(hss_read_stub),
+            stop: Some(hss_stop_stub),
+        };
+        assert!(api.missing_exports().is_empty());
+    }
+
+    #[test]
+    fn t_p3_abi_reports_only_missing_hss_exports() {
+        let api = HssApi {
+            get_caps: Some(hss_get_caps_stub),
+            start: None,
+            read: None,
+            stop: Some(hss_stop_stub),
+        };
+        assert_eq!(api.missing_exports(), ["JLINK_HSS_Start", "JLINK_HSS_Read"]);
     }
 
     #[test]
@@ -1554,6 +1681,17 @@ mod tests {
         assert!(output.ends_with("[diagnostics truncated]"));
         assert_eq!(diagnostics.len, 0);
         assert!(!diagnostics.truncated);
+    }
+
+    #[test]
+    #[ignore = "requires the explicitly fingerprinted J-Link 6.98a DLL"]
+    fn t_p3_abi_frozen_dll_has_required_hss_exports() {
+        let path = PathBuf::from(
+            env::var("JLINK_MCP_T_P3_ABI_DLL")
+                .expect("JLINK_MCP_T_P3_ABI_DLL must name the frozen DLL"),
+        );
+        let gateway = DllGateway::load(&path).expect("load frozen DLL");
+        assert!(gateway.api.hss.missing_exports().is_empty());
     }
 
     #[test]
