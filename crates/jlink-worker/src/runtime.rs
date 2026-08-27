@@ -9,8 +9,8 @@ use std::{
 };
 
 use jlink_domain::{
-    ErrorCode, IpcRequest, IpcResponse, JlinkError, ProtocolVersion, SessionCommand,
-    probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+    DebugRequest, ErrorCode, HssWriteKind, IpcRequest, IpcResponse, JlinkError, ProtocolVersion,
+    SessionCommand, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
 };
 use serde_json::json;
 use windows_sys::Win32::{
@@ -442,10 +442,14 @@ impl WorkerRuntime {
                     false,
                 )
             })?;
-            let write = debug.may_interleave_during_hss();
-            let token = if write {
+            let write_kind = match &debug {
+                DebugRequest::WriteMemory { .. } => Some(HssWriteKind::MemoryWrite),
+                DebugRequest::WriteVariable { .. } => Some(HssWriteKind::VariableWrite),
+                _ => None,
+            };
+            let token = if let Some(kind) = write_kind {
                 self.hss
-                    .begin_write(request_id.as_str(), queued_at, Instant::now())?
+                    .begin_write(request_id.as_str(), kind, queued_at, Instant::now())?
             } else {
                 None
             };

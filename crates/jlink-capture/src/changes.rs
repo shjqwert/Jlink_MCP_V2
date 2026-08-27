@@ -142,12 +142,12 @@ pub fn changes(
 }
 
 #[derive(Clone, Debug)]
-struct SeriesDescriptor {
-    id: String,
-    path: String,
+pub(crate) struct SeriesDescriptor {
+    pub(crate) id: String,
+    pub(crate) path: String,
     top_level: usize,
     value_steps: Vec<ValueStep>,
-    numeric: bool,
+    pub(crate) numeric: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -163,7 +163,9 @@ struct LeafDescriptor {
     numeric: bool,
 }
 
-fn series_catalog(snapshot: &CaptureSnapshot) -> Result<Vec<SeriesDescriptor>, JlinkError> {
+pub(crate) fn series_catalog(
+    snapshot: &CaptureSnapshot,
+) -> Result<Vec<SeriesDescriptor>, JlinkError> {
     let mut catalog = Vec::new();
     for (top_level, variable) in snapshot.plan().variables().iter().enumerate() {
         let base = variable.access_plan().selector().path();
@@ -264,7 +266,7 @@ fn append_layout_leaves(
     Ok(())
 }
 
-fn normalize_series_selection(series: Vec<String>) -> Result<Vec<String>, JlinkError> {
+pub(crate) fn normalize_series_selection(series: Vec<String>) -> Result<Vec<String>, JlinkError> {
     if series.is_empty() {
         return Err(query_value_invalid("changes.series 不能为空数组"));
     }
@@ -289,7 +291,7 @@ fn normalize_series_selection(series: Vec<String>) -> Result<Vec<String>, JlinkE
     Ok(normalized)
 }
 
-fn resolve_series(
+pub(crate) fn resolve_series(
     catalog: &[SeriesDescriptor],
     requested: Option<&[String]>,
 ) -> Result<Vec<usize>, JlinkError> {
@@ -510,7 +512,7 @@ fn append_pair_rows(
 }
 
 impl SeriesDescriptor {
-    fn value<'a>(&self, decoded: &'a [Value]) -> Result<&'a Value, JlinkError> {
+    pub(crate) fn value<'a>(&self, decoded: &'a [Value]) -> Result<&'a Value, JlinkError> {
         let mut value = decoded
             .get(self.top_level)
             .ok_or_else(|| query_frame_invalid("HSS 顶层解码值缺失"))?;
@@ -528,7 +530,10 @@ impl SeriesDescriptor {
     }
 }
 
-fn decode_frame(variables: &[HssVariablePlan], sample: &[u8]) -> Result<Vec<Value>, JlinkError> {
+pub(crate) fn decode_frame(
+    variables: &[HssVariablePlan],
+    sample: &[u8],
+) -> Result<Vec<Value>, JlinkError> {
     variables
         .iter()
         .map(|variable| {
@@ -549,7 +554,7 @@ fn decode_frame(variables: &[HssVariablePlan], sample: &[u8]) -> Result<Vec<Valu
         .collect()
 }
 
-fn validate_complete_frames(
+pub(crate) fn validate_complete_frames(
     snapshot: &CaptureSnapshot,
     batch: &jlink_domain::HssFrameBatch<'_>,
 ) -> Result<(), JlinkError> {

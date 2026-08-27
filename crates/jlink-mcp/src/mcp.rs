@@ -543,7 +543,7 @@ fn hss_tool() -> Value {
             "query",
             &[
                 ("view", json!({ "const": "window" })),
-                ("series", string_array()),
+                ("series", non_empty_unique_string_array()),
                 ("from_us", non_negative_integer()),
                 ("to_us", positive_integer()),
                 ("mode", json!({ "const": mode })),
@@ -557,11 +557,11 @@ fn hss_tool() -> Value {
             "query",
             &[
                 ("view", json!({ "const": "window" })),
-                ("series", string_array()),
+                ("series", non_empty_unique_string_array()),
                 ("from_us", non_negative_integer()),
                 ("to_us", positive_integer()),
                 ("mode", json!({ "const": mode })),
-                ("points", positive_integer()),
+                ("points", bounded_integer(1, 1_000)),
                 ("limit", bounded_integer(1, 1_000)),
             ],
             &["view", "series", "from_us", "to_us", "mode", "points"],
@@ -699,6 +699,9 @@ fn hss_output_schema() -> Value {
         hss_status_output_schema(),
         hss_overview_output_schema(),
         hss_changes_output_schema(),
+        hss_window_rows_output_schema(),
+        hss_window_buckets_output_schema(),
+        hss_around_event_output_schema(),
         hss_completed_start_output_schema(),
         closed_object(vec![("error", error_schema())], &["error"]),
     ])
@@ -722,6 +725,16 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
         {
             "overview" => hss_overview_output_schema(),
             "changes" => hss_changes_output_schema(),
+            "window" => match arguments
+                .get("mode")
+                .and_then(Value::as_str)
+                .expect("window query Schema guarantees mode")
+            {
+                "raw" | "transitions" => hss_window_rows_output_schema(),
+                "min_max" | "first_last" => hss_window_buckets_output_schema(),
+                _ => unreachable!("window mode passed closed MCP Schema"),
+            },
+            "around_event" => hss_around_event_output_schema(),
             _ => hss_output_schema(),
         },
         _ => unreachable!("HSS action was validated against the closed catalog"),
@@ -801,19 +814,7 @@ fn hss_changes_output_schema() -> Value {
             ),
             (
                 "changes",
-                json!({
-                    "type": "array",
-                    "items": closed_object(
-                        vec![
-                            ("series", non_empty_string()),
-                            ("after_us", non_negative_integer()),
-                            ("observed_by_us", non_negative_integer()),
-                            ("from", typed_value_schema()),
-                            ("to", typed_value_schema()),
-                        ],
-                        &["series", "after_us", "observed_by_us", "from", "to"],
-                    )
-                }),
+                json!({ "type": "array", "items": hss_change_item_schema() }),
             ),
             (
                 "matches",
@@ -834,6 +835,156 @@ fn hss_changes_output_schema() -> Value {
         ],
         &["dictionary", "changes", "matches", "truncated"],
     )
+}
+
+fn hss_change_item_schema() -> Value {
+    closed_object(
+        vec![
+            ("series", non_empty_string()),
+            ("after_us", non_negative_integer()),
+            ("observed_by_us", non_negative_integer()),
+            ("from", typed_value_schema()),
+            ("to", typed_value_schema()),
+        ],
+        &["series", "after_us", "observed_by_us", "from", "to"],
+    )
+}
+
+fn hss_window_rows_output_schema() -> Value {
+    closed_object(
+        vec![
+            ("clock", json!({ "const": "sample" })),
+            ("dictionary", hss_series_dictionary_schema()),
+            (
+                "time_us",
+                json!({ "type": "array", "items": non_negative_integer() }),
+            ),
+            (
+                "values",
+                json!({
+                    "type": "object",
+                    "additionalProperties": {
+                        "type": "array",
+                        "items": typed_value_schema()
+                    }
+                }),
+            ),
+            ("truncated", boolean()),
+        ],
+        &["clock", "dictionary", "time_us", "values", "truncated"],
+    )
+}
+
+fn hss_window_buckets_output_schema() -> Value {
+    closed_object(
+        vec![
+            ("clock", json!({ "const": "sample" })),
+            ("dictionary", hss_series_dictionary_schema()),
+            (
+                "buckets",
+                json!({
+                    "type": "array",
+                    "items": closed_object(
+                        vec![
+                            ("from_us", non_negative_integer()),
+                            ("to_us", positive_integer()),
+                            (
+                                "values",
+                                json!({
+                                    "type": "object",
+                                    "additionalProperties": {
+                                        "type": "array",
+                                        "minItems": 2,
+                                        "maxItems": 2,
+                                        "items": typed_value_schema()
+                                    }
+                                }),
+                            ),
+                        ],
+                        &["from_us", "to_us", "values"],
+                    )
+                }),
+            ),
+            ("truncated", boolean()),
+        ],
+        &["clock", "dictionary", "buckets", "truncated"],
+    )
+}
+
+fn hss_around_event_output_schema() -> Value {
+    closed_object(
+        vec![
+            ("event", hss_capture_event_schema()),
+            (
+                "window",
+                closed_object(
+                    vec![
+                        ("from_us", non_negative_integer()),
+                        ("to_us", positive_integer()),
+                    ],
+                    &["from_us", "to_us"],
+                ),
+            ),
+            ("dictionary", hss_series_dictionary_schema()),
+            (
+                "changes",
+                json!({ "type": "array", "items": hss_change_item_schema() }),
+            ),
+            ("quality", hss_quality_events_schema()),
+            ("truncated", boolean()),
+        ],
+        &[
+            "event",
+            "window",
+            "dictionary",
+            "changes",
+            "quality",
+            "truncated",
+        ],
+    )
+}
+
+fn hss_capture_event_schema() -> Value {
+    let host_time = || {
+        closed_object(
+            vec![
+                ("clock", json!({ "const": "host" })),
+                ("us", non_negative_integer()),
+            ],
+            &["clock", "us"],
+        )
+    };
+    closed_object(
+        vec![
+            ("id", non_empty_string()),
+            (
+                "kind",
+                string_enum(&[
+                    "target_write",
+                    "memory_write",
+                    "variable_write",
+                    "quality_buffer_overflow",
+                    "quality_short_frame",
+                    "quality_frame_format",
+                    "quality_sample_interval",
+                    "quality_clock_regression",
+                    "recovery_stop_completed_after_failure",
+                    "recovery_partial_data_retained",
+                    "recovery_aborted_capture",
+                ]),
+            ),
+            ("start", host_time()),
+            ("end", host_time()),
+            ("request_id", non_empty_string()),
+            ("outcome", string_enum(&["succeeded", "failed"])),
+            ("error_code", non_empty_string()),
+        ],
+        &["id", "kind", "start", "end"],
+    )
+}
+
+fn hss_series_dictionary_schema() -> Value {
+    json!({ "type": "object", "additionalProperties": non_empty_string() })
 }
 
 fn hss_overview_variables_schema() -> Value {

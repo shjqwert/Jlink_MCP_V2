@@ -28,8 +28,8 @@ pub use hss::{
     HssQualityBasis, HssQualityEvent, HssQualityEventKind, HssQualityEvidence, HssQualitySummary,
     HssQualityTracker, HssRawFrame, HssRecoveryNotification, HssReservationOutcome, HssReturnWhen,
     HssRunSnapshot, HssRunState, HssSourceTimeUnit, HssStartPlan, HssStartRegistry,
-    HssThresholdRule, HssVariablePlan, HssWriteResult, HssWriteTiming, normalize_hss_rules,
-    normalize_hss_timestamp_us,
+    HssThresholdRule, HssVariablePlan, HssWriteKind, HssWriteResult, HssWriteTiming,
+    compare_numeric_typed_values, normalize_hss_rules, normalize_hss_timestamp_us,
 };
 pub use image::{
     FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,

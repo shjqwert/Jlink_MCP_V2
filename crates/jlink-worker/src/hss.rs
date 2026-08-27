@@ -8,7 +8,7 @@ use jlink_capture::{CapturePhase, CaptureRecovery, CaptureSnapshot, CaptureStore
 use jlink_domain::{
     ErrorCode, HssCaptureReservation, HssCaptureState, HssDrainTiming, HssQualitySummary,
     HssQualityTracker, HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState,
-    HssStartPlan, HssStartRegistry, HssWriteResult, HssWriteTiming, JlinkError,
+    HssStartPlan, HssStartRegistry, HssWriteKind, HssWriteResult, HssWriteTiming, JlinkError,
     TargetConnectionSpec,
 };
 use serde_json::json;
@@ -509,6 +509,7 @@ impl HssCoordinator {
     pub(crate) fn begin_write(
         &mut self,
         request_id: &str,
+        kind: HssWriteKind,
         requested_at: Instant,
         started_at: Instant,
     ) -> Result<Option<HssWriteToken>, JlinkError> {
@@ -532,6 +533,7 @@ impl HssCoordinator {
         let index = active.writes.len();
         active.writes.push(HssWriteTiming {
             request_id: request_id.to_owned(),
+            kind,
             requested_at_us: instant_offset_us(active.started, requested_at),
             started_at_us: instant_offset_us(active.started, started_at),
             completed_at_us: instant_offset_us(active.started, started_at),
@@ -731,8 +733,8 @@ mod tests {
         AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssClockMappingMethod,
         HssDataIntegrity, HssNormalizedTimeUnit, HssQualityBasis, HssQualityEventKind,
         HssQualityEvidence, HssRecoveryNotification, HssReturnWhen, HssRunSnapshot, HssRunState,
-        HssSourceTimeUnit, HssStartPlan, HssWriteResult, ScalarEncoding, TargetConnectionSpec,
-        VariableSelector,
+        HssSourceTimeUnit, HssStartPlan, HssWriteKind, HssWriteResult, ScalarEncoding,
+        TargetConnectionSpec, VariableSelector,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -1004,6 +1006,7 @@ mod tests {
         let token = coordinator
             .begin_write(
                 "write-1",
+                HssWriteKind::MemoryWrite,
                 started + Duration::from_millis(101),
                 started + Duration::from_millis(102),
             )
@@ -1042,6 +1045,7 @@ mod tests {
         assert_eq!(snapshot.state, HssRunState::Completed);
         assert_eq!(snapshot.complete_records, 2);
         assert_eq!(snapshot.writes.len(), 1);
+        assert_eq!(snapshot.writes[0].kind, HssWriteKind::MemoryWrite);
         assert_eq!(snapshot.writes[0].samples_before, 1);
         assert_eq!(snapshot.writes[0].samples_after_next_drain, Some(2));
         assert_eq!(

@@ -972,12 +972,28 @@ pub enum HssWriteResult {
     },
 }
 
+/// Retained target-write category used by immutable timeline and event queries.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssWriteKind {
+    /// Backward-compatible category for captures created before write kind was retained.
+    #[default]
+    TargetWrite,
+    /// Raw memory or MMIO write.
+    MemoryWrite,
+    /// DWARF-resolved typed variable write.
+    VariableWrite,
+}
+
 /// Queue, execution, and next-drain evidence for one interleaved write.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HssWriteTiming {
     /// IPC request correlated with this target write.
     pub request_id: String,
+    /// Retained write category; old capture manifests default to `target_write`.
+    #[serde(default)]
+    pub kind: HssWriteKind,
     /// Time since capture start when the listener accepted the request.
     pub requested_at_us: u64,
     /// Time since capture start when the DLL scheduler began the write.
@@ -1458,6 +1474,20 @@ fn compare_rule_numbers(
             compare_mixed_number(right, left, rule_id).map(Ordering::reverse)
         }
     }
+}
+
+/// Compares two numeric `TypedValue` instances without silently losing integer precision.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ValueInvalid`] when either value is non-numeric or an
+/// integer/float comparison cannot be represented safely.
+pub fn compare_numeric_typed_values(left: &Value, right: &Value) -> Result<Ordering, JlinkError> {
+    compare_rule_numbers(
+        parse_rule_number(left, "typed-value-comparison", "left")?,
+        parse_rule_number(right, "typed-value-comparison", "right")?,
+        "typed-value-comparison",
+    )
 }
 
 fn compare_mixed_number(integer: i128, float: f64, rule_id: &str) -> Result<Ordering, JlinkError> {

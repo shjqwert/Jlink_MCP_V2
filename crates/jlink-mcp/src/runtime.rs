@@ -2,7 +2,10 @@
 
 use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 
-use jlink_capture::{CaptureChangesQuery, CaptureSnapshot, CaptureStore, changes, overview};
+use jlink_capture::{
+    CaptureChangesQuery, CaptureSnapshot, CaptureStore, CaptureWindowMode, CaptureWindowQuery,
+    around_event, changes, overview, window,
+};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
@@ -445,6 +448,12 @@ impl Runtime {
             "query" if arguments.get("view").and_then(Value::as_str) == Some("changes") => {
                 self.changes_hss(arguments)
             }
+            "query" if arguments.get("view").and_then(Value::as_str) == Some("window") => {
+                self.window_hss(arguments)
+            }
+            "query" if arguments.get("view").and_then(Value::as_str) == Some("around_event") => {
+                self.around_event_hss(arguments)
+            }
             action => Ok(ToolCall::Unavailable(format!(
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
@@ -592,6 +601,106 @@ impl Runtime {
         let snapshot = self.completed_snapshot(arguments)?;
         Ok(ToolCall::success(
             serde_json::to_value(changes(&snapshot, &query)?).map_err(serialization_error)?,
+        ))
+    }
+
+    fn window_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let series = arguments
+            .get("series")
+            .and_then(Value::as_array)
+            .expect("window.series passed MCP Schema")
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .expect("window.series item passed MCP Schema")
+                    .to_owned()
+            })
+            .collect();
+        let mode = match arguments
+            .get("mode")
+            .and_then(Value::as_str)
+            .expect("window.mode passed MCP Schema")
+        {
+            "raw" => CaptureWindowMode::Raw,
+            "transitions" => CaptureWindowMode::Transitions,
+            "min_max" => CaptureWindowMode::MinMax {
+                points: usize::try_from(
+                    arguments["points"]
+                        .as_u64()
+                        .expect("window.points passed MCP Schema"),
+                )
+                .map_err(|_| {
+                    JlinkError::new(ErrorCode::ValueInvalid, "window.points 超出 usize", false)
+                })?,
+            },
+            "first_last" => CaptureWindowMode::FirstLast {
+                points: usize::try_from(
+                    arguments["points"]
+                        .as_u64()
+                        .expect("window.points passed MCP Schema"),
+                )
+                .map_err(|_| {
+                    JlinkError::new(ErrorCode::ValueInvalid, "window.points 超出 usize", false)
+                })?,
+            },
+            _ => unreachable!("window.mode passed closed MCP Schema"),
+        };
+        let limit =
+            arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(Ok(1_000_usize), |value| {
+                    usize::try_from(value).map_err(|_| {
+                        JlinkError::new(ErrorCode::ValueInvalid, "window.limit 超出 usize", false)
+                    })
+                })?;
+        let query = CaptureWindowQuery::new(
+            series,
+            arguments["from_us"]
+                .as_u64()
+                .expect("window.from_us passed MCP Schema"),
+            arguments["to_us"]
+                .as_u64()
+                .expect("window.to_us passed MCP Schema"),
+            mode,
+            limit,
+        )?;
+        let snapshot = self.completed_snapshot(arguments)?;
+        Ok(ToolCall::success(
+            serde_json::to_value(window(&snapshot, &query)?).map_err(serialization_error)?,
+        ))
+    }
+
+    fn around_event_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let limit =
+            arguments
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map_or(Ok(200_usize), |value| {
+                    usize::try_from(value).map_err(|_| {
+                        JlinkError::new(
+                            ErrorCode::ValueInvalid,
+                            "around_event.limit 超出 usize",
+                            false,
+                        )
+                    })
+                })?;
+        let snapshot = self.completed_snapshot(arguments)?;
+        let result = around_event(
+            &snapshot,
+            arguments["event_id"]
+                .as_str()
+                .expect("around_event.event_id passed MCP Schema"),
+            arguments["before_us"]
+                .as_u64()
+                .expect("around_event.before_us passed MCP Schema"),
+            arguments["after_us"]
+                .as_u64()
+                .expect("around_event.after_us passed MCP Schema"),
+            limit,
+        )?;
+        Ok(ToolCall::success(
+            serde_json::to_value(result).map_err(serialization_error)?,
         ))
     }
 

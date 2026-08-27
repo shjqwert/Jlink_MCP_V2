@@ -149,6 +149,7 @@ fn t_p4_overview_reads_only_verified_completed_bytes_and_returns_top_level_count
         quality: tracker.summary(0),
         writes: vec![HssWriteTiming {
             request_id: "write-1".to_owned(),
+            kind: jlink_domain::HssWriteKind::MemoryWrite,
             requested_at_us: 100_000,
             started_at_us: 101_000,
             completed_at_us: 102_000,

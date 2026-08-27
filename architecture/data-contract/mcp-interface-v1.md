@@ -735,6 +735,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 非 `raw` 模式必须由 Agent 显式选择。MCP 不自动替 Agent 决定曲线简化方式。
 
+`raw` 和 `transitions` 使用相同的矩形 `time_us`/`values` 结构；`raw` 保留重复值，`transitions` 只在至少一个所选序列发生变化时返回该完整观测行。`min_max` 和 `first_last` 将请求的半开时间范围等分为 `points` 个桶，只返回非空桶；每个桶包含 `from_us/to_us` 和按 `series` 登记的二元值。`points`、`limit` 的 V1 上限均为 1000。稳定游标和续页从 5.4 的不可变快照游标接通。
+
 #### `around_event`
 
 ```json
@@ -750,6 +752,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 ```
 
 默认返回事件和附近变化，不返回原始波形；原始波形通过 `window` 获取。
+
+结果包含所选 `event`、可直接复用于 `window` 的 sample 时钟半开边界、附近精确 `changes` 和重叠的质量证据。写入事件保留 `memory_write` 或 `variable_write`；旧格式 capture 未保存写入类别时只报告 `target_write`，不得猜测更具体类型。事件邻域按已持久化的 host→sample 映射误差扩展并裁剪到采集范围。
 
 事件时间使用显式时钟域：
 
