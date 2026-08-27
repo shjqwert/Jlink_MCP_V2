@@ -68,4 +68,4 @@ OpenSpec 任务 3.6 的主要测试 T-P2-CTL 已通过软件合同、IPC、HSS �
 | `Appl/Source/Appl/AppPwrMode/AppPwrMode.h` | `E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085` |
 | `Appl/T26_DCU_APP_NXP.dep` | `B73FCCA00DADB12D639B65B60FD6B44F60295D43301536333373448D5C00D620` |
 
-DBG-004、DBG-005 的主要证据已经形成。3.7 仍须在同一冻结链路执行烧录、校验、变量/内存、寄存器和控制组合 smoke，并观察活动 HSS 占位状态下的冲突路由。任一 DLL、探针/目标、OUT、寄存器规范集合、FFI ABI、IPC、错误映射、HSS 边界或会话状态机变化时，本证据失效。
+DBG-004、DBG-005 的主要证据已经形成。3.7 已在同一冻结链路完成烧录、校验、变量/内存、R0 往返恢复、PC 单步、reset_run 和 disconnect 组合 smoke，并观察活动 HSS 占位状态下的冲突路由，证据见 `validation/p2-stage.md`。任一 DLL、探针/目标、OUT、寄存器规范集合、FFI ABI、IPC、错误映射、HSS 边界或会话状态机变化时，本证据失效。

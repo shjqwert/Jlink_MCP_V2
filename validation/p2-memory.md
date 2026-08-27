@@ -2,7 +2,7 @@
 
 ## 结论
 
-OpenSpec 任务 3.5 的主要测试 T-P2-MEM 已完成软件、合同、冻结 DLL 器件区域和实际 IAR 夹具验证。生产链路已接通变量读写、1–4096 字节原始内存读写、Flash/RAM/MMIO 分类、短写不确定态、显式读回、固件身份验证和安全读取合并规则。本任务没有连接探针或访问目标内存；真实 RAM/MMIO/变量写入、读回、对齐能力和目标最终状态仍必须由 3.7 的冻结硬件纵向测试证明。
+OpenSpec 任务 3.5 的主要测试 T-P2-MEM 已完成软件、合同、冻结 DLL 器件区域和实际 IAR 夹具验证。生产链路已接通变量读写、1–4096 字节原始内存读写、Flash/RAM/MMIO 分类、短写不确定态、显式读回、固件身份验证和安全读取合并规则。3.7 冻结硬件纵向 smoke 已进一步证明可写标量与同地址原始 RAM 的交叉读写、读回、原值恢复和目标最终运行状态，证据见 `validation/p2-stage.md`；MMIO、复合变量和失败边界仍只由其分配的主要测试证明。
 
 ## 已验证实现
 
@@ -58,4 +58,4 @@ IAR Embedded Workbench 8.2.4.5914 使用目标工程 `S32K144` 配置在隔离�
 | `Appl/Source/Appl/AppPwrMode/AppPwrMode.h` | `E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085` |
 | `Appl/T26_DCU_APP_NXP.dep` | `B73FCCA00DADB12D639B65B60FD6B44F60295D43301536333373448D5C00D620` |
 
-DBG-002、DBG-003、DBG-006 的软件与合同证据已经形成；DBG-001 增补了实际目标工程的执行计划和夹具证据。3.7 必须使用上述 DLL、S32K144、SWD 4000 kHz、新 OUT 和当时实际探针身份重新验证：原始 RAM/MMIO 读写、变量/复合值读写、默认无读回、显式读回、短写/对齐失败、HSS 冲突及写后原值恢复。任一 DLL、器件数据库、OUT/ELF、AccessPlan 格式、TypedValue、IPC、范围/错误规则或状态机变化时，本证据失效。
+DBG-002、DBG-003、DBG-006 的软件与合同证据已经形成；DBG-001 增补了实际目标工程的执行计划和夹具证据。3.7 已使用当前冻结 DLL、S32K144、SWD 4000 kHz、OUT 和探针证明标量变量/原始 RAM 的显式读回、HSS 冲突路由及写后原值恢复；MMIO、复合值、默认无读回和失败边界未由 stage smoke 重复。任一 DLL、器件数据库、OUT/ELF、AccessPlan 格式、TypedValue、IPC、范围/错误规则或状态机变化时，本证据失效。

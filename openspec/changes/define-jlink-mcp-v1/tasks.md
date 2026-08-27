@@ -25,7 +25,7 @@
 - [x] 3.4 实现 Flash 烧录、整片/范围擦除、默认与独立校验、边界检查及显式 `after`，并以主要测试 T-P2-PRG 覆盖 PRG-001、PRG-002、PRG-003、PRG-004、PRG-005、PRG-006
 - [x] 3.5 实现变量执行与 1–4096 字节原始内存读写、短写检测、RAM/MMIO/Flash 分类、可选读回，以及仅针对无副作用相邻 RAM/静态变量区间的安全读取合并；MMIO、`volatile`、跨区和未对齐访问不得自动合并，并以主要测试 T-P2-MEM 覆盖 DBG-002、DBG-003、DBG-006
 - [x] 3.6 实现核心寄存器读写和 halt/resume/reset/step 控制，并以主要测试 T-P2-CTL 覆盖 DBG-004、DBG-005
-- [ ] 3.7 先按冻结 J-Link 6.98a SDK 精确修正实际使用导出的 ABI 声明，确定检查同一 DLL 会话内具体器件命令的返回码和错误输出，并用有界日志/错误回调保留失败诊断；首次真机下载的 `EndDownload = -3` 已解释为没有匹配 Flash bank，只有实际诊断证明需要时才增加下载前 reset/halt，不得用 Commander、降速或重试兜底。随后仅重试一次烧录→独立校验→变量/原始内存交叉读写并恢复→核心寄存器/目标控制→reset_run→断开 smoke，集成观察活动 HSS 占位状态下的冲突路由，不重复相应主要断言，也不重复 P1 全量回归
+- [x] 3.7 按冻结 J-Link 6.98a SDK 精确修正实际使用导出的 ABI 声明、器件命令返回与错误输出，并使用有界日志/错误回调保留失败诊断；通用 `JLINKARM_ReadMem` 按 `0` 成功状态解释，类型化读取按完成项目数解释。flash/erase 在首个 Flash 副作用前执行 `reset_halt`，flash 默认校验在 `EndDownload` 后再次 `reset_halt`，独立 verify 保持只读且无新公共字段。冻结生产 smoke 已通过 `connect → flash（默认校验）→ 独立 verify → resume 初始化 `.data` → 变量/原始内存交叉读写并恢复 → 核心寄存器/目标控制 → reset_run → disconnect`，并观察活动 HSS 占位下的冲突路由；全程没有 Commander 成功路径、降速、重试、固定延时或其他 fallback，证据见 `validation/p2-stage.md`
 
 ## 4. P3 HSS 采集
 

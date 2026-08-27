@@ -21,7 +21,7 @@
 |---|---|
 | IAR fixture 源 | `8C305EE9242DA9CECB5FA21863FB4755C2DE2068639774191033D3343749317A` |
 | IAR fixture OUT | `0AD89204DE9382C06F2D1605A4CD53B284C62BC58E980C9BC61086EB43577909` |
-| 实际 T26 OUT | `9CA4B80CE028F03BDE56082C20BFEDFA65FAE6264B33FB3190FD87FC7DA5CCE2`；3.5 目标夹具构建后刷新 |
+| 实际 T26 OUT | `F8ADB9A2B9BBFD26B469C66F2478EE6E22735302706B83509B2D4F2AE7F7738D`；用户在 3.7 授权重新冻结 |
 | 实际 producer | `IAR ANSI C/C++ Compiler V8.32.3.193/W32 for ARM`；`IAR Assembler V8.32.3.193/W32 for ARM` |
 | 解析器格式版本 | `1` |
 
@@ -34,7 +34,7 @@
 - 类型定义：7177。
 - 非 declaration 变量定义：3538。
 - 可供 `symbols` 返回的稳定精确路径：3563。
-- 实际 OUT 在 3.5 仅因计划内 `AppUserDesc.c` 夹具重新构建；T-P2-DWARF 对新指纹完成只读解析，旧 F0-C/P2-3.2 指纹仍保留在其历史证据中，不被改写为当前产物。
+- 实际 OUT 在 3.7 经用户授权重新冻结；T-P2-DWARF 对当前指纹完成只读解析，并再次确认 DWARF 3/4、35 个 type unit、7177 个类型和 `DW_FORM_ref_sig8` 支持。3.5 的 `9CA4B80C...` 与旧 F0-C/P2-3.2 指纹仍是对应提交的历史证据，不被改写为当前产物。
 
 ## 自动验证
 
@@ -56,7 +56,7 @@ T-P2-DWARF 覆盖二维固定数组地址/步长、有效显式柔性 slice、�
 ## SVN 安全基线
 
 - `AppPwrMode.h` 仍为用户已有 `M`，SHA-256：`E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085`。
-- `T26_DCU_APP_NXP.dep` 仍为用户已有 `M`，SHA-256：`B73FCCA00DADB12D639B65B60FD6B44F60295D43301536333373448D5C00D620`。
+- `T26_DCU_APP_NXP.dep` 仍为用户已有 `M`，并已由用户在 3.7 重新冻结，SHA-256：`4FDA4431B3502EBDB1B0313BF58B21995A2B962C9C0BA853DF42F3988B4A6F85`。
 - 本任务没有写入上述文件，也没有执行 `svn commit`。
 
 ## 证据失效条件

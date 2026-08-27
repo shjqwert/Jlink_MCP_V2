@@ -183,7 +183,7 @@ fn t_p2_dwarf_indexes_frozen_actual_t26_ref_sig8_artifact() {
     });
     assert_eq!(
         index.elf_sha256(),
-        "9ca4b80ce028f03bde56082c20bfedfa65fae6264b33fb3190fd87fc7da5cce2"
+        "f8adb9a2b9bbfd26b469c66f2478ee6e22735302706b83509b2d4f2ae7f7738d"
     );
     assert_eq!(index.dwarf_versions(), vec![3, 4]);
     assert_eq!(index.type_unit_count(), 35);

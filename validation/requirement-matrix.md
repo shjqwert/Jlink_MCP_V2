@@ -47,24 +47,24 @@ public contract and is recorded in the implementation constraints.
 | SES-005 | T-P1-SES | `validation/p1-ses.md` hardware + identity fixture | F0-A |
 | SES-006 | T-P1-SES | `validation/p1-ses.md` hardware diagnostics | F0-A |
 | ART-001 | T-P2-IMG | Image-format fixture | F0-C ELF fixture |
-| ART-002 | T-P2-IMG | ELF fixture + target Flash | F0-A + F0-C |
+| ART-002 | T-P2-IMG | ELF fixture + `validation/p2-stage.md` target Flash | F0-A + F0-C |
 | ART-003 | T-P2-DWARF | `validation/p2-dwarf.md` IAR AccessPlan fixture | F0-C |
 | ART-004 | T-P2-VALUE | `validation/p2-value.md` IAR DWARF/value 与 slice 契约 | F0-C |
 | ART-005 | T-P2-DWARF | `validation/p2-dwarf.md` dynamic/pointer rejection | F0-C |
 | ART-006 | T-P2-VALUE | `validation/p2-value.md` 无损 Value round-trip fixture | F0-C |
 | ART-007 | T-P2-DWARF | `validation/p2-dwarf.md` IAR compatibility evidence | F0-C |
-| PRG-001 | T-P2-PRG | `validation/p2-program.md` image/region unit + frozen DLL；3.7 hardware | F0-A |
-| PRG-002 | T-P2-PRG | `validation/p2-program.md` strict Schema/state fixture；3.7 hardware | F0-A |
-| PRG-003 | T-P2-PRG | `validation/p2-program.md` range/device-algorithm implementation；3.7 erase/preservation hardware | F0-A |
-| PRG-004 | T-P2-PRG | `validation/p2-program.md` compact mismatch fixture；3.7 readback hardware | F0-A |
+| PRG-001 | T-P2-PRG | `validation/p2-program.md` image/region unit + frozen DLL；`validation/p2-stage.md` actual Flash | F0-A |
+| PRG-002 | T-P2-PRG | `validation/p2-program.md` strict Schema/state fixture；`validation/p2-stage.md` state smoke | F0-A |
+| PRG-003 | T-P2-PRG | `validation/p2-program.md` range/device-algorithm primary evidence；3.7 does not add erase hardware evidence | F0-A |
+| PRG-004 | T-P2-PRG | `validation/p2-program.md` compact mismatch fixture；`validation/p2-stage.md` matching readback | F0-A |
 | PRG-005 | T-P2-PRG | `validation/p2-program.md` closed Schema/no-token contract；3.7 hardware | F0-A |
-| PRG-006 | T-P2-PRG | `validation/p2-program.md` HSS-first state fixture；3.7 active-capture hardware | F0-A |
-| DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验 + `validation/p2-memory.md` 执行链路；3.7 hardware | F0-A + F0-C |
-| DBG-002 | T-P2-MEM | `validation/p2-memory.md` unit/contract/IAR fixture；3.7 hardware | F0-A |
-| DBG-003 | T-P2-MEM | `validation/p2-memory.md` readback fixture；3.7 hardware | F0-A |
-| DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware | F0-A |
-| DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware | F0-A |
-| DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；3.7 hardware | F0-A |
+| PRG-006 | T-P2-PRG | `validation/p2-program.md` HSS-first state fixture；`validation/p2-stage.md` conflict route | F0-A |
+| DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验 + `validation/p2-memory.md` 执行链路；`validation/p2-stage.md` scalar hardware | F0-A + F0-C |
+| DBG-002 | T-P2-MEM | `validation/p2-memory.md` unit/contract/IAR fixture；`validation/p2-stage.md` RAM hardware | F0-A |
+| DBG-003 | T-P2-MEM | `validation/p2-memory.md` readback fixture；`validation/p2-stage.md` readback hardware | F0-A |
+| DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware；`validation/p2-stage.md` | F0-A |
+| DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware；`validation/p2-stage.md` | F0-A |
+| DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；`validation/p2-stage.md` | F0-A |
 | DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
 | HSSA-001 | T-P3-START | Contract + J-Link hardware | F0-A |

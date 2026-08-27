@@ -2,7 +2,7 @@
 
 ## 结论
 
-OpenSpec 任务 3.4 的主要测试 T-P2-PRG 通过。生产链路已接通 `jlink_program.flash/erase/verify`、严格 IPC、唯一 Worker gateway、动态器件 Flash 区域、默认/独立校验、显式 `after`、HSS 冲突和稳定错误。首次 3.7 真机纵向测试在 `JLINKARM_EndDownload = -3` 停止；冻结 6.98a 将其解释为没有匹配 Flash bank。根因收敛发现生产 gateway 沿用了 P0 的简化 ABI，并忽略 `JLINKARM_ExecCommand` 的错误输出；现已修正并通过软件门禁，但真实写入、读回及最终 CPU 状态仍必须由 3.7 的单次冻结硬件复验重新证明，不得以本文件声明真机烧录已经通过。
+OpenSpec 任务 3.4 的主要测试 T-P2-PRG 通过。生产链路已接通 `jlink_program.flash/erase/verify`、严格 IPC、唯一 Worker gateway、动态器件 Flash 区域、默认/独立校验、显式 `after`、HSS 冲突和稳定错误。首次 3.7 真机诊断揭示并收敛了 ABI、器件命令观测和 Flash 状态准备问题；最终冻结纵向 smoke 已完成实际 Flash 写入、默认校验、独立只读 verify 和最终 CPU 运行状态验证，证据见 `validation/p2-stage.md`。该 stage smoke 没有重复整片/范围擦除、区间外保留和所有 `after` 主要断言，因此本文件不把这些场景表述为新增硬件证据。
 
 ## 已验证实现
 
@@ -57,4 +57,4 @@ OpenSpec 任务 3.4 的主要测试 T-P2-PRG 通过。生产链路已接通 `jli
 | `Appl/Source/Appl/AppPwrMode/AppPwrMode.h` | `E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085` |
 | `Appl/T26_DCU_APP_NXP.dep` | `B73FCCA00DADB12D639B65B60FD6B44F60295D43301536333373448D5C00D620` |
 
-PRG-001..PRG-006 的软件、合同、无探针 DLL 区域和状态机证据已完成。3.7 必须使用冻结的 DLL、探针、S32K144、SWD 4000 kHz 和当时 IAR OUT 重新验证：默认校验、独立 mismatch、整片/范围擦除、区间外字节保留、每种 `after`、HSS 活动冲突以及失败安全状态。任一 DLL、器件数据库、FFI ABI、Flash 区域、镜像解析、IPC、错误映射、范围擦除路线或状态机变化时，本证据失效。
+PRG-001..PRG-006 的软件、合同、无探针 DLL 区域和状态机证据已完成；3.7 进一步在冻结 DLL、探针、S32K144、SWD 4000 kHz 和当前 OUT 上证明实际写入、默认校验、独立 verify、HSS 冲突路由及最终运行状态。整片/范围擦除、区间外保留、独立 mismatch 和所有 `after` 分支仍只保留其分配的主要测试证据，不宣称新增硬件覆盖。任一 DLL、器件数据库、FFI ABI、Flash 区域、镜像解析、IPC、错误映射、范围擦除路线或状态机变化时，本证据失效。
