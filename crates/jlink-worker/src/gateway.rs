@@ -541,11 +541,7 @@ impl DllGateway {
             )
         };
         if result < 0 {
-            return Err(JlinkError::new(
-                ErrorCode::HssStartFailed,
-                format!("JLINK_HSS_Start 返回失败状态 {result}"),
-                false,
-            ));
+            return Err(hss_start_error(result));
         }
         self.hss_started = true;
         Ok(())
@@ -1619,6 +1615,14 @@ fn classify_observed_target_state(
     }
 }
 
+fn hss_start_error(status: i32) -> JlinkError {
+    JlinkError::new(
+        ErrorCode::HssStartFailed,
+        format!("JLINK_HSS_Start 返回失败状态 {status}"),
+        true,
+    )
+}
+
 /// Requires the reset-halt preparation established for the frozen Flash algorithm.
 fn require_flash_reset_halted(state: TargetState) -> Result<(), JlinkError> {
     if state == TargetState::Halted {
@@ -1727,7 +1731,7 @@ mod tests {
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
-        HssCaps, classify_observed_target_state, require_flash_reset_halted,
+        HssCaps, classify_observed_target_state, hss_start_error, require_flash_reset_halted,
         validate_exec_command_result, validate_read_mem_result,
     };
 
@@ -1755,6 +1759,13 @@ mod tests {
     #[test]
     fn frozen_x64_device_info_prefix_is_568_bytes() {
         assert_eq!(std::mem::size_of::<DeviceInfo>(), 568);
+    }
+
+    #[test]
+    fn hss_start_failure_is_retryable_by_public_contract() {
+        let error = hss_start_error(-1);
+        assert_eq!(error.code, ErrorCode::HssStartFailed);
+        assert!(error.retryable);
     }
 
     #[test]
