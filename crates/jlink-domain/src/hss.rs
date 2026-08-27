@@ -378,6 +378,584 @@ pub struct HssDrainTiming {
     pub max_us: u64,
 }
 
+/// Strength of one HSS quality conclusion.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssQualityEvidence {
+    /// A direct signal proves the condition.
+    Confirmed,
+    /// Observable timing or framing facts indicate the condition without an independent counter.
+    Suspected,
+    /// The frozen ABI cannot prove or disprove the condition.
+    Unknown,
+}
+
+/// Stable reason supporting a loss or overflow assessment.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssQualityBasis {
+    /// J-Link 6.98a exposes neither a sequence number nor an overflow counter.
+    NoIndependentOverflowOrSequenceCounter,
+    /// The DLL exposed a recognizable overflow indication.
+    DllOverflowSignal,
+    /// One or more reads did not end on a frozen record boundary.
+    ShortOrMalformedRead,
+    /// Source timestamps contain gaps that cannot be reconciled with timestamp collisions.
+    SourceTimestampGap,
+    /// Source timestamps moved backwards.
+    SourceTimestampRegression,
+}
+
+/// Loss conclusion that deliberately omits a numeric count when none is provable.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssLossAssessment {
+    /// Evidence strength for possible lost samples.
+    pub evidence: HssQualityEvidence,
+    /// Observable basis for the conclusion.
+    pub basis: HssQualityBasis,
+    /// Exact lost-sample count only when an independent source proves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lost_samples: Option<u64>,
+}
+
+/// Overflow conclusion without a false zero-event claim.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssOverflowAssessment {
+    /// Evidence strength for DLL buffer overflow.
+    pub evidence: HssQualityEvidence,
+    /// Observable basis for the conclusion.
+    pub basis: HssQualityBasis,
+    /// Number of direct overflow indications, omitted when the ABI has no signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<u64>,
+}
+
+/// Frozen J-Link source timestamp unit.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssSourceTimeUnit {
+    /// J-Link 6.98a mainline timestamps count milliseconds.
+    Milliseconds,
+}
+
+/// Unit used by public capture and host timeline fields.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssNormalizedTimeUnit {
+    /// Integer microseconds without an implied microsecond source resolution.
+    Microseconds,
+}
+
+/// Explicit cross-clock mapping used by the Worker.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssClockMappingMethod {
+    /// Source elapsed time is anchored to the bounded DLL Start call window.
+    CaptureStartCallBound,
+}
+
+/// Source and host clock facts retained with every capture.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssClockEvidence {
+    /// Unit of the frozen 32-bit source value.
+    pub source_unit: HssSourceTimeUnit,
+    /// Frequency of the source counter.
+    pub source_frequency_hz: u32,
+    /// Proven source resolution after normalization.
+    pub source_resolution_us: u32,
+    /// Unit used by normalized source timestamps and Worker monotonic events.
+    pub normalized_unit: HssNormalizedTimeUnit,
+    /// Host event domain is monotonic elapsed time since successful Start return.
+    pub host_monotonic_since_start: bool,
+    /// Deterministic mapping used between source and host domains.
+    pub mapping_method: HssClockMappingMethod,
+    /// Upper bound from DLL Start-call duration plus source resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping_error_us: Option<u64>,
+    /// First normalized source timestamp observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_timestamp_us: Option<u64>,
+    /// Last normalized source timestamp observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_timestamp_us: Option<u64>,
+}
+
+/// Aggregate source interval statistics without floating-point ambiguity.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssIntervalStatistics {
+    /// Number of adjacent source timestamp pairs observed.
+    pub intervals: u64,
+    /// Smallest non-regressing interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_us: Option<u64>,
+    /// Largest non-regressing interval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_us: Option<u64>,
+    /// Sum used to derive an exact rational mean.
+    pub total_us: u64,
+    /// Adjacent records mapped to the same requested-rate slot.
+    pub collisions: u64,
+    /// Adjacent records that skipped at least one requested-rate slot.
+    pub gap_events: u64,
+    /// Total requested-rate slots skipped by those gaps.
+    pub gap_slots: u64,
+    /// Source timestamps that moved backwards.
+    pub regressions: u64,
+}
+
+/// Bounded categories emitted by the production quality classifier.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssQualityEventKind {
+    /// A direct DLL indication reported buffer overflow.
+    BufferOverflow,
+    /// A non-empty read was smaller than one complete record.
+    ShortFrame,
+    /// A read did not end on a record boundary.
+    FrameFormat,
+    /// Source timestamp spacing differs from the requested-rate slots.
+    SampleInterval,
+    /// Source timestamps moved backwards.
+    ClockRegression,
+}
+
+/// Aggregated occurrence range for one quality event category and evidence level.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssQualityEvent {
+    /// Stable quality category.
+    pub kind: HssQualityEventKind,
+    /// Evidence strength for this category.
+    pub evidence: HssQualityEvidence,
+    /// First Worker monotonic observation time.
+    pub first_host_elapsed_us: u64,
+    /// Last Worker monotonic observation time.
+    pub last_host_elapsed_us: u64,
+    /// First affected complete-record index.
+    pub first_record: u64,
+    /// Last affected complete-record index.
+    pub last_record: u64,
+    /// Number of observations aggregated into this range.
+    pub occurrences: u64,
+}
+
+/// Persisted acquisition quality facts used by overview and timeline queries.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssQualitySummary {
+    /// Requested rate; never presented as achieved rate.
+    pub requested_rate_hz: u32,
+    /// Fixed-duration requested sample count.
+    pub expected_samples: u64,
+    /// Number of complete source records actually observed.
+    pub actual_samples: u64,
+    /// Rate derived from source timestamp span, in milli-hertz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actual_rate_millihz: Option<u64>,
+    /// Source interval statistics.
+    pub intervals: HssIntervalStatistics,
+    /// Loss conclusion with no synthetic zero.
+    pub loss: HssLossAssessment,
+    /// Overflow conclusion with no synthetic zero.
+    pub overflow: HssOverflowAssessment,
+    /// Explicit source/host clock contract.
+    pub clock: HssClockEvidence,
+    /// Aggregated quality occurrences.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<HssQualityEvent>,
+}
+
+impl Default for HssQualitySummary {
+    fn default() -> Self {
+        Self {
+            requested_rate_hz: 0,
+            expected_samples: 0,
+            actual_samples: 0,
+            actual_rate_millihz: None,
+            intervals: HssIntervalStatistics::default(),
+            loss: HssLossAssessment {
+                evidence: HssQualityEvidence::Unknown,
+                basis: HssQualityBasis::NoIndependentOverflowOrSequenceCounter,
+                lost_samples: None,
+            },
+            overflow: HssOverflowAssessment {
+                evidence: HssQualityEvidence::Unknown,
+                basis: HssQualityBasis::NoIndependentOverflowOrSequenceCounter,
+                events: None,
+            },
+            clock: HssClockEvidence {
+                source_unit: HssSourceTimeUnit::Milliseconds,
+                source_frequency_hz: HSS_SOURCE_TIMESTAMP_FREQUENCY_HZ,
+                source_resolution_us: HSS_SOURCE_TIMESTAMP_RESOLUTION_US,
+                normalized_unit: HssNormalizedTimeUnit::Microseconds,
+                host_monotonic_since_start: true,
+                mapping_method: HssClockMappingMethod::CaptureStartCallBound,
+                mapping_error_us: None,
+                first_timestamp_us: None,
+                last_timestamp_us: None,
+            },
+            events: Vec::new(),
+        }
+    }
+}
+
+/// Pure incremental quality classifier owned by the Worker acquisition state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HssQualityTracker {
+    summary: HssQualitySummary,
+    previous_timestamp_us: Option<u64>,
+    previous_slot: Option<u64>,
+    last_host_elapsed_us: u64,
+}
+
+impl HssQualityTracker {
+    /// Creates quality state for one validated fixed-duration plan.
+    #[must_use]
+    pub fn new(plan: &HssStartPlan, start_call_elapsed_us: u64) -> Self {
+        let mut summary = HssQualitySummary {
+            requested_rate_hz: plan.rate_hz(),
+            expected_samples: u64::from(plan.duration_s()) * u64::from(plan.rate_hz()),
+            ..HssQualitySummary::default()
+        };
+        summary.clock.mapping_error_us = Some(
+            start_call_elapsed_us.saturating_add(u64::from(HSS_SOURCE_TIMESTAMP_RESOLUTION_US)),
+        );
+        Self {
+            summary,
+            previous_timestamp_us: None,
+            previous_slot: None,
+            last_host_elapsed_us: 0,
+        }
+    }
+
+    /// Records one DLL read boundary without discarding bytes that may complete later.
+    pub fn observe_read_shape(
+        &mut self,
+        read_bytes: usize,
+        record_bytes: usize,
+        host_elapsed_us: u64,
+        first_record: u64,
+    ) {
+        self.last_host_elapsed_us = self.last_host_elapsed_us.max(host_elapsed_us);
+        if read_bytes == 0 {
+            return;
+        }
+        if read_bytes < record_bytes {
+            self.record_event(
+                HssQualityEventKind::ShortFrame,
+                HssQualityEvidence::Suspected,
+                host_elapsed_us,
+                first_record,
+                first_record,
+            );
+        } else if !read_bytes.is_multiple_of(record_bytes) {
+            self.record_event(
+                HssQualityEventKind::FrameFormat,
+                HssQualityEvidence::Suspected,
+                host_elapsed_us,
+                first_record,
+                first_record
+                    .saturating_add(u64::try_from(read_bytes / record_bytes).unwrap_or(u64::MAX)),
+            );
+        }
+    }
+
+    /// Parses complete frozen-layout records and updates normalized time evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::FrameInvalid`] when the bytes do not contain only
+    /// complete records for the validated layout.
+    pub fn observe_complete_records(
+        &mut self,
+        layout: HssFrameLayout,
+        bytes: &[u8],
+        host_elapsed_us: u64,
+    ) -> Result<u64, JlinkError> {
+        self.last_host_elapsed_us = self.last_host_elapsed_us.max(host_elapsed_us);
+        let batch = layout.parse(bytes)?;
+        if !batch.incomplete_tail.is_empty() {
+            return Err(frame_invalid(
+                "quality classifier received bytes outside a complete record boundary",
+            ));
+        }
+        for frame in batch.frames {
+            let record_index = self.summary.actual_samples;
+            let timestamp_us = normalize_hss_timestamp_us(frame.timestamp_raw);
+            self.observe_timestamp(timestamp_us, host_elapsed_us, record_index);
+            self.summary.actual_samples = self.summary.actual_samples.saturating_add(1);
+        }
+        Ok(self.summary.actual_samples)
+    }
+
+    /// Records a direct overflow indication from an ABI that exposes one.
+    pub fn record_confirmed_overflow(
+        &mut self,
+        host_elapsed_us: u64,
+        first_record: u64,
+        last_record: u64,
+    ) {
+        self.last_host_elapsed_us = self.last_host_elapsed_us.max(host_elapsed_us);
+        self.record_event(
+            HssQualityEventKind::BufferOverflow,
+            HssQualityEvidence::Confirmed,
+            host_elapsed_us,
+            first_record,
+            last_record,
+        );
+        let events = self.summary.overflow.events.unwrap_or(0).saturating_add(1);
+        self.summary.overflow = HssOverflowAssessment {
+            evidence: HssQualityEvidence::Confirmed,
+            basis: HssQualityBasis::DllOverflowSignal,
+            events: Some(events),
+        };
+    }
+
+    /// Records a read result that cannot be interpreted as the frozen frame format.
+    pub fn record_frame_format_error(&mut self, host_elapsed_us: u64, record_index: u64) {
+        self.last_host_elapsed_us = self.last_host_elapsed_us.max(host_elapsed_us);
+        self.record_event(
+            HssQualityEventKind::FrameFormat,
+            HssQualityEvidence::Confirmed,
+            host_elapsed_us,
+            record_index,
+            record_index,
+        );
+    }
+
+    /// Produces current or terminal quality facts without consuming the tracker.
+    #[must_use]
+    pub fn summary(&self, final_tail_bytes: usize) -> HssQualitySummary {
+        let mut summary = self.summary.clone();
+        let timestamp_span = summary
+            .clock
+            .first_timestamp_us
+            .zip(summary.clock.last_timestamp_us)
+            .and_then(|(first, last)| last.checked_sub(first));
+        summary.actual_rate_millihz = (summary.intervals.regressions == 0)
+            .then_some(timestamp_span)
+            .flatten()
+            .and_then(|span| {
+                (span > 0 && summary.actual_samples > 1).then(|| {
+                    summary
+                        .actual_samples
+                        .saturating_sub(1)
+                        .saturating_mul(1_000_000_000)
+                        / span
+                })
+            });
+        if final_tail_bytes > 0 {
+            aggregate_quality_event(
+                &mut summary.events,
+                HssQualityEventKind::ShortFrame,
+                HssQualityEvidence::Confirmed,
+                self.last_host_elapsed_us,
+                summary.actual_samples,
+                summary.actual_samples,
+            );
+        }
+        summary.loss = loss_assessment(&summary, final_tail_bytes);
+        summary
+    }
+
+    /// Returns the strongest integrity conclusion supported by current quality facts.
+    #[must_use]
+    pub fn integrity(&self, final_tail_bytes: usize) -> HssDataIntegrity {
+        let unmatched_gaps = self
+            .summary
+            .intervals
+            .gap_slots
+            .saturating_sub(self.summary.intervals.collisions);
+        if final_tail_bytes > 0
+            || self.summary.overflow.evidence == HssQualityEvidence::Confirmed
+            || self.summary.intervals.regressions > 0
+            || unmatched_gaps > 0
+        {
+            HssDataIntegrity::Degraded
+        } else {
+            HssDataIntegrity::Unknown
+        }
+    }
+
+    fn observe_timestamp(&mut self, timestamp_us: u64, host_elapsed_us: u64, record_index: u64) {
+        self.summary
+            .clock
+            .first_timestamp_us
+            .get_or_insert(timestamp_us);
+        self.summary.clock.last_timestamp_us = Some(timestamp_us);
+        let slot = timestamp_us
+            .saturating_mul(u64::from(self.summary.requested_rate_hz))
+            .saturating_add(500_000)
+            / 1_000_000;
+        if let Some(previous) = self.previous_timestamp_us {
+            if timestamp_us < previous {
+                self.summary.intervals.regressions =
+                    self.summary.intervals.regressions.saturating_add(1);
+                self.record_event(
+                    HssQualityEventKind::ClockRegression,
+                    HssQualityEvidence::Confirmed,
+                    host_elapsed_us,
+                    record_index.saturating_sub(1),
+                    record_index,
+                );
+            } else {
+                let delta = timestamp_us - previous;
+                self.summary.intervals.intervals =
+                    self.summary.intervals.intervals.saturating_add(1);
+                self.summary.intervals.total_us =
+                    self.summary.intervals.total_us.saturating_add(delta);
+                self.summary.intervals.min_us = Some(
+                    self.summary
+                        .intervals
+                        .min_us
+                        .map_or(delta, |current| current.min(delta)),
+                );
+                self.summary.intervals.max_us = Some(
+                    self.summary
+                        .intervals
+                        .max_us
+                        .map_or(delta, |current| current.max(delta)),
+                );
+            }
+        }
+        if let Some(previous_slot) = self.previous_slot {
+            if slot < previous_slot {
+                // Timestamp regression already records the stronger event above.
+            } else if slot == previous_slot {
+                self.summary.intervals.collisions =
+                    self.summary.intervals.collisions.saturating_add(1);
+                self.record_event(
+                    HssQualityEventKind::SampleInterval,
+                    HssQualityEvidence::Unknown,
+                    host_elapsed_us,
+                    record_index.saturating_sub(1),
+                    record_index,
+                );
+            } else if slot > previous_slot.saturating_add(1) {
+                self.summary.intervals.gap_events =
+                    self.summary.intervals.gap_events.saturating_add(1);
+                self.summary.intervals.gap_slots = self
+                    .summary
+                    .intervals
+                    .gap_slots
+                    .saturating_add(slot - previous_slot - 1);
+                self.record_event(
+                    HssQualityEventKind::SampleInterval,
+                    HssQualityEvidence::Suspected,
+                    host_elapsed_us,
+                    record_index.saturating_sub(1),
+                    record_index,
+                );
+            }
+        }
+        self.previous_timestamp_us = Some(timestamp_us);
+        self.previous_slot = Some(slot);
+    }
+
+    fn record_event(
+        &mut self,
+        kind: HssQualityEventKind,
+        evidence: HssQualityEvidence,
+        host_elapsed_us: u64,
+        first_record: u64,
+        last_record: u64,
+    ) {
+        aggregate_quality_event(
+            &mut self.summary.events,
+            kind,
+            evidence,
+            host_elapsed_us,
+            first_record,
+            last_record,
+        );
+    }
+}
+
+/// Converts the frozen J-Link 6.98a millisecond counter to integer microseconds.
+#[must_use]
+pub fn normalize_hss_timestamp_us(timestamp_ms: u32) -> u64 {
+    u64::from(timestamp_ms) * u64::from(HSS_SOURCE_TIMESTAMP_RESOLUTION_US)
+}
+
+fn aggregate_quality_event(
+    events: &mut Vec<HssQualityEvent>,
+    kind: HssQualityEventKind,
+    evidence: HssQualityEvidence,
+    host_elapsed_us: u64,
+    first_record: u64,
+    last_record: u64,
+) {
+    if let Some(event) = events
+        .iter_mut()
+        .find(|event| event.kind == kind && event.evidence == evidence)
+    {
+        event.last_host_elapsed_us = host_elapsed_us;
+        event.last_record = event.last_record.max(last_record);
+        event.occurrences = event.occurrences.saturating_add(1);
+        return;
+    }
+    events.push(HssQualityEvent {
+        kind,
+        evidence,
+        first_host_elapsed_us: host_elapsed_us,
+        last_host_elapsed_us: host_elapsed_us,
+        first_record,
+        last_record,
+        occurrences: 1,
+    });
+}
+
+fn loss_assessment(summary: &HssQualitySummary, final_tail_bytes: usize) -> HssLossAssessment {
+    if summary.overflow.evidence == HssQualityEvidence::Confirmed {
+        return HssLossAssessment {
+            evidence: HssQualityEvidence::Confirmed,
+            basis: HssQualityBasis::DllOverflowSignal,
+            lost_samples: None,
+        };
+    }
+    if summary.intervals.regressions > 0 {
+        return HssLossAssessment {
+            evidence: HssQualityEvidence::Suspected,
+            basis: HssQualityBasis::SourceTimestampRegression,
+            lost_samples: None,
+        };
+    }
+    let unmatched_gaps = summary
+        .intervals
+        .gap_slots
+        .saturating_sub(summary.intervals.collisions);
+    if unmatched_gaps > 0 {
+        return HssLossAssessment {
+            evidence: HssQualityEvidence::Suspected,
+            basis: HssQualityBasis::SourceTimestampGap,
+            lost_samples: None,
+        };
+    }
+    if final_tail_bytes > 0
+        || summary.events.iter().any(|event| {
+            matches!(
+                event.kind,
+                HssQualityEventKind::ShortFrame | HssQualityEventKind::FrameFormat
+            )
+        })
+    {
+        return HssLossAssessment {
+            evidence: HssQualityEvidence::Suspected,
+            basis: HssQualityBasis::ShortOrMalformedRead,
+            lost_samples: None,
+        };
+    }
+    HssLossAssessment {
+        evidence: HssQualityEvidence::Unknown,
+        basis: HssQualityBasis::NoIndependentOverflowOrSequenceCounter,
+        lost_samples: None,
+    }
+}
+
 /// Result retained for one write interleaved with an active capture.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
@@ -428,6 +1006,9 @@ pub struct HssRunSnapshot {
     pub complete_records: u64,
     /// Aggregate serialized drain timings.
     pub drain: HssDrainTiming,
+    /// Source timing, rate, loss, overflow, and framing evidence.
+    #[serde(default)]
+    pub quality: HssQualitySummary,
     /// Ordered write-interleaving evidence.
     pub writes: Vec<HssWriteTiming>,
     /// Stable failure code present only for controlled `failed` captures.

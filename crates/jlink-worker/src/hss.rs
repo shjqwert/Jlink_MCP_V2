@@ -6,9 +6,9 @@ use std::{
 
 use jlink_capture::{CapturePhase, CaptureRecovery, CaptureSnapshot, CaptureStore, CaptureWriter};
 use jlink_domain::{
-    ErrorCode, HssCaptureReservation, HssCaptureState, HssDataIntegrity, HssDrainTiming,
-    HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState, HssStartPlan,
-    HssStartRegistry, HssWriteResult, HssWriteTiming, JlinkError,
+    ErrorCode, HssCaptureReservation, HssCaptureState, HssDrainTiming, HssQualitySummary,
+    HssQualityTracker, HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState,
+    HssStartPlan, HssStartRegistry, HssWriteResult, HssWriteTiming, JlinkError,
 };
 use serde_json::json;
 
@@ -21,8 +21,18 @@ const TAIL_EMPTY_READS: u32 = 20;
 
 pub(crate) trait HssIo {
     fn start_hss(&mut self, plan: &HssStartPlan) -> Result<(), JlinkError>;
-    fn read_hss(&mut self, buffer: &mut [u8], record_bytes: usize) -> Result<usize, JlinkError>;
+    fn read_hss(
+        &mut self,
+        buffer: &mut [u8],
+        record_bytes: usize,
+    ) -> Result<HssReadOutcome, JlinkError>;
     fn stop_hss(&mut self) -> Result<(), JlinkError>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HssReadOutcome {
+    bytes: usize,
+    overflow_confirmed: bool,
 }
 
 impl HssIo for DllGateway {
@@ -30,8 +40,16 @@ impl HssIo for DllGateway {
         Self::start_hss(self, plan)
     }
 
-    fn read_hss(&mut self, buffer: &mut [u8], record_bytes: usize) -> Result<usize, JlinkError> {
-        Self::read_hss(self, buffer, record_bytes)
+    fn read_hss(
+        &mut self,
+        buffer: &mut [u8],
+        record_bytes: usize,
+    ) -> Result<HssReadOutcome, JlinkError> {
+        Self::read_hss(self, buffer, record_bytes).map(|bytes| HssReadOutcome {
+            bytes,
+            // Frozen 6.98a exposes no independent overflow signal or counter.
+            overflow_confirmed: false,
+        })
     }
 
     fn stop_hss(&mut self) -> Result<(), JlinkError> {
@@ -62,6 +80,7 @@ struct ActiveCapture {
     incomplete_tail: Vec<u8>,
     complete_records: u64,
     drain: HssDrainTiming,
+    quality: HssQualityTracker,
     writes: Vec<HssWriteTiming>,
     pending_write_impact: Option<usize>,
 }
@@ -177,50 +196,21 @@ impl HssCoordinator {
                 return Err(error);
             }
         };
-        if let Err(error) = io.start_hss(&plan) {
-            let mut status = HssCaptureState::starting();
-            status
-                .mark_failed(error.code, false, Vec::new())
-                .expect("a controlled Start failure can terminate starting");
-            let snapshot = HssRunSnapshot {
-                capture_id: capture_id.clone(),
-                state: status.lifecycle(),
-                integrity: status.integrity(),
-                elapsed_us: 0,
-                complete_records: 0,
-                drain: HssDrainTiming::default(),
-                writes: Vec::new(),
-                failure_code: status.failure_code(),
-                partial_available: false,
-                reason: None,
-                recoverable: None,
-                recovery_notifications: Vec::new(),
-            };
-            let store_result = writer.finish(&snapshot);
-            self.terminal.insert(
-                capture_id.clone(),
-                TerminalCapture {
-                    snapshot,
-                    _plan: Some(plan),
-                    _store: store_result.as_ref().ok().cloned(),
-                    _failure: Some(error.clone()),
-                },
-            );
-            let mut error = error
-                .with_detail("capture_id", json!(capture_id))
-                .with_detail("state", json!(HssRunState::Failed))
-                .with_detail("partial_available", json!(false));
-            if let Err(store_error) = store_result {
-                error = error.with_detail("capture_store_publish", json!(store_error.to_string()));
-            }
-            return Err(error);
-        }
+        let start_called = Instant::now();
+        let start_result = io.start_hss(&plan);
         let started = Instant::now();
+        if let Err(error) = start_result {
+            return Err(self.record_start_failure(&capture_id, plan, writer, error));
+        }
         let deadline = started + Duration::from_secs(u64::from(plan.duration_s()));
         let mut status = HssCaptureState::starting();
         status
             .mark_running()
             .expect("a successful Start transitions starting to running");
+        let quality = HssQualityTracker::new(
+            &plan,
+            duration_us(started.saturating_duration_since(start_called)),
+        );
         self.active = Some(ActiveCapture {
             reservation,
             plan,
@@ -234,6 +224,7 @@ impl HssCoordinator {
             incomplete_tail: Vec::new(),
             complete_records: 0,
             drain: HssDrainTiming::default(),
+            quality,
             writes: Vec::new(),
             pending_write_impact: None,
         });
@@ -241,6 +232,52 @@ impl HssCoordinator {
             snapshot: self.status(&capture_id, started)?,
             started_new: true,
         })
+    }
+
+    fn record_start_failure(
+        &mut self,
+        capture_id: &str,
+        plan: HssStartPlan,
+        writer: CaptureWriter,
+        error: JlinkError,
+    ) -> JlinkError {
+        let mut status = HssCaptureState::starting();
+        status
+            .mark_failed(error.code, false, Vec::new())
+            .expect("a controlled Start failure can terminate starting");
+        let snapshot = HssRunSnapshot {
+            capture_id: capture_id.to_owned(),
+            state: status.lifecycle(),
+            integrity: status.integrity(),
+            elapsed_us: 0,
+            complete_records: 0,
+            drain: HssDrainTiming::default(),
+            quality: HssQualitySummary::default(),
+            writes: Vec::new(),
+            failure_code: status.failure_code(),
+            partial_available: false,
+            reason: None,
+            recoverable: None,
+            recovery_notifications: Vec::new(),
+        };
+        let store_result = writer.finish(&snapshot);
+        self.terminal.insert(
+            capture_id.to_owned(),
+            TerminalCapture {
+                snapshot,
+                _plan: Some(plan),
+                _store: store_result.as_ref().ok().cloned(),
+                _failure: Some(error.clone()),
+            },
+        );
+        let mut error = error
+            .with_detail("capture_id", json!(capture_id))
+            .with_detail("state", json!(HssRunState::Failed))
+            .with_detail("partial_available", json!(false));
+        if let Err(store_error) = store_result {
+            error = error.with_detail("capture_store_publish", json!(store_error.to_string()));
+        }
+        error
     }
 
     /// Drains once before any dispatch and performs automatic Stop/tail drain.
@@ -313,11 +350,7 @@ impl HssCoordinator {
             .active
             .take()
             .expect("completion requires active capture");
-        let integrity = if active.incomplete_tail.is_empty() {
-            HssDataIntegrity::Unknown
-        } else {
-            HssDataIntegrity::Degraded
-        };
+        let integrity = active.quality.integrity(active.incomplete_tail.len());
         let mut completed_status = active.status.clone();
         completed_status
             .mark_completed(integrity)
@@ -494,18 +527,47 @@ fn drain_once<I: HssIo>(
 ) -> Result<usize, JlinkError> {
     let record_bytes = usize::try_from(active.plan.frame_layout().record_bytes())
         .map_err(|_| JlinkError::new(ErrorCode::FrameInvalid, "HSS 帧长度无法表示", false))?;
-    let read = io.read_hss(&mut active.buffer, record_bytes)?;
+    let outcome = match io.read_hss(&mut active.buffer, record_bytes) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if error.code == ErrorCode::FrameInvalid {
+                active.quality.record_frame_format_error(
+                    instant_offset_us(active.started, Instant::now()),
+                    active.complete_records,
+                );
+            }
+            return Err(error);
+        }
+    };
+    let read = outcome.bytes;
     let completed = Instant::now();
     let elapsed = duration_us(completed.saturating_duration_since(call_started));
     active.drain.calls += 1;
     active.drain.total_us = active.drain.total_us.saturating_add(elapsed);
     active.drain.max_us = active.drain.max_us.max(elapsed);
     if read > active.buffer.len() {
+        active.quality.record_frame_format_error(
+            instant_offset_us(active.started, completed),
+            active.complete_records,
+        );
         return Err(JlinkError::new(
             ErrorCode::FrameInvalid,
             "HSS 排空长度超过读取缓冲区",
             false,
         ));
+    }
+    let host_elapsed_us = instant_offset_us(active.started, completed);
+    active
+        .quality
+        .observe_read_shape(read, record_bytes, host_elapsed_us, active.complete_records);
+    if outcome.overflow_confirmed {
+        active.quality.record_confirmed_overflow(
+            host_elapsed_us,
+            active.complete_records,
+            active
+                .complete_records
+                .saturating_add(u64::try_from(read / record_bytes).unwrap_or(u64::MAX)),
+        );
     }
     let phase = if active.status.lifecycle() == HssRunState::Running {
         CapturePhase::Live
@@ -516,18 +578,16 @@ fn drain_once<I: HssIo>(
         .writer
         .as_mut()
         .expect("active capture owns a writer")
-        .append(
-            instant_offset_us(active.started, completed),
-            phase,
-            &active.buffer[..read],
-        )?;
+        .append(host_elapsed_us, phase, &active.buffer[..read])?;
     active
         .incomplete_tail
         .extend_from_slice(&active.buffer[..read]);
     let complete_bytes = active.incomplete_tail.len() / record_bytes * record_bytes;
-    active.complete_records = active
-        .complete_records
-        .saturating_add(u64::try_from(complete_bytes / record_bytes).unwrap_or(u64::MAX));
+    active.complete_records = active.quality.observe_complete_records(
+        active.plan.frame_layout(),
+        &active.incomplete_tail[..complete_bytes],
+        host_elapsed_us,
+    )?;
     let tail = active.incomplete_tail.split_off(complete_bytes);
     active.incomplete_tail = tail;
     if let Some(index) = active.pending_write_impact.take() {
@@ -545,6 +605,12 @@ fn snapshot_with_status(
     status: &HssCaptureState,
     now: Instant,
 ) -> HssRunSnapshot {
+    let terminal_tail_bytes = matches!(
+        status.lifecycle(),
+        HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+    )
+    .then_some(active.incomplete_tail.len())
+    .unwrap_or_default();
     HssRunSnapshot {
         capture_id: active.reservation.capture_id().to_owned(),
         state: status.lifecycle(),
@@ -552,6 +618,7 @@ fn snapshot_with_status(
         elapsed_us: instant_offset_us(active.started, now),
         complete_records: active.complete_records,
         drain: active.drain,
+        quality: active.quality.summary(terminal_tail_bytes),
         writes: active.writes.clone(),
         failure_code: status.failure_code(),
         partial_available: status.partial_available(),
@@ -592,21 +659,22 @@ mod tests {
     use std::{collections::VecDeque, time::Duration};
 
     use jlink_domain::{
-        AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssDataIntegrity,
-        HssRecoveryNotification, HssReturnWhen, HssRunState, HssStartPlan, HssWriteResult,
-        ScalarEncoding, VariableSelector,
+        AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssClockMappingMethod,
+        HssDataIntegrity, HssNormalizedTimeUnit, HssQualityBasis, HssQualityEventKind,
+        HssQualityEvidence, HssRecoveryNotification, HssReturnWhen, HssRunSnapshot, HssRunState,
+        HssSourceTimeUnit, HssStartPlan, HssWriteResult, ScalarEncoding, VariableSelector,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
 
-    use super::{HssCoordinator, HssIo, Instant, JlinkError};
+    use super::{HssCoordinator, HssIo, HssReadOutcome, Instant, JlinkError};
 
     const TEST_CAPTURE_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
     struct ScriptedHss {
         start_error: Option<JlinkError>,
         stop_error: Option<JlinkError>,
-        reads: VecDeque<Result<Vec<u8>, JlinkError>>,
+        reads: VecDeque<Result<(Vec<u8>, bool), JlinkError>>,
         calls: Vec<&'static str>,
     }
 
@@ -615,7 +683,7 @@ mod tests {
             Self {
                 start_error: None,
                 stop_error: None,
-                reads: reads.into_iter().map(Ok).collect(),
+                reads: reads.into_iter().map(|bytes| Ok((bytes, false))).collect(),
                 calls: Vec::new(),
             }
         }
@@ -634,11 +702,17 @@ mod tests {
             &mut self,
             buffer: &mut [u8],
             _record_bytes: usize,
-        ) -> Result<usize, JlinkError> {
+        ) -> Result<HssReadOutcome, JlinkError> {
             self.calls.push("drain");
-            let bytes = self.reads.pop_front().unwrap_or_else(|| Ok(Vec::new()))?;
+            let (bytes, overflow_confirmed) = self
+                .reads
+                .pop_front()
+                .unwrap_or_else(|| Ok((Vec::new(), false)))?;
             buffer[..bytes.len()].copy_from_slice(&bytes);
-            Ok(bytes.len())
+            Ok(HssReadOutcome {
+                bytes: bytes.len(),
+                overflow_confirmed,
+            })
         }
 
         fn stop_hss(&mut self) -> Result<(), JlinkError> {
@@ -685,10 +759,141 @@ mod tests {
         .expect("start plan")
     }
 
-    fn coordinator() -> (TempDir, HssCoordinator) {
+    fn open_coordinator() -> (TempDir, HssCoordinator) {
         let root = tempdir().expect("capture store root");
         let coordinator = HssCoordinator::open(root.path()).expect("capture store opens");
         (root, coordinator)
+    }
+
+    fn record(timestamp_ms: u32, value: u32) -> Vec<u8> {
+        [timestamp_ms.to_le_bytes(), value.to_le_bytes()].concat()
+    }
+
+    fn complete_capture(
+        coordinator: &mut HssCoordinator,
+        io: &mut ScriptedHss,
+        capture_id: &str,
+    ) -> HssRunSnapshot {
+        let started = coordinator.active.as_ref().expect("active capture").started;
+        coordinator
+            .advance_at(io, started + Duration::from_secs(1))
+            .expect("deadline drain and Stop");
+        for index in 1..=100 {
+            if coordinator
+                .advance_at(
+                    io,
+                    started + Duration::from_secs(1) + Duration::from_millis(index),
+                )
+                .expect("tail drain")
+            {
+                return coordinator
+                    .status(capture_id, Instant::now())
+                    .expect("terminal quality snapshot");
+            }
+        }
+        panic!("tail drain did not complete")
+    }
+
+    fn quality_capture(reads: impl IntoIterator<Item = (Vec<u8>, bool)>) -> HssRunSnapshot {
+        let (_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss {
+            start_error: None,
+            stop_error: None,
+            reads: reads.into_iter().map(Ok).collect(),
+            calls: Vec::new(),
+        };
+        let capture = coordinator
+            .start(
+                "260106173",
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| Ok(()),
+            )
+            .expect("quality capture starts");
+        complete_capture(&mut coordinator, &mut io, &capture.snapshot.capture_id)
+    }
+
+    #[test]
+    fn t_p3_quality_reports_rate_loss_overflow_and_millisecond_clock_evidence() {
+        let snapshot = quality_capture([(record(12_345, 1), false), (record(12_346, 2), false)]);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(snapshot.quality.requested_rate_hz, 1_000);
+        assert_eq!(snapshot.quality.actual_samples, 2);
+        assert_eq!(snapshot.quality.actual_rate_millihz, Some(1_000_000));
+        assert_eq!(snapshot.quality.loss.evidence, HssQualityEvidence::Unknown);
+        assert_eq!(snapshot.quality.loss.lost_samples, None);
+        assert_eq!(
+            snapshot.quality.overflow.evidence,
+            HssQualityEvidence::Unknown
+        );
+        assert_eq!(snapshot.quality.overflow.events, None);
+        assert_eq!(
+            snapshot.quality.clock.source_unit,
+            HssSourceTimeUnit::Milliseconds
+        );
+        assert_eq!(snapshot.quality.clock.source_resolution_us, 1_000);
+        assert_eq!(
+            snapshot.quality.clock.normalized_unit,
+            HssNormalizedTimeUnit::Microseconds
+        );
+        assert_eq!(
+            snapshot.quality.clock.mapping_method,
+            HssClockMappingMethod::CaptureStartCallBound
+        );
+        assert!(snapshot.quality.clock.mapping_error_us.unwrap() >= 1_000);
+        assert_eq!(snapshot.quality.clock.first_timestamp_us, Some(12_345_000));
+        assert_eq!(snapshot.quality.clock.last_timestamp_us, Some(12_346_000));
+
+        let snapshot = quality_capture([
+            (record(0, 1), false),
+            (record(2, 2), false),
+            (record(4, 3), false),
+        ]);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(snapshot.quality.actual_rate_millihz, Some(500_000));
+        assert_eq!(snapshot.quality.intervals.gap_events, 2);
+        assert_eq!(snapshot.quality.intervals.gap_slots, 2);
+        assert_eq!(
+            snapshot.quality.loss.basis,
+            HssQualityBasis::SourceTimestampGap
+        );
+        assert_eq!(
+            snapshot.quality.loss.evidence,
+            HssQualityEvidence::Suspected
+        );
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Degraded);
+
+        let snapshot = quality_capture([(record(0, 1), true)]);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(
+            snapshot.quality.overflow.evidence,
+            HssQualityEvidence::Confirmed
+        );
+        assert_eq!(snapshot.quality.overflow.events, Some(1));
+        assert_eq!(
+            snapshot.quality.loss.evidence,
+            HssQualityEvidence::Confirmed
+        );
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Degraded);
+        assert!(snapshot.quality.events.iter().any(|event| {
+            event.kind == HssQualityEventKind::BufferOverflow
+                && event.evidence == HssQualityEvidence::Confirmed
+        }));
+
+        let bytes = record(0, 1);
+        let snapshot =
+            quality_capture([(bytes[..3].to_vec(), false), (bytes[3..].to_vec(), false)]);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(snapshot.complete_records, 1);
+        assert_eq!(
+            snapshot.quality.loss.basis,
+            HssQualityBasis::ShortOrMalformedRead
+        );
+        assert_eq!(snapshot.quality.loss.lost_samples, None);
+        assert!(snapshot.quality.events.iter().any(|event| {
+            event.kind == HssQualityEventKind::ShortFrame && event.occurrences == 2
+        }));
     }
 
     #[test]
@@ -696,7 +901,7 @@ mod tests {
         let first_record = [1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat();
         let second_record = [2_u32.to_le_bytes(), 20_u32.to_le_bytes()].concat();
         let mut io = ScriptedHss::healthy([first_record, second_record]);
-        let (store_root, mut coordinator) = coordinator();
+        let (store_root, mut coordinator) = open_coordinator();
         let outcome = coordinator
             .start(
                 "260106173",
@@ -778,7 +983,7 @@ mod tests {
             start_error: None,
             stop_error: None,
             reads: VecDeque::from([
-                Ok([1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat()),
+                Ok(([1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat(), false)),
                 Err(JlinkError::new(
                     ErrorCode::FrameInvalid,
                     "read failed",
@@ -787,7 +992,7 @@ mod tests {
             ]),
             calls: Vec::new(),
         };
-        let (_store_root, mut coordinator) = coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let outcome = coordinator
             .start(
                 "260106173",
@@ -836,7 +1041,7 @@ mod tests {
             reads: VecDeque::new(),
             calls: Vec::new(),
         };
-        let (store_root, mut coordinator) = coordinator();
+        let (store_root, mut coordinator) = open_coordinator();
         let error = coordinator
             .start(
                 "260106173",
@@ -887,7 +1092,7 @@ mod tests {
             reads: VecDeque::new(),
             calls: Vec::new(),
         };
-        let (store_root, mut coordinator) = coordinator();
+        let (store_root, mut coordinator) = open_coordinator();
         let outcome = coordinator
             .start(
                 "260106173",
@@ -919,7 +1124,7 @@ mod tests {
         let mut bytes = [1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat();
         bytes.push(0xAA);
         let mut io = ScriptedHss::healthy([bytes]);
-        let (_store_root, mut coordinator) = coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let outcome = coordinator
             .start(
                 "260106173",

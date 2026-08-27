@@ -5,8 +5,8 @@ use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssDataIntegrity, HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule,
-    JlinkError, MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
+    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
+    MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
     ValidationAfter, VariableSelector, WriteVerify,
 };
 use serde_json::{Map, Value, json};
@@ -787,12 +787,13 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
     ]);
     if snapshot.state == HssRunState::Completed {
         result.insert("elapsed_us".to_owned(), json!(snapshot.elapsed_us));
-        if snapshot.integrity != HssDataIntegrity::Complete {
-            result.insert(
-                "quality".to_owned(),
-                json!({ "integrity": snapshot.integrity }),
-            );
-        }
+        let mut quality = serde_json::to_value(&snapshot.quality)
+            .expect("HssQualitySummary is serializable")
+            .as_object()
+            .expect("HssQualitySummary serializes as an object")
+            .clone();
+        quality.insert("integrity".to_owned(), json!(snapshot.integrity));
+        result.insert("quality".to_owned(), Value::Object(quality));
     } else if snapshot.state == HssRunState::Failed {
         if let Some(code) = snapshot.failure_code {
             result.insert("failure_code".to_owned(), json!(code.as_str()));
@@ -1194,6 +1195,7 @@ mod hss_state_tests {
             elapsed_us: 10,
             complete_records: 1,
             drain: HssDrainTiming::default(),
+            quality: jlink_domain::HssQualitySummary::default(),
             writes: Vec::new(),
             failure_code: None,
             partial_available: false,
@@ -1222,5 +1224,8 @@ mod hss_state_tests {
         ));
         assert_eq!(result["state"], "completed");
         assert_eq!(result["quality"]["integrity"], "degraded");
+        assert_eq!(result["quality"]["loss"]["evidence"], "unknown");
+        assert!(result["quality"]["loss"].get("lost_samples").is_none());
+        assert_eq!(result["quality"]["clock"]["source_resolution_us"], 1_000);
     }
 }

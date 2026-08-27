@@ -532,7 +532,18 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 }
 ```
 
-正常时不返回 `quality`；出现降频、间隙、溢出、短包、格式异常、时钟不确定或可识别丢样时才返回。
+正常且证据足够时不返回 `quality`；出现降频、间隙、溢出、短包、格式异常、时钟不确定或可识别丢样时返回。J-Link 6.98a 没有独立 overflow/sequence counter，因此即使没有其他异常，也必须以 `unknown` 明确呈现 loss/overflow 限制，不能通过省略字段暗示零丢样或无溢出。生产内部证据使用以下固定含义；`actual_rate_millihz` 是由源首尾时间戳推导的 milli-hertz 固定点，不等同请求频率：
+
+| `quality` 字段 | 规则 |
+|---|---|
+| `integrity` | `complete | degraded | unknown`，与 lifecycle 独立 |
+| `requested_rate_hz` / `expected_samples` | 原请求事实，不表示实际达到 |
+| `actual_samples` / `actual_rate_millihz` | 完整记录计数与源时间跨度推导的 milli-hertz；时间回退时不输出实际频率 |
+| `intervals` | 保存相邻间隔 count/min/max/total，以及 collision、gap event/slot、regression 计数 |
+| `loss` | `evidence` 为 `confirmed | suspected | unknown`，保存 `basis`；没有独立计数时省略 `lost_samples` |
+| `overflow` | 同样保存证据和依据；6.98a 无直接信号时省略事件数 |
+| `clock` | 固定保存毫秒源、1000 Hz、1000 us 分辨率、微秒归一化、Worker 单调时间域、`capture_start_call_bound` 映射方法和实际误差上界 |
+| `events` | 按类别与证据等级聚合首次/末次 Worker 时间、记录范围和出现次数 |
 
 ### 9.4 `status`
 

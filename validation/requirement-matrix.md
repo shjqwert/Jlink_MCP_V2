@@ -73,11 +73,11 @@ public contract and is recorded in the implementation constraints.
 | HSSA-004 | T-P3-RUN | Production automatic Stop/tail-drain trace + timed J-Link capture | F0-A |
 | HSSA-005 | T-P3-STATE | Production state-machine/fault-retention fixture | F0-A + F0-B |
 | HSSA-006 | T-P3-STORE | Production Capture Store limit/CRC/atomic-publish fixture + Worker restart recovery | F0-A throughput |
-| HSSA-007 | T-P3-QUALITY | J-Link raw-frame fixture/hardware | F0-A |
+| HSSA-007 | T-P3-QUALITY | Production frame/overflow/loss classifier + P3 hardware smoke | F0-A |
 | HSSA-008 | T-P3-RUN | Production write event trace + J-Link write-interleaving timeline | F0-A |
 | HSSA-009 | T-P3-RECOVER | Windows process + hardware integration | F0-B |
-| HSSA-010 | T-P3-QUALITY | J-Link timing evidence | F0-A |
-| HSSA-011 | T-P3-QUALITY | J-Link/host clock evidence | F0-A |
+| HSSA-010 | T-P3-QUALITY | Production requested/actual-rate and interval fixture + P3 hardware smoke | F0-A |
+| HSSA-011 | T-P3-QUALITY | Production ms-to-us/clock-mapping fixture + P3 hardware smoke | F0-A |
 | HSSQ-001 | T-P4-OVERVIEW | Capture fixture integration | None |
 | HSSQ-002 | T-P4-OVERVIEW | Capture fixture integration | None |
 | HSSQ-003 | T-P4-OVERVIEW | Capture fixture integration | F0-D resource observation |

@@ -22,10 +22,13 @@ pub use hss::{
     HSS_BLOCK_FLAGS_DEFAULT, HSS_MAX_DURATION_S, HSS_MAX_EXPANDED_SAMPLE_BYTES, HSS_MAX_RATE_HZ,
     HSS_MAX_TOP_LEVEL_SELECTORS, HSS_MIN_DURATION_S, HSS_MIN_RATE_HZ,
     HSS_START_FLAG_TIMESTAMP_US_EXPERIMENTAL, HSS_START_FLAGS_698A_MAINLINE, HssCapabilities,
-    HssCaptureReservation, HssCaptureState, HssCrossingDirection, HssDataIntegrity, HssDrainTiming,
-    HssFrameBatch, HssFrameLayout, HssRawFrame, HssRecoveryNotification, HssReservationOutcome,
-    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssStartRegistry, HssThresholdRule,
-    HssVariablePlan, HssWriteResult, HssWriteTiming,
+    HssCaptureReservation, HssCaptureState, HssClockEvidence, HssClockMappingMethod,
+    HssCrossingDirection, HssDataIntegrity, HssDrainTiming, HssFrameBatch, HssFrameLayout,
+    HssIntervalStatistics, HssLossAssessment, HssNormalizedTimeUnit, HssOverflowAssessment,
+    HssQualityBasis, HssQualityEvent, HssQualityEventKind, HssQualityEvidence, HssQualitySummary,
+    HssQualityTracker, HssRawFrame, HssRecoveryNotification, HssReservationOutcome, HssReturnWhen,
+    HssRunSnapshot, HssRunState, HssSourceTimeUnit, HssStartPlan, HssStartRegistry,
+    HssThresholdRule, HssVariablePlan, HssWriteResult, HssWriteTiming, normalize_hss_timestamp_us,
 };
 pub use image::{
     FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,
