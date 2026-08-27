@@ -38,7 +38,7 @@
 - `jlink_inspect` 的 variable、memory、register 和 symbols 成功结果分别按 action 校验；合法寄存器字符串可通过，空、混合或跨 action 结果以 `-32603` 拒绝。
 - 普通 target status 成功结果只包含连接和目标状态，`content` 为空；没有 `ok`、请求回显、空数组或无意义 `null`。
 - `WORKER_UNAVAILABLE` 等内部错误不会泄露到公共合同；该路径稳定映射为 `TARGET_CONNECT_FAILED`。IPC/响应格式故障保留为服务器级错误，不伪装成业务成功。
-- overview 占位结果、资源模板和资源读取统一使用 `jlink-mcp://capture/{capture_id}/raw` 与 `application/vnd.jlink-mcp.capture.v1+binary`；实际不可变内容读取仍由任务 5.5 接通。
+- overview 结果、资源模板和资源读取统一使用 `jlink-mcp://capture/{capture_id}/raw` 与 `application/vnd.jlink-mcp.capture.v1+binary`；任务 5.5 已接通不可变完成内容，T-P1-MCP 只保留合同端到端复核责任。
 - 生产 stdio 二进制完成独立进程 smoke；本次不访问 J-Link DLL、探针或目标，不形成硬件能力证据。
 
 ## Windows Codex 基线复用

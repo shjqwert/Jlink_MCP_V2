@@ -1,7 +1,7 @@
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{BufWriter, ErrorKind, Read, Seek, Write},
+    io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
     os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -172,12 +172,40 @@ impl CaptureSnapshot {
     /// Returns a stable identity, frame, CRC, digest, or local storage error.
     pub(crate) fn read_verified_payload(&self) -> Result<Vec<u8>, JlinkError> {
         let scan = scan_capture(&self.path, true)?;
+        self.verify_scan_identity(&scan)?;
+        Ok(scan.raw_payload)
+    }
+
+    /// Reads the complete immutable, self-describing capture resource after
+    /// re-verifying its header, block CRCs, raw digest, and terminal manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable identity, frame, CRC, digest, size, or local storage error.
+    pub fn read_verified_resource(&self) -> Result<Vec<u8>, JlinkError> {
+        let (mut file, file_len) = open_capture_file(&self.path)?;
+        let scan = scan_capture_file(&mut file, file_len, false)?;
+        self.verify_scan_identity(&scan)?;
+        let resource_len = usize::try_from(file_len)
+            .map_err(|_| storage_error("Capture Store 资源大小无法表示为 usize"))?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|error| storage_error(format!("无法定位原始 capture 资源：{error}")))?;
+        let mut resource = Vec::with_capacity(resource_len);
+        file.read_to_end(&mut resource)
+            .map_err(|error| storage_error(format!("无法读取原始 capture 资源：{error}")))?;
+        if resource.len() != resource_len {
+            return Err(invalid_store("原始 capture 资源长度在读取期间发生变化"));
+        }
+        Ok(resource)
+    }
+
+    fn verify_scan_identity(&self, scan: &CaptureScan) -> Result<(), JlinkError> {
         if scan.header != self.header || scan.manifest.as_ref() != Some(&self.manifest) {
             return Err(invalid_store(
                 "查询期间 Capture Store 自描述身份或终态清单发生变化",
             ));
         }
-        Ok(scan.raw_payload)
+        Ok(())
     }
 }
 
@@ -762,12 +790,25 @@ struct CaptureScan {
 }
 
 fn scan_capture(path: &Path, retain_payload: bool) -> Result<CaptureScan, JlinkError> {
-    let mut file = File::open(path)
+    let (mut file, file_len) = open_capture_file(path)?;
+    scan_capture_file(&mut file, file_len, retain_payload)
+}
+
+fn open_capture_file(path: &Path) -> Result<(File, u64), JlinkError> {
+    let file = File::open(path)
         .map_err(|error| storage_error(format!("无法打开 {}：{error}", path.display())))?;
     let file_len = file
         .metadata()
         .map_err(|error| storage_error(format!("无法读取 capture 元数据：{error}")))?
         .len();
+    Ok((file, file_len))
+}
+
+fn scan_capture_file(
+    file: &mut File,
+    file_len: u64,
+    retain_payload: bool,
+) -> Result<CaptureScan, JlinkError> {
     let mut fixed = [0_u8; FILE_HEADER_LEN];
     file.read_exact(&mut fixed)
         .map_err(|error| invalid_store(format!("Capture Store 头不完整：{error}")))?;
@@ -821,7 +862,7 @@ fn scan_capture(path: &Path, retain_payload: bool) -> Result<CaptureScan, JlinkE
             return Err(storage_error(format!("无法读取 Capture Store 块：{error}")));
         }
         if &magic == TERMINAL_MAGIC {
-            read_terminal(&mut file, file_len, &mut scan, &raw_hasher)?;
+            read_terminal(file, file_len, &mut scan, &raw_hasher)?;
             return Ok(scan);
         }
         if &magic != BLOCK_MAGIC {
@@ -829,13 +870,7 @@ fn scan_capture(path: &Path, retain_payload: bool) -> Result<CaptureScan, JlinkE
             scan.trailing_bytes = file_len.saturating_sub(position);
             return Ok(scan);
         }
-        if !read_block(
-            &mut file,
-            file_len,
-            &mut scan,
-            &mut raw_hasher,
-            retain_payload,
-        )? {
+        if !read_block(file, file_len, &mut scan, &mut raw_hasher, retain_payload)? {
             return Ok(scan);
         }
     }

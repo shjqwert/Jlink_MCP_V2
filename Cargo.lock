@@ -435,6 +435,7 @@ dependencies = [
 name = "jlink-mcp"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "gimli",
  "jlink-capture",
  "jlink-domain",

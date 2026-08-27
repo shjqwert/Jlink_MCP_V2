@@ -9,6 +9,7 @@ resolver = "3"
 
 [workspace.dependencies]
 crc32fast = "=1.5.0"
+data-encoding = "=2.11.1"
 gimli = { version = "=0.32.3", default-features = false, features = ["read", "std"] }
 jsonschema = { version = "=0.51.0", default-features = false }
 object = { version = "=0.37.3", default-features = false, features = ["elf", "read_core", "std"] }

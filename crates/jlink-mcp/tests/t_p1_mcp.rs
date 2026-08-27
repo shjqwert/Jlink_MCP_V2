@@ -450,7 +450,7 @@ fn t_p1_mcp_resource_link_template_and_read_share_one_contract() {
 }
 
 #[test]
-fn t_p1_mcp_runtime_keeps_raw_resource_unavailable_until_5_5() {
+fn t_p1_mcp_runtime_reports_an_unavailable_unknown_raw_resource() {
     let paths = ConfigPaths::new(
         PathBuf::from("unused-project.toml"),
         PathBuf::from("unused-user.toml"),

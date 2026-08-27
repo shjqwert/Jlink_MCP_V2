@@ -12,7 +12,7 @@ PASS。T-P4-OVERVIEW 已覆盖 HSSQ-001、HSSQ-002、HSSQ-003 的只读完成快
 - 顶层变量按请求顺序登记稳定 `s0..sN`；完整路径只在 `dictionary` 出现，变量项只含 `series/samples/changes`。
 - `changes` 统计相邻完整样本的顶层选择字节是否变化；不解码成员，不生成成员预览。
 - `events` 统计持久化写入、恢复和质量事件出现次数；6.98a 的 loss/overflow 为 `unknown` 时保留 `quality`，空 `quality.events` 省略。
-- `query.overview` 只访问不可变完成文件，不加载 J-Link DLL、不连接 Worker、不创建未知 capture；结果附带完整原始资源链接，资源读取仍由 5.5 接通。
+- `query.overview` 只访问不可变完成文件，不加载 J-Link DLL、不连接 Worker、不创建未知 capture；结果附带由 5.5 接通的完整原始资源链接。
 - 生命周期为 `failed/aborted` 的不可变部分文件只能通过 status 报告范围；overview 明确拒绝，不能伪装为完整结果。
 
 ## 主要证据

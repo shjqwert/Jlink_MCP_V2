@@ -87,8 +87,8 @@ public contract and is recorded in the implementation constraints.
 | HSSQ-007 | T-P4-TIMELINE | `validation/p4-timeline.md` interval + uncertainty relation fixture | F0-A clock evidence |
 | HSSQ-008 | T-P4-TIMELINE | `validation/p4-timeline.md` incremental dictionary pages | None |
 | HSSQ-009 | T-P4-TIMELINE | `validation/p4-timeline.md` cursor binding/tamper/expiry fixture | None |
-| HSSQ-010 | T-P4-RESOURCE | Capture resource integration | F0-A format + F0-D link |
-| HSSQ-011 | T-P4-RESOURCE | Contract/resource integration | F0-D |
+| HSSQ-010 | T-P4-RESOURCE | `validation/p4-resource.md` immutable full-file/read-after-disconnect/checksum fixture | F0-A format + F0-D link |
+| HSSQ-011 | T-P4-RESOURCE | `validation/p4-resource.md` binary-data/no-image + P4 stage smoke | F0-D |
 
 ## Stage smoke and evidence reuse
 

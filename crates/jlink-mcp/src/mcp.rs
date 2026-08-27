@@ -2,6 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 
+use data_encoding::BASE64;
 use jlink_domain::{ErrorCode, JlinkError};
 use serde_json::{Map, Value, json};
 
@@ -44,6 +45,19 @@ impl ToolCall {
         Self::Success {
             structured_content,
             content: vec![raw_capture_resource_link(capture_id)],
+        }
+    }
+
+    /// Creates one complete binary MCP resource from a verified immutable capture.
+    #[must_use]
+    pub fn raw_capture_resource(capture_id: &str, resource: &[u8]) -> Self {
+        Self::Success {
+            structured_content: json!({}),
+            content: vec![json!({
+                "uri": format!("jlink-mcp://capture/{capture_id}/raw"),
+                "mimeType": RAW_CAPTURE_MIME,
+                "blob": BASE64.encode(resource)
+            })],
         }
     }
 }

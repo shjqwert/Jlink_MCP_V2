@@ -937,6 +937,13 @@ impl Runtime {
         }
     }
 
+    fn read_capture_resource(&self, uri: &str) -> Result<ToolCall, JlinkError> {
+        let capture_id = capture_id_from_resource_uri(uri)?;
+        let snapshot = self.completed_snapshot(&json!({ "capture_id": capture_id }))?;
+        let resource = snapshot.read_verified_resource()?;
+        Ok(ToolCall::raw_capture_resource(capture_id, &resource))
+    }
+
     fn read_hss_status(&self, arguments: &Value) -> Result<HssRunSnapshot, JlinkError> {
         let client = &self
             .attachment
@@ -1246,9 +1253,8 @@ impl ToolDispatcher for Runtime {
     }
 
     fn read_resource(&mut self, uri: &str) -> ToolCall {
-        ToolCall::Unavailable(format!(
-            "资源 {uri} 的占位合同已建立，读取实现将在任务 5.5 接通"
-        ))
+        self.read_capture_resource(uri)
+            .unwrap_or_else(ToolCall::Error)
     }
 }
 
@@ -1351,6 +1357,27 @@ fn capture_not_found(arguments: &Value) -> JlinkError {
         error = error.with_detail("capture_key", capture_key.clone());
     }
     error
+}
+
+fn capture_id_from_resource_uri(uri: &str) -> Result<&str, JlinkError> {
+    let Some(capture_id) = uri
+        .strip_prefix("jlink-mcp://capture/")
+        .and_then(|path| path.strip_suffix("/raw"))
+    else {
+        return Err(JlinkError::new(
+            ErrorCode::ValueInvalid,
+            "资源 URI 必须匹配 jlink-mcp://capture/{capture_id}/raw",
+            false,
+        ));
+    };
+    if capture_id.is_empty() || capture_id.contains('/') {
+        return Err(JlinkError::new(
+            ErrorCode::ValueInvalid,
+            "资源 URI 必须包含一个有效的 capture_id",
+            false,
+        ));
+    }
+    Ok(capture_id)
 }
 
 impl Drop for Runtime {

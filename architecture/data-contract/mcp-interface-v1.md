@@ -642,6 +642,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 原始资源包含完整 path→`series_id` 字典、DWARF 路径规则、数组维度、位域范围、union 歧义、编码、格式版本、采集边界、完整性信息和校验和。
 
+`resources/read` 只接受上述规范 URI，并在返回前重新验证版本头、头/块/终态 CRC、原始 payload SHA-256、采集身份和终态清单。成功结果的 `contents` 只有一个二进制项：`uri` 为相同规范 URI，`mimeType` 为固定 MIME，`blob` 为完整 `.capture` 文件的标准 Base64；不得返回服务端生成的图片或仅抽取后的 payload。读取只依赖已完成的不可变 Capture Store 和已配置的探针身份，不要求活动 Worker 或目标连接。V1 格式按启动计划中顶层变量的稳定顺序定义 `s0..sN`，因此完整路径字典可由资源内计划独立恢复，无需当前 ELF 或会话。
+
 #### `changes`
 
 ```json
