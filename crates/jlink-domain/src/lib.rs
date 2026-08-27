@@ -19,8 +19,11 @@ pub use dwarf::{
 };
 pub use error::{ErrorCode, JlinkError};
 pub use hss::{
-    HSS_BLOCK_FLAGS_DEFAULT, HSS_START_FLAG_TIMESTAMP_US_EXPERIMENTAL,
-    HSS_START_FLAGS_698A_MAINLINE, HssFrameBatch, HssFrameLayout, HssRawFrame,
+    HSS_BLOCK_FLAGS_DEFAULT, HSS_MAX_DURATION_S, HSS_MAX_EXPANDED_SAMPLE_BYTES, HSS_MAX_RATE_HZ,
+    HSS_MAX_TOP_LEVEL_SELECTORS, HSS_MIN_DURATION_S, HSS_MIN_RATE_HZ,
+    HSS_START_FLAG_TIMESTAMP_US_EXPERIMENTAL, HSS_START_FLAGS_698A_MAINLINE, HssCapabilities,
+    HssCaptureReservation, HssFrameBatch, HssFrameLayout, HssRawFrame, HssReservationOutcome,
+    HssReturnWhen, HssStartPlan, HssStartRegistry, HssVariablePlan,
 };
 pub use image::{
     FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,

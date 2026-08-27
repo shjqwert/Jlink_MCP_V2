@@ -13,10 +13,11 @@ use std::{
 
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
-    JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter, TargetConnectionSpec,
-    TargetInterface, TargetState, ValidationCheck, ValidationCheckKind, ValidationReport,
-    validate_write_count,
+    HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
+    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckKind,
+    ValidationReport, validate_write_count,
 };
+use serde_json::json;
 use windows_sys::Win32::{
     Foundation::{FreeLibrary, GetLastError, HMODULE},
     System::LibraryLoader::{
@@ -387,7 +388,7 @@ pub(crate) struct DllGateway {
     opened: bool,
     connected_spec: Option<TargetConnectionSpec>,
     target_id: Option<u32>,
-    _path: PathBuf,
+    path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
 }
 
@@ -429,7 +430,7 @@ impl DllGateway {
             opened: false,
             connected_spec: None,
             target_id: None,
-            _path: path.to_path_buf(),
+            path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
     }
@@ -437,6 +438,46 @@ impl DllGateway {
     /// Reports whether this gateway currently owns a loaded module.
     pub(crate) const fn is_loaded(&self) -> bool {
         !self.module.is_null()
+    }
+
+    /// Reads and validates the exact HSS capability set needed before Start.
+    pub(crate) fn hss_capabilities(&self) -> Result<HssCapabilities, JlinkError> {
+        let missing_exports = self.api.hss.missing_exports();
+        if !missing_exports.is_empty() {
+            return Err(JlinkError::new(
+                ErrorCode::DllExportMissing,
+                "当前 DLL 缺少必要 HSS 导出，未启动采集",
+                false,
+            )
+            .with_detail("missing_exports", json!(missing_exports))
+            .with_detail("dll_path", json!(self.path.display().to_string()))
+            .with_detail(
+                "recommendation",
+                json!("使用身份已冻结且包含 GetCaps/Start/Read/Stop 的 J-Link 6.98a DLL"),
+            ));
+        }
+        let mut caps = HssCaps::default();
+        let get_caps = self
+            .api
+            .hss
+            .get_caps
+            .expect("complete HSS export set contains GetCaps");
+        // SAFETY: `caps` is writable and the frozen 6.98a ABI was verified in F0-A.
+        let result = unsafe { get_caps(&raw mut caps) };
+        if result < 0 {
+            return Err(JlinkError::new(
+                ErrorCode::HssUnsupported,
+                format!("JLINK_HSS_GetCaps 返回失败状态 {result}"),
+                false,
+            )
+            .with_detail("dll_path", json!(self.path.display().to_string())));
+        }
+        HssCapabilities::frozen_698a(
+            caps.max_blocks,
+            caps.max_frequency_hz,
+            caps.flags,
+            caps.reserved,
+        )
     }
 
     /// Reads authoritative Flash regions from the loaded J-Link device database.
@@ -1325,31 +1366,23 @@ impl DllGateway {
                 "确认目标正在运行且支持后台内存访问",
             ),
         });
-        let missing_hss_exports = self.api.hss.missing_exports();
-        if missing_hss_exports.is_empty() {
-            let mut caps = HssCaps::default();
-            let get_caps = self
-                .api
-                .hss
-                .get_caps
-                .expect("complete HSS export set contains GetCaps");
-            // SAFETY: `caps` is writable and the frozen 6.98a ABI was verified in F0-A.
-            let hss_result = unsafe { get_caps(&raw mut caps) };
-            checks.push(check(
+        match self.hss_capabilities() {
+            Ok(caps) => checks.push(passed_check(
                 ValidationCheckKind::HssCapability,
-                hss_result >= 0 && caps.max_blocks > 0 && caps.max_frequency_hz > 0,
                 format!(
-                    "return={hss_result}，max_blocks={}，max_frequency_hz={}，flags={}",
-                    caps.max_blocks, caps.max_frequency_hz, caps.flags
+                    "max_blocks={}，max_frequency_hz={}，source_timestamp={} Hz/{} us，monotonic={}",
+                    caps.max_blocks(),
+                    caps.max_frequency_hz(),
+                    caps.source_timestamp_frequency_hz(),
+                    caps.source_timestamp_resolution_us(),
+                    caps.source_timestamp_monotonic()
                 ),
-                "确认使用冻结的 J-Link 6.98a DLL、已连接目标和支持 HSS 的探针",
-            ));
-        } else {
-            checks.push(failed_check(
+            )),
+            Err(error) => checks.push(failed_check(
                 ValidationCheckKind::HssCapability,
-                format!("缺少 HSS 导出：{}", missing_hss_exports.join(", ")),
+                error.to_string(),
                 "使用包含 GetCaps/Start/Read/Stop 的冻结 J-Link DLL；普通调试能力不受影响",
-            ));
+            )),
         }
         ValidationReport {
             valid: checks.iter().all(|item| item.passed),

@@ -263,6 +263,8 @@ fn public_tool_error(error: JlinkError) -> Result<Value, String> {
         ErrorCode::RegisterNotFound => "REGISTER_NOT_FOUND",
         ErrorCode::VerifyFailed => "VERIFY_FAILED",
         ErrorCode::FrameInvalid => "FRAME_INVALID",
+        ErrorCode::HssUnsupported => "HSS_UNSUPPORTED",
+        ErrorCode::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
         ErrorCode::ExecutionUncertain => "EXECUTION_UNCERTAIN",
         ErrorCode::InvalidRequestId
         | ErrorCode::UnknownProtocolVersion
@@ -1043,5 +1045,17 @@ mod tests {
             result["structuredContent"]["error"]["code"],
             "FRAME_INVALID"
         );
+    }
+
+    #[test]
+    fn p3_start_errors_remain_structured_and_distinct() {
+        for (code, expected) in [
+            (ErrorCode::HssUnsupported, "HSS_UNSUPPORTED"),
+            (ErrorCode::CaptureKeyConflict, "CAPTURE_KEY_CONFLICT"),
+        ] {
+            let result = public_tool_error(JlinkError::new(code, "start rejected", false))
+                .expect("P3 start error is public");
+            assert_eq!(result["structuredContent"]["error"]["code"], expected);
+        }
     }
 }

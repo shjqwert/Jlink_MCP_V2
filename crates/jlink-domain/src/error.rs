@@ -69,6 +69,10 @@ pub enum ErrorCode {
     VerifyFailed,
     /// Raw HSS bytes cannot be interpreted as the frozen frame layout.
     FrameInvalid,
+    /// The selected DLL, probe, target, or frame exceeds the supported HSS capability.
+    HssUnsupported,
+    /// One capture key was reused for a different normalized start request.
+    CaptureKeyConflict,
 }
 
 impl ErrorCode {
@@ -107,6 +111,8 @@ impl ErrorCode {
             Self::RegisterNotFound => "REGISTER_NOT_FOUND",
             Self::VerifyFailed => "VERIFY_FAILED",
             Self::FrameInvalid => "FRAME_INVALID",
+            Self::HssUnsupported => "HSS_UNSUPPORTED",
+            Self::CaptureKeyConflict => "CAPTURE_KEY_CONFLICT",
         }
     }
 }

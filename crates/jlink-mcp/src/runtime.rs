@@ -1,12 +1,12 @@
 //! Process-owned configuration and Worker orchestration behind the MCP boundary.
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, sync::Arc};
 
 use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    JlinkError, MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
-    ValidationAfter, VariableSelector, WriteVerify,
+    HssReturnWhen, HssStartPlan, JlinkError, MemoryRange, ProgramAfter, ProgramRequest,
+    TargetConnectionSpec, TargetInterface, ValidationAfter, VariableSelector, WriteVerify,
 };
 use serde_json::{Map, Value, json};
 
@@ -17,7 +17,7 @@ use crate::{
         resolve_config, validate_dll_identity,
     },
     mcp::{ToolCall, ToolDispatcher},
-    symbols::SymbolCache,
+    symbols::{SymbolCache, SymbolIndex},
     worker_client::{WorkerAttachment, WorkerLaunchSpec, attach_or_spawn},
 };
 
@@ -45,6 +45,67 @@ impl Runtime {
             attachment: None,
             symbol_cache: SymbolCache::new(),
         }
+    }
+
+    /// Builds the immutable HSS sampling plan without calling the DLL or target.
+    ///
+    /// This is the production planning boundary consumed by the Worker scheduler
+    /// in P3-4.3; it does not report a capture as started.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable configuration, image, DWARF, selector, value, identity, or
+    /// HSS capability errors when the request cannot form one fixed sampling frame.
+    pub fn prepare_hss_start(&mut self, arguments: &Value) -> Result<HssStartPlan, JlinkError> {
+        let (index, firmware) = self.load_symbol_planning_context("HSS")?;
+        let variables = arguments
+            .get("variables")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ValueInvalid,
+                    "HSS variables 必须是非空顶层选择项数组",
+                    false,
+                )
+            })?;
+        let mut plans = Vec::with_capacity(variables.len());
+        for variable in variables {
+            let path = variable
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    JlinkError::new(ErrorCode::ValueInvalid, "HSS 顶层变量缺少 path", false)
+                })?;
+            let selector = VariableSelector::new(path, element_slice(variable)?)?;
+            plans.push(self.symbol_cache.access_plan(&index, &selector)?);
+        }
+        let capture_key = arguments
+            .get("capture_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                JlinkError::new(ErrorCode::ValueInvalid, "HSS 缺少 capture_key", false)
+            })?;
+        let duration_s = required_u32(arguments, "duration_s")?;
+        let rate_hz = required_u32(arguments, "rate_hz")?;
+        let return_when = match arguments.get("return_when").and_then(Value::as_str) {
+            Some("started") => HssReturnWhen::Started,
+            Some("completed") => HssReturnWhen::Completed,
+            _ => {
+                return Err(JlinkError::new(
+                    ErrorCode::ValueInvalid,
+                    "HSS return_when 必须为 started 或 completed",
+                    false,
+                ));
+            }
+        };
+        HssStartPlan::new(
+            capture_key,
+            duration_s,
+            rate_hz,
+            return_when,
+            plans,
+            firmware,
+        )
     }
 
     /// Derives the sibling Worker executable and default configuration locations.
@@ -498,11 +559,25 @@ impl Runtime {
         &mut self,
         arguments: &Value,
     ) -> Result<(AccessPlan, FirmwareIdentityPlan), JlinkError> {
+        let (index, firmware) = self.load_symbol_planning_context("变量操作")?;
+        let path = arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .expect("MCP Schema guarantees variable.path");
+        let selector = VariableSelector::new(path, element_slice(arguments)?)?;
+        let plan = self.symbol_cache.access_plan(&index, &selector)?;
+        Ok((plan, firmware))
+    }
+
+    fn load_symbol_planning_context(
+        &mut self,
+        operation: &str,
+    ) -> Result<(Arc<SymbolIndex>, FirmwareIdentityPlan), JlinkError> {
         let resolved = self.resolve()?;
         let elf_path = resolved.symbols.elf.ok_or_else(|| {
             JlinkError::new(
                 ErrorCode::ConfigInvalid,
-                "symbols.elf 未配置，无法执行变量操作",
+                format!("symbols.elf 未配置，无法执行{operation}"),
                 false,
             )
         })?;
@@ -526,13 +601,7 @@ impl Runtime {
             })?;
         let firmware = FirmwareImage::parse(file_name, &data, None)?.symbol_identity_plan()?;
         let index = self.symbol_cache.load_bytes(&data)?;
-        let path = arguments
-            .get("path")
-            .and_then(Value::as_str)
-            .expect("MCP Schema guarantees variable.path");
-        let selector = VariableSelector::new(path, element_slice(arguments)?)?;
-        let plan = self.symbol_cache.access_plan(&index, &selector)?;
-        Ok((plan, firmware))
+        Ok((index, firmware))
     }
 
     fn execute_debug(&mut self, request: &DebugRequest) -> Result<DebugResult, JlinkError> {
@@ -739,6 +808,23 @@ fn element_slice(arguments: &Value) -> Result<Option<ElementSlice>, JlinkError> 
             ElementSlice::new(start, count)
         })
         .transpose()
+}
+
+fn required_u32(arguments: &Value, name: &str) -> Result<u32, JlinkError> {
+    let value = arguments.get(name).and_then(Value::as_u64).ok_or_else(|| {
+        JlinkError::new(
+            ErrorCode::ValueInvalid,
+            format!("HSS {name} 必须是无符号整数"),
+            false,
+        )
+    })?;
+    u32::try_from(value).map_err(|_| {
+        JlinkError::new(
+            ErrorCode::ValueInvalid,
+            format!("HSS {name} 超出 u32 范围"),
+            false,
+        )
+    })
 }
 
 fn write_verify(arguments: &Value) -> Result<WriteVerify, JlinkError> {

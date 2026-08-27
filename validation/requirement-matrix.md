@@ -67,9 +67,9 @@ public contract and is recorded in the implementation constraints.
 | DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；`validation/p2-stage.md` | F0-A |
 | DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
 | DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
-| HSSA-001 | T-P3-START | Contract + J-Link hardware | F0-A |
-| HSSA-002 | T-P3-START | IAR fixture + J-Link hardware | F0-A + F0-C |
-| HSSA-003 | T-P3-START | J-Link hardware diagnostics | F0-A |
+| HSSA-001 | T-P3-START | `validation/p3-start.md` normalized request/key fixture + frozen J-Link capability preflight | F0-A |
+| HSSA-002 | T-P3-START | `validation/p3-start.md` IAR DWARF AccessPlan/frame fixture + frozen J-Link capability preflight | F0-A + F0-C |
+| HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
 | HSSA-004 | T-P3-RUN | Timed J-Link hardware capture | F0-A |
 | HSSA-005 | T-P3-STATE | State-machine/fault fixture | F0-A + F0-B |
 | HSSA-006 | T-P3-STORE | Local storage integration | F0-A throughput |

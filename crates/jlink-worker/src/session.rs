@@ -462,10 +462,12 @@ fn reset_target<T: RecoveryIo>(
     actions.extend([RecoveryAction::Reset, RecoveryAction::RunAfterReset]);
     let final_result = io.reset_run_and_observe();
     if matches!(final_result, Ok(TargetState::Running)) {
-        return Ok((
-            TargetState::Running,
-            vec![RecoveryNotification::ResetAfterFault],
-        ));
+        let mut notifications = Vec::new();
+        if actions.contains(&RecoveryAction::Resume) {
+            notifications.push(RecoveryNotification::ResumedFromHalt);
+        }
+        notifications.push(RecoveryNotification::ResetAfterFault);
+        return Ok((TargetState::Running, notifications));
     }
     let diagnostics = io.fault_diagnostics();
     let mut error = JlinkError::new(
@@ -567,6 +569,24 @@ mod tests {
             recover_target(&mut io, TargetState::HardFault).expect("reset succeeds");
         assert_eq!(state, TargetState::Running);
         assert_eq!(notifications, [RecoveryNotification::ResetAfterFault]);
+    }
+
+    #[test]
+    fn t_p3_start_reuses_session_resume_then_reset_and_preserves_both_notices() {
+        let mut io = ScriptedRecovery {
+            resume: VecDeque::from([Ok(TargetState::HardFault)]),
+            reset: VecDeque::from([Ok(TargetState::Running)]),
+        };
+        let (state, notifications) =
+            recover_target(&mut io, TargetState::Halted).expect("shared recovery succeeds");
+        assert_eq!(state, TargetState::Running);
+        assert_eq!(
+            notifications,
+            [
+                RecoveryNotification::ResumedFromHalt,
+                RecoveryNotification::ResetAfterFault
+            ]
+        );
     }
 
     #[test]
