@@ -14,8 +14,8 @@
 | FT-002 | 已确认 | 六个工具描述重复公共合同、`structuredContent` 和副作用恢复说明，增加每个 `tools/list` 的固定上下文。 | 公共规则只保留一个权威入口；工具描述仅保留自身 action、关键约束和必要示例。 |
 | FT-003 | 已确认 | `jlink_hss` 的联合输出在多个分支重复展开完整 quality 结构，Schema 体积明显高于其他工具。 | 在不改变严格输入输出、四种 query view 和客户端兼容性的前提下复用公共定义，并比较优化前后实际 `tools/list`。 |
 | FT-004 | 已确认 | Skill 根规则、reference、MCP instructions 和工具描述存在内容重叠；每个新的 J-Link 用户回合还会重新加载完整根 Skill。 | 明确各层信息所有权，保持根 Skill 路由加按需 reference 的渐进披露；不得删除状态复用、副作用和错误恢复规则。 |
-| FT-005 | 已确认 | 已连接且验证通过的运行态目标读取规范寄存器 `PC` 返回 `REGISTER_NOT_FOUND`，详情为 `dll_status: 255`；执行 `halt` 后同一路径立即成功。错误把“当前状态下读取失败”表达成“寄存器不存在”。 | 区分目标状态/访问失败与真实目录缺失；增加同一 `PC` 在 running/halted 两种状态下的公共错误映射回归。 |
-| FT-006 | 待调查 | 在阶段间首次读取 `PC` 返回 `TARGET_STATE_INVALID`，随后 `status` 确认 `disconnected`；重新连接返回 `resumed_from_halt`。目前不能证明这是预期 MCP/Worker 生命周期结束还是异常会话丢失。 | 后续阶段记录每次生命周期边界和最终状态；只有能稳定复现非预期断开时才转为实现缺陷。 |
+| FT-005 | 完成 | 根因是寄存器已在目录中命中后，DLL 单项读取状态非零仍被映射成 `REGISTER_NOT_FOUND`。修复后只有目录缺失返回该错误；running 返回 `TARGET_STATE_INVALID`，halted 仍失败返回 `TARGET_CONNECT_FAILED`。 | 单元、公共 Schema/错误 smoke、真机 running→halted→running 回归通过。 |
+| FT-006 | 完成（预期生命周期） | 同一 MCP PID 内 Worker PID 稳定，连续寄存器/控制调用没有断连；MCP 结束后 Worker 随父进程退出，新 MCP 生命周期从 `disconnected` 和新 PID 对重新开始。 | 已证明阶段间断连与 MCP 父进程生命周期一致，不修改 Worker 生命周期代码。 |
 | FT-007 | 兼容性复核 | 错误同时出现在 `content.text`、`structuredContent.error` 和 `isError`，存在信息重复，但可能服务于不同 MCP 客户端兼容层。 | 先验证目标客户端实际消费路径；不得仅为减小文本删除结构化错误或破坏兼容性。 |
 | FT-008 | 已确认 | `jlink_write.variable` 的实时 Schema 将顶层数组限定为 `Array<string>`，但数组切片传入 `["17","34"]` 时运行时返回 `VALUE_INVALID`，并要求 JSON integer 或 `$int`；同一数组放入结构体对象并使用整数元素可以成功写入。 | 统一 Schema、反序列化和运行时整数模型；增加标量数组整写、切片写、结构体内嵌数组及超出安全整数范围的合同测试。 |
 | FT-009 | 完成 | 根因是 Flash 主操作成功后，要到后置状态也成功才记录 Flash 已修改。修复后主操作成功立即使固件/验证证据失效；后置失败关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`，固定报告操作、阶段、`after`、Flash 修改事实和原始错误码。 | 单元测试、workspace 门禁和真机故障路径通过；擦除未重放，状态立即为 `faulted/unknown`，随后完成固件重烧、独立 verify 和 running 恢复。 |
@@ -59,7 +59,13 @@
 | Reset run | `jlink_control.reset(after=run)` 返回 `{}`；`status=running`。 |
 | 固件执行 | `gucCddAdcCount` 连续回读 `5715 → 5771`，证明最终固件继续执行。 |
 
-CPU 控制 action 本身通过；FT-005 是当前确认的公共错误分类问题。最终目标保持 `connected/running`，本阶段没有变量写入、Flash 操作或 HSS。
+CPU 控制 action 本身通过；FT-005 的公共错误分类已在后续修复回归中完成。最终目标保持 `connected/running`，本阶段没有变量写入、Flash 操作或 HSS。
+
+### FT-005/006 修复回归
+
+- 第一生命周期固定为 MCP PID `6984`、Worker PID `63616`。running 状态读取 `PC` 返回 `TARGET_STATE_INVALID`，详情为 `dll_status=255`、`target_state=running` 和显式 halt 建议；不再误报 `REGISTER_NOT_FOUND`。
+- `halt` 返回 `{}`，连续两次读取 `PC` 均成功并返回 `0x00029566`；MCP/Worker PID 在连续调用前后未变化。`resume` 返回 `{}`，只读状态证据为 `connected/running`。
+- MCP 进程结束后，原 MCP/Worker 均在 5 秒内退出。新生命周期先返回 `connection=disconnected`，随后 connect 建立新的 MCP PID `53396`、Worker PID `19748`；这证明 FT-006 是父进程边界，不是同一 MCP 内 Worker 丢失。最终断开时 CPU 保持 running。
 
 ## 安全写入与 Flash 阶段证据摘要
 

@@ -50,6 +50,14 @@
 - **WHEN** Agent 请求一个受支持的核心寄存器
 - **THEN** 系统返回该寄存器的无损数值
 
+#### Scenario: 运行态寄存器暂不可读
+- **WHEN** 规范寄存器已在目标目录中找到，但 DLL 在目标 running 时报告单项读取失败
+- **THEN** 系统返回 `TARGET_STATE_INVALID`、`target_state=running` 和显式 halt 建议，不得返回 `REGISTER_NOT_FOUND`
+
+#### Scenario: 暂停态寄存器读取失败
+- **WHEN** 规范寄存器已在目标目录中找到，但目标 halted 时 DLL 仍报告单项读取失败
+- **THEN** 系统返回 `TARGET_CONNECT_FAILED` 和实际 `target_state`，不得返回 `REGISTER_NOT_FOUND`
+
 #### Scenario: 写入只读寄存器
 - **WHEN** Agent 请求写入当前目标声明为只读的核心寄存器
 - **THEN** 系统在设备调用前拒绝请求并报告寄存器不可写

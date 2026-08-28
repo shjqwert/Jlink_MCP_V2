@@ -341,7 +341,7 @@ V1 单次长度范围为 `1..4096` 字节。结果仅包含按内存地址顺序
 { "value": "0x08001234" }
 ```
 
-V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`PSP`、`APSR`、`EPSR`、`IPSR`、`PRIMASK`、`BASEPRI`、`FAULTMASK`、`CONTROL`，并与当前目标实际目录取交集。名称区分大小写，不接受 `R13/R14/R15` 等别名；名称不准确或目标不支持时返回 `REGISTER_NOT_FOUND`。
+V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`PSP`、`APSR`、`EPSR`、`IPSR`、`PRIMASK`、`BASEPRI`、`FAULTMASK`、`CONTROL`，并与当前目标实际目录取交集。名称区分大小写，不接受 `R13/R14/R15` 等别名；只有名称未出现在目标目录时返回 `REGISTER_NOT_FOUND`。目录已命中但运行态不可读时返回 `TARGET_STATE_INVALID` 和 `target_state: "running"`；暂停态仍读取失败时返回 `TARGET_CONNECT_FAILED`。
 
 ### 6.4 `symbols`
 

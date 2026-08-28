@@ -1183,13 +1183,16 @@ impl DllGateway {
             )));
         }
         if status != 0 {
-            return Err(JlinkError::new(
-                ErrorCode::RegisterNotFound,
-                format!("当前目标不能读取核心寄存器 {}", register.canonical_name()),
-                false,
-            )
-            .with_detail("register", serde_json::json!(register.canonical_name()))
-            .with_detail("dll_status", serde_json::json!(status)));
+            let target_state = self.observe_target_state().map_err(|error| {
+                error
+                    .with_detail("register", serde_json::json!(register.canonical_name()))
+                    .with_detail("dll_status", serde_json::json!(status))
+            })?;
+            return Err(classify_register_read_failure(
+                register,
+                status,
+                target_state,
+            ));
         }
         Ok(value)
     }
@@ -1615,6 +1618,41 @@ fn classify_observed_target_state(
     }
 }
 
+fn classify_register_read_failure(
+    register: CoreRegister,
+    dll_status: u8,
+    target_state: TargetState,
+) -> JlinkError {
+    let (code, message) = if target_state == TargetState::Running {
+        (
+            ErrorCode::InvalidStateTransition,
+            format!(
+                "目标运行时不能读取核心寄存器 {}；请先显式 halt",
+                register.canonical_name()
+            ),
+        )
+    } else {
+        (
+            ErrorCode::TargetConnectFailed,
+            format!(
+                "目标处于 {target_state:?} 时读取核心寄存器 {} 失败",
+                register.canonical_name()
+            ),
+        )
+    };
+    let mut error = JlinkError::new(code, message, true)
+        .with_detail("register", serde_json::json!(register.canonical_name()))
+        .with_detail("dll_status", serde_json::json!(dll_status))
+        .with_detail("target_state", serde_json::json!(target_state));
+    if target_state == TargetState::Running {
+        error = error.with_detail(
+            "recommendation",
+            serde_json::json!("先调用 jlink_control.halt，再读取核心寄存器"),
+        );
+    }
+    error
+}
+
 fn hss_start_error(status: i32) -> JlinkError {
     JlinkError::new(
         ErrorCode::HssStartFailed,
@@ -1731,8 +1769,8 @@ mod tests {
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
-        HssCaps, classify_observed_target_state, hss_start_error, require_flash_reset_halted,
-        validate_exec_command_result, validate_read_mem_result,
+        HssCaps, classify_observed_target_state, classify_register_read_failure, hss_start_error,
+        require_flash_reset_halted, validate_exec_command_result, validate_read_mem_result,
     };
 
     unsafe extern "C" fn hss_get_caps_stub(_caps: *mut HssCaps) -> i32 {
@@ -1840,6 +1878,24 @@ mod tests {
         let hardfault = classify_observed_target_state(true, || Ok(3))
             .expect("halted HardFault is classified from ICSR");
         assert_eq!(hardfault, TargetState::HardFault);
+    }
+
+    #[test]
+    fn register_item_failure_distinguishes_running_from_halted_access() {
+        let running = classify_register_read_failure(CoreRegister::Pc, 255, TargetState::Running);
+        assert_eq!(running.code, ErrorCode::InvalidStateTransition);
+        assert!(running.retryable);
+        let running_details = running.details.expect("running details");
+        assert_eq!(
+            running_details["target_state"],
+            serde_json::json!("running")
+        );
+
+        let halted = classify_register_read_failure(CoreRegister::Pc, 255, TargetState::Halted);
+        assert_eq!(halted.code, ErrorCode::TargetConnectFailed);
+        assert!(halted.retryable);
+        let halted_details = halted.details.expect("halted details");
+        assert_eq!(halted_details["target_state"], serde_json::json!("halted"));
     }
 
     #[test]
