@@ -300,7 +300,8 @@ fn t_p4_timeline_cursor_continues_event_neighborhood_changes() {
             "jsonrpc": "2.0", "id": 1, "method": "tools/call",
             "params": { "name": "jlink_hss", "arguments": {
                 "action": "query", "capture_id": "cap-timeline", "view": "around_event",
-                "event_id": "e0", "before_us": 0, "after_us": 2_000, "limit": 1
+                "event_id": "e0", "before_us": 0, "after_us": 2_000,
+                "series": ["s0", "s1"], "limit": 1
             }}
         })],
         &mut runtime,
@@ -329,6 +330,30 @@ fn t_p4_timeline_cursor_continues_event_neighborhood_changes() {
     assert_eq!(second["relations"][0]["relation"], "before");
     assert_eq!(second["truncated"], false);
     assert!(second.get("next_cursor").is_none());
+
+    let filtered = exchange(
+        &[json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "jlink_hss", "arguments": {
+                "action": "query", "capture_id": "cap-timeline", "view": "around_event",
+                "event_id": "e0", "before_us": 0, "after_us": 2_000,
+                "series": ["s1"], "limit": 10
+            }}
+        })],
+        &mut runtime,
+    );
+    let filtered = &filtered[0]["result"]["structuredContent"];
+    assert_eq!(filtered["dictionary"], json!({ "s1": "fixture.second" }));
+    assert!(
+        filtered["changes"]
+            .as_array()
+            .is_some_and(|changes| changes.iter().all(|change| change["series"] == "s1"))
+    );
+    assert!(
+        filtered["relations"]
+            .as_array()
+            .is_some_and(|relations| relations.iter().all(|relation| relation["series"] == "s1"))
+    );
 }
 
 #[test]

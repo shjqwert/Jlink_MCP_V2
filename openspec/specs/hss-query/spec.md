@@ -7,7 +7,7 @@
 ## Requirements
 
 ### Requirement: HSSQ-001 采集状态查询
-系统 MUST 支持通过采集 ID 或 `capture_key` 查询生命周期、进度、完整性和可用资源；状态和四种视图请求 MUST 且只能提供这两个标识之一。活动或异常终止的采集 MUST 以 `complete_records` 及可用时的半开区间 `from_us/to_us` 明确报告已持久化范围，不得把部分数据表示为完整结果。
+系统 MUST 支持通过采集 ID 或 `capture_key` 查询生命周期、进度和可用资源；状态和四种视图请求 MUST 且只能提供这两个标识之一。活动或异常终止的采集 MUST 以 `complete_records` 及可用时的半开区间 `from_us/to_us` 明确报告已持久化范围，不得把部分数据表示为完整结果。`completed` 状态 MUST 只返回进入查询所需的 `capture_id`、生命周期、耗时和完整记录数；完整范围与质量证据 MUST 由 `overview` 返回。`failed/aborted` 状态 MUST 继续保留故障、恢复和必要质量证据。
 
 #### Scenario: 查询运行中采集
 - **WHEN** Agent 使用有效采集 ID 查询状态
@@ -16,6 +16,10 @@
 #### Scenario: 查询未知采集键
 - **WHEN** Agent 使用不存在的 `capture_key` 查询
 - **THEN** 系统返回稳定的未找到错误，不创建采集
+
+#### Scenario: 完成态进入概览查询
+- **WHEN** Agent 查询已完成采集的状态
+- **THEN** 系统返回不含 `quality/from_us/to_us` 的终态摘要，Agent 可使用同一 `capture_id` 请求 `overview` 获取完整质量与范围
 
 ### Requirement: HSSQ-002 四种确定性视图
 系统 MUST 提供 `overview`、`changes`、`window` 和 `around_event` 四种查询视图。每种视图 MUST 具有独立严格 Schema，并 MUST 从已持久化采集的不可变快照计算结果。
@@ -54,11 +58,15 @@
 - **THEN** 系统返回明确标记的分桶范围及每桶最小值和最大值，不将结果表示为原始样本
 
 ### Requirement: HSSQ-006 事件邻域查询
-`around_event` MUST 默认返回目标事件及其附近的变化摘要；Agent 请求完整原始邻域时 MUST 通过 `window` 的原始模式获取，避免在两个视图中重复定义原始样本协议。
+`around_event` MUST 默认返回目标事件及其附近的变化摘要，并 MAY 通过可选 `series` 只投影指定叶序列。`series` MUST 与 `changes/window` 使用相同的稳定短 ID 或精确叶路径解析；省略时 MUST 保持全序列行为，分页游标 MUST 绑定规范化后的选择。Agent 请求完整原始邻域时 MUST 通过 `window` 的原始模式获取，避免在两个视图中重复定义原始样本协议。
 
 #### Scenario: 查看写入后的状态变化
 - **WHEN** Agent 对一个采集中写入事件请求 `around_event`
 - **THEN** 系统返回该事件、所选前后时间范围内的变量变化和质量影响，并提供可用于原始窗口查询的边界
+
+#### Scenario: 限定事件邻域序列
+- **WHEN** Agent 使用 `series` 请求事件附近的一个叶序列并继续分页
+- **THEN** 系统只返回该序列的字典、变化和关系，续页保持同一序列选择
 
 ### Requirement: HSSQ-007 时间线与关系语义
 系统 MUST 在统一时间线上表达样本变化、写入、自动恢复和质量事件。样本变化 MUST 区分最迟未变化时间 `after_us` 与首次观察时间 `observed_by_us`；持续设备调用 MUST 使用开始和结束时间。跨时钟域关系 MUST 依据已知误差输出 `before`、`after`、`overlaps` 或 `indeterminate`，不得声称因果关系。

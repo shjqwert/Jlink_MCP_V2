@@ -152,23 +152,23 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         .expect("HSS tool");
     let hss_description = hss["description"].as_str().expect("HSS description");
     for required in [
-        "flat top-level JSON",
-        "never use query or resolution wrapper objects",
-        r#"{"action":"query","capture_id":"...","view":"overview"}"#,
-        r#""view":"changes""#,
-        r#""view":"window""#,
-        r#""mode":"raw""#,
-        r#""mode":"min_max""#,
-        r#""points":100"#,
-        r#""view":"around_event""#,
-        r#"{"action":"query","capture_id":"...","cursor":"..."}"#,
-        "omits view plus every view-specific field",
+        "fixed-duration",
+        "status",
+        "overview",
+        "changes",
+        "window",
+        "around_event",
+        "capture_id",
+        "capture_key",
+        "cursor",
     ] {
         assert!(
             hss_description.contains(required),
             "HSS description is missing {required}"
         );
     }
+    assert!(hss_description.len() <= 240);
+    assert!(!hss_description.contains('{'));
     let window = json!({
         "action": "query",
         "capture_id": "cap_contract",
@@ -260,6 +260,59 @@ fn t_p1_mcp_inspect_output_schema_is_strict() {
     ] {
         assert!(!jsonschema::is_valid(output, &invalid), "valid {invalid}");
     }
+}
+
+#[test]
+fn t_p4_hss_catalog_is_bounded_and_around_event_accepts_series() {
+    let catalog = tool_catalog();
+    let catalog_bytes = serde_json::to_vec(&catalog).expect("serialize tool catalog");
+    assert!(
+        catalog_bytes.len() <= 32 * 1024,
+        "tools/list catalog is {} bytes",
+        catalog_bytes.len()
+    );
+    let hss = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_hss")
+        .expect("HSS tool");
+    let hss_bytes = serde_json::to_vec(hss).expect("serialize HSS tool");
+    assert!(
+        hss_bytes.len() <= 22 * 1024,
+        "jlink_hss is {} bytes",
+        hss_bytes.len()
+    );
+    assert!(jsonschema::is_valid(
+        &hss["inputSchema"],
+        &json!({
+            "action": "query",
+            "capture_id": "cap-1",
+            "view": "around_event",
+            "event_id": "e0",
+            "before_us": 1_000,
+            "after_us": 1_000,
+            "series": ["s0"],
+            "limit": 100
+        })
+    ));
+    assert!(jsonschema::is_valid(
+        &hss["outputSchema"],
+        &json!({
+            "capture_id": "cap-compact",
+            "state": "completed",
+            "elapsed_us": 60_000_000,
+            "complete_records": 59_993
+        })
+    ));
+    assert!(!jsonschema::is_valid(
+        &hss["outputSchema"],
+        &json!({
+            "capture_id": "cap-duplicated",
+            "state": "completed",
+            "elapsed_us": 60_000_000,
+            "complete_records": 59_993,
+            "from_us": 0
+        })
+    ));
 }
 
 #[test]

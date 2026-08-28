@@ -15,6 +15,7 @@ PASS。T-P4-OVERVIEW 已覆盖 HSSQ-001、HSSQ-002、HSSQ-003 的只读完成快
 - `events` 统计持久化写入、恢复和质量事件出现次数；6.98a 的 loss/overflow 为 `unknown` 时保留 `quality`，空 `quality.events` 省略。
 - `query.overview` 只访问不可变完成文件，不加载 J-Link DLL、不连接 Worker、不创建未知 capture；结果附带由 5.5 接通的完整原始资源链接。
 - 生命周期为 `failed/aborted` 的不可变部分文件只能通过 status 报告范围；overview 明确拒绝，不能伪装为完整结果。
+- `status(completed)` 只作为查询入口返回 ID、状态、耗时和完整记录数，不重复范围或 quality；完整范围、字典、导航计数和质量证据由随后独立的 overview 返回。
 
 ## 主要证据
 

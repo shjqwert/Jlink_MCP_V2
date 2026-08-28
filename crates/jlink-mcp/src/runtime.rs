@@ -578,18 +578,7 @@ impl Runtime {
         offset: usize,
         emitted_series: &[String],
     ) -> Result<ToolCall, JlinkError> {
-        let series = arguments.get("series").map(|value| {
-            value
-                .as_array()
-                .expect("changes.series passed MCP Schema")
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .expect("changes.series item passed MCP Schema")
-                        .to_owned()
-                })
-                .collect::<Vec<_>>()
-        });
+        let series = hss_series(arguments, "changes");
         let rules = arguments
             .get("rules")
             .map(|value| {
@@ -775,6 +764,7 @@ impl Runtime {
             arguments["after_us"]
                 .as_u64()
                 .expect("around_event.after_us passed MCP Schema"),
+            hss_series(arguments, "around_event"),
             limit,
             offset,
         )?;
@@ -1339,6 +1329,10 @@ fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
         "complete_records".to_owned(),
         json!(snapshot.complete_records),
     );
+    if snapshot.state == HssRunState::Completed {
+        result.remove("quality");
+        return Ok(Value::Object(result));
+    }
     if snapshot.quality.requested_rate_hz > 0 || snapshot.complete_records > 0 {
         let mut quality = serde_json::to_value(&snapshot.quality)
             .map_err(serialization_error)?
@@ -1353,6 +1347,21 @@ fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
         result.insert("to_us".to_owned(), json!(to_us));
     }
     Ok(Value::Object(result))
+}
+
+fn hss_series(arguments: &Value, context: &str) -> Option<Vec<String>> {
+    arguments.get("series").map(|value| {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("{context}.series passed MCP Schema"))
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .unwrap_or_else(|| panic!("{context}.series item passed MCP Schema"))
+                    .to_owned()
+            })
+            .collect()
+    })
 }
 
 fn persisted_range(snapshot: &HssRunSnapshot) -> Result<Option<(u64, u64)>, JlinkError> {
@@ -1979,5 +1988,23 @@ mod hss_state_tests {
         assert_eq!(result["from_us"], 10_000);
         assert_eq!(result["to_us"], 11_000);
         assert_eq!(result["quality"]["integrity"], "unknown");
+    }
+
+    #[test]
+    fn completed_status_is_a_compact_query_entrypoint() {
+        let mut completed = snapshot(HssRunState::Completed, HssDataIntegrity::Unknown);
+        completed.quality.requested_rate_hz = 1_000;
+        completed.quality.expected_samples = 1_000;
+        completed.quality.actual_samples = 996;
+        completed.quality.clock.first_timestamp_us = Some(0);
+        completed.quality.clock.last_timestamp_us = Some(995_000);
+        let result = hss_status_result(&completed).expect("completed status result");
+        assert_eq!(result["capture_id"], "cap-state");
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["elapsed_us"], 10);
+        assert_eq!(result["complete_records"], 1);
+        assert!(result.get("quality").is_none());
+        assert!(result.get("from_us").is_none());
+        assert!(result.get("to_us").is_none());
     }
 }

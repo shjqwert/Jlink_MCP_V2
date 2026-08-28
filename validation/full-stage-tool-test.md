@@ -12,7 +12,7 @@
 |---|---|---|---|
 | FT-001 | 完成 | Codex 曾同时暴露用户级 `jlink-MCP-v2`（工具命名空间 `jlink_MCP_v2`）和插件级 `jlink_mcp`，两者各提供同一组六工具，且指向不同路径和不同二进制指纹。2026-08-28 已移除旧注册并重启 Codex；新窗口仅发现插件 `jlink_mcp` 的 `jlink_target`、`jlink_program`、`jlink_inspect`、`jlink_write`、`jlink_control`、`jlink_hss`，旧命名空间工具数为 0，`jlink_target.config_get` 成功返回当前配置。 | 已通过。后续重装回归继续确认单一服务发现。 |
 | FT-002 | 已确认 | 六个工具描述重复公共合同、`structuredContent` 和副作用恢复说明，增加每个 `tools/list` 的固定上下文。 | 公共规则只保留一个权威入口；工具描述仅保留自身 action、关键约束和必要示例。 |
-| FT-003 | 已确认 | `jlink_hss` 的联合输出在多个分支重复展开完整 quality 结构，Schema 体积明显高于其他工具。 | 在不改变严格输入输出、四种 query view 和客户端兼容性的前提下复用公共定义，并比较优化前后实际 `tools/list`。 |
+| FT-003 | 完成 | 根因是 HSS 输入按模式重复完整分支，输出内联递归 TypedValue、quality、event、change 和 relation。现使用根级 `$defs`，将等价 window 模式合并为两类严格分支并缩短 HSS 描述。 | 原始 `tools/list` 从 45,501 降至 32,555 bytes（-28.5%），`jlink_hss` 从 33,596 降至 18,875 bytes（-43.8%）；分别不超过 32 KiB 与 22 KiB。 |
 | FT-004 | 已确认 | Skill 根规则、reference、MCP instructions 和工具描述存在内容重叠；每个新的 J-Link 用户回合还会重新加载完整根 Skill。 | 明确各层信息所有权，保持根 Skill 路由加按需 reference 的渐进披露；不得删除状态复用、副作用和错误恢复规则。 |
 | FT-005 | 完成 | 根因是寄存器已在目录中命中后，DLL 单项读取状态非零仍被映射成 `REGISTER_NOT_FOUND`。修复后只有目录缺失返回该错误；running 返回 `TARGET_STATE_INVALID`，halted 仍失败返回 `TARGET_CONNECT_FAILED`。 | 单元、公共 Schema/错误 smoke、真机 running→halted→running 回归通过。 |
 | FT-006 | 完成（预期生命周期） | 同一 MCP PID 内 Worker PID 稳定，连续寄存器/控制调用没有断连；MCP 结束后 Worker 随父进程退出，新 MCP 生命周期从 `disconnected` 和新 PID 对重新开始。 | 已证明阶段间断连与 MCP 父进程生命周期一致，不修改 Worker 生命周期代码。 |
@@ -21,8 +21,8 @@
 | FT-009 | 完成 | 根因是 Flash 主操作成功后，要到后置状态也成功才记录 Flash 已修改。修复后主操作成功立即使固件/验证证据失效；后置失败关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`，固定报告操作、阶段、`after`、Flash 修改事实和原始错误码。 | 单元测试、workspace 门禁和真机故障路径通过；擦除未重放，状态立即为 `faulted/unknown`，随后完成固件重烧、独立 verify 和 running 恢复。 |
 | FT-010 | 完成 | 每项检查新增必填 `evidence`。running 每次实际执行 ICSR；halted/HardFault 只能复用同一连接中已成功的 running 证据，detail 明确当前状态和复用来源。 | 真机 halted validate 返回 `target_state=halted`、`background_access.evidence=reused`，不再伪称本次在 running 执行。 |
 | FT-011 | 完成 | 当前 Worker/目标指纹内复用 DLL、导出、探针、目标身份、接口和 HSS 能力；目标状态始终重观测。Flash 清固件身份和动态后台证据，连接/Worker 变化全清。 | 首次、连续复用、halted、Flash 后失效、resume 重建和新 Worker 全执行矩阵通过。 |
-| FT-012 | 已确认 | 1 kHz 结构体采样下，`around_event` 在 5 ms 前后窗口返回所有连续变化成员及逐项 relation；单个写事件产生数十项与写入无直接关系的变化，而当前 Schema 没有 `series` 过滤字段。 | 保留事件、时间不确定度和相关变化证据；评估增加可选 `series` 过滤或默认有界摘要，完整原始变化继续通过 `window/changes` 获取，并验证分页确定性。 |
-| FT-013 | 待优化 | `status(completed)` 与紧随其后的 `query(overview)` 重复返回完整 quality、采样范围和捕获身份；异步流程又需要先等待终态再进入查询，形成正常调用链中的固定重复。 | 在保持 `status` 和离线 `overview` 可独立解释的前提下，比较终态摘要、客户端可信缓存或增量响应方案；不得删除质量证据或让客户端猜测捕获完整性。 |
+| FT-012 | 完成 | `around_event` 新增可选 `series`，与 `changes/window` 共用短 ID/精确路径解析；省略时保持全序列，游标绑定规范查询。 | 捕获层和 MCP 回归覆盖过滤与续页；真机 `series=[s2]` 两页只返回 `s2` 的变化/关系，续页字典为空且保留过滤。 |
+| FT-013 | 完成 | `status(completed)` 现只返回 `capture_id/state/elapsed_us/complete_records` 作为查询入口；完整范围和 quality 只由 `overview` 返回。活动态继续报告进度/质量，failed/aborted 保留故障恢复事实。 | 单元回归及 60 s 真机 `status→overview` 证明终态无重复字段且完整质量证据未丢失。 |
 | FT-014 | 待优化 | 并发矩阵首次使用 15 s 固定捕获，但 Agent 与工具多次往返消耗了捕获窗口；执行 `halt` 时捕获已自然结束，导致该结果不能证明运行期冲突，并额外重做一次 60 s 捕获。 | 在 Skill 和测试编排中根据操作数量、往返耗时上界和安全余量选择捕获时长，并在批量操作前确认捕获仍为 `running`；不得改变 HSS 固定时长或无手动停止的合同。 |
 | FT-015 | 待优化 | 对会被 1 ms 任务消费并清零的控制变量使用同步 `verify=readback` 时，写入已生效仍会因最终值恢复为 0 而返回 `VERIFY_FAILED`，容易被 Agent 误判为未写入并危险重试。 | Skill 明确将命令、触发、握手和自清零变量默认写为 `verify=none`，随后按业务状态验证效果；说明 `VERIFY_FAILED` 只证明最终回读不匹配，不能单独证明写入从未发生，并增加不自动重试的流程验收。 |
 | FT-016 | 完成 | 根因是 Worker 启动合同只传用户级 `lease_root`，采集路径被错误派生到租约目录。现已增加独立工程 `capture_root`，新采集写入 `.jlink-mcp/captures/<probe_identity_hash>`；查询工程优先、旧用户 Store 仅显式身份只读回退。 | 两工程同探针隔离、离线缺失不建目录、旧 Store 回退、Worker 参数边界及真机 1 kHz 落盘/断开后 ID/key 查询均通过；旧文件未移动、覆盖或删除。 |
@@ -149,9 +149,20 @@ CPU 控制 action 本身通过；FT-005 的公共错误分类已在后续修复�
 | 并发判定捕获 | `cap_65e326e673ad67c11253547c`，60 s、1000 Hz；expected 60000、actual 59996，间隔仍全部为 1000 us，无 collision/gap/regression。 |
 | 允许操作 | 捕获 running 时 `target.status` 可用；typed variable 写 `0xA1B2C3D4` 和 raw memory 写 `0xCAFEBABE` 均成功，并被 1 ms 任务回显。 |
 | 拒绝操作 | 捕获 running 时普通 `inspect.variable`、`program.verify`、`control.halt`、`target.disconnect` 均返回 `OPERATION_CONFLICT`。 |
-| 事件查询 | `changes` 返回两个成功写事件、对应规则命中和有界 relation；`around_event` 能定位事件，但暴露 FT-012 的高上下文问题。 |
+| 事件查询 | `changes` 返回两个成功写事件、对应规则命中和有界 relation；旧 `around_event` 能定位事件，但未提供 `series` 过滤，形成 FT-012。 |
 
 第 9 步功能通过。最初 15 s 捕获在测试 halt 前自然结束，因此该次 halt 成功不能作为并发证据；随后用 60 s 捕获在明确 running 状态下重测完整冲突矩阵，排除了调用延迟造成的误判。
+
+### FT-003/012/013 修复回归
+
+| 项目 | 结果 |
+|---|---|
+| Schema 体积 | 历史基线 `tools/list=45,501`、`jlink_hss=33,596` bytes；修复后分别为 `32,555`、`18,875` bytes，下降 28.5% 与 43.8%。修复前当前分支基线 49,193/35,319 bytes 也保留为 FT-008 引入递归合同后的对照。 |
+| 真机捕获 | `cap_235129d282f9c4e8e651a81a`，key `ft009-hss-contract-20260828`，60 s、1 kHz、3 个顶层 selector；完成 59,993 条，实际间隔全部为 1,000 us，4 个成功写事件。 |
+| 终态链路 | `status(completed)` 只含 ID、状态、60,039,884 us 和 59,993 records，不含 `quality/from_us/to_us`；随后 `overview` 返回范围、字典、事件和完整 quality。integrity/loss/overflow 仍按 DLL 证据报告 `unknown`，未宣称绝对无丢样。 |
+| 四种视图 | `overview`、`changes`、`window(raw)`、`around_event` 均通过；changes limit=1 正确续页并增量登记字典。 |
+| 事件过滤 | 对内存写事件 `e1` 使用 `around_event(series=[s2], limit=1)`，两页都只包含 `s2`；第二页字典为空、游标保留 series 绑定，关系从写入重叠变化到后续恢复变化均可解释。 |
+| 持久化与收尾 | 文件位于工程 `.jlink-mcp/captures/1659...949b9/`，长度 2,300,645 bytes，SHA-256 `F1BD55389853E133F11805F8334D5704D2B496DE1915B14C1FF227D9417B2512`。typed/raw 命令均恢复为 0，断开前 CPU 为 running。 |
 
 ### 第 10 步：完成态 Capture Store 离线读取与原始资源
 
@@ -189,7 +200,7 @@ FT-016 修复后新增真机采集 `cap_b194591611163ca6306e1102`：1 秒、1 kH
 - 正确流程可以复用当前 MCP 生命周期内的可信连接/验证状态；本阶段只在新固件烧录前后执行必要 `validate`，没有在每个查询前机械调用 `status`。
 - 并发矩阵应在一次足够长的捕获中批量完成，避免 15 s 捕获因 Agent/tool 往返耗时而失效；本轮因此额外执行一次 60 s 捕获。
 - 查询分页必须在同一调试上下文保留 cursor；本轮最终核查确认续页本身没有 dictionary 重复。
-- MCP 侧需要统一评估 FT-011、FT-012、FT-013、FT-016；Codex 资源集成侧处理 FT-017；Skill 与测试编排侧处理 FT-014、FT-015。全阶段测试已完成，后续按本清单的修复执行顺序逐项修改和回归。
+- MCP 侧 FT-011、FT-012、FT-013、FT-016 已完成；Codex 资源集成侧继续跟踪 FT-017；Skill 与测试编排侧处理 FT-014、FT-015。
 
 ## 后续统一修复门禁
 
