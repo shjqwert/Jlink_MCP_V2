@@ -1,0 +1,120 @@
+views {
+  view as_is {
+    title "As-Is: V2 implementation baseline"
+    description "Pending user confirmation: the V2 worktree contains no Rust runtime architecture yet."
+
+    include agent, v2Baseline, jlinkDll, target
+    include jlinkDll -> target
+
+    style element.tag = #reused {
+      color muted
+    }
+    autoLayout LeftRight
+  }
+
+  view data_contract_delta {
+    title "Delta: proposed V1 MCP and HSS data contract"
+    description "Main review entry: new responsibilities, ownership boundaries, external dependencies and unresolved validation gates."
+
+    include agent, v2Baseline, dataContractChange, dataContractChange.**, jlinkDll, target
+    include * -> *
+
+    style element.tag = #added {
+      color green
+    }
+    style element.tag = #modified {
+      color amber
+      border dashed
+    }
+    style element.tag = #reused {
+      color muted
+    }
+    style element.tag = #review_risk {
+      color red
+      border dashed
+    }
+    autoLayout LeftRight
+  }
+
+  view data_contract_boundaries {
+    title "To-Be: interfaces and single state owners"
+    description "The main process owns schemas and read-only projections; the worker owns the live probe session; the store owns persisted captures."
+
+    include agent, dataContractChange, dataContractChange.**, jlinkDll, target
+    include * -> *
+
+    style element.tag = #added {
+      color green
+    }
+    style element.tag = #modified {
+      color amber
+      border dashed
+    }
+    style element.tag = #reused {
+      color muted
+    }
+    style element.tag = #review_risk {
+      color red
+      border dashed
+    }
+    autoLayout TopBottom
+  }
+
+  dynamic view hss_capture_query_sequence {
+    title "HSS capture, interleaved write and bounded query"
+    description "Strict sequence showing fixed-duration capture, serialized DLL access, durable evidence and Agent retrieval."
+    variant sequence
+
+    agent -> dataContractChange.mcpProcess.mcpAdapter "jlink_hss start with capture_key"
+    dataContractChange.mcpProcess.mcpAdapter -> dataContractChange.mcpProcess.artifactResolver "resolve ELF/DWARF selectors"
+    dataContractChange.mcpProcess.artifactResolver -> dataContractChange.workerProcess.operationScheduler "submit immutable acquisition plan"
+    dataContractChange.workerProcess.operationScheduler -> dataContractChange.workerProcess.captureCoordinator "create or recover capture by capture_key"
+    dataContractChange.workerProcess.captureCoordinator -> dataContractChange.workerProcess.dllGateway "GetCaps, connect and Start"
+    dataContractChange.workerProcess.dllGateway -> jlinkDll "serialized HSS start"
+
+    opt "return_when = started" {
+      agent <- dataContractChange.mcpProcess.mcpAdapter "capture_id and started state"
+    }
+
+    loop "until fixed 1-300 second duration expires" {
+      dataContractChange.workerProcess.captureCoordinator -> dataContractChange.workerProcess.dllGateway "drain HSS buffer"
+      dataContractChange.workerProcess.dllGateway -> jlinkDll "HSS_Read"
+      dataContractChange.workerProcess.dllGateway <- jlinkDll "raw frame and status"
+      dataContractChange.workerProcess.captureCoordinator <- dataContractChange.workerProcess.dllGateway "parsed frame or explicit format error"
+      dataContractChange.workerProcess.captureCoordinator -> dataContractChange.captureStore "append raw samples and quality evidence"
+
+      opt "queued variable, RAM or MMIO write" {
+        agent -> dataContractChange.mcpProcess.mcpAdapter "jlink_write"
+        dataContractChange.mcpProcess.mcpAdapter -> dataContractChange.workerProcess.operationScheduler "validated write command"
+        dataContractChange.workerProcess.operationScheduler -> dataContractChange.workerProcess.captureCoordinator "schedule between drains"
+        dataContractChange.workerProcess.captureCoordinator -> dataContractChange.workerProcess.dllGateway "serialized write"
+        dataContractChange.workerProcess.dllGateway -> jlinkDll "memory write"
+        dataContractChange.workerProcess.captureCoordinator -> dataContractChange.captureStore "append write start, end and result event"
+        agent <- dataContractChange.mcpProcess.mcpAdapter "empty success or stable error"
+      }
+    }
+
+    dataContractChange.workerProcess.captureCoordinator -> dataContractChange.workerProcess.dllGateway "Stop and tail drain"
+    dataContractChange.workerProcess.dllGateway -> jlinkDll "HSS_Stop and final HSS_Read"
+    dataContractChange.workerProcess.captureCoordinator -> dataContractChange.captureStore "finalize immutable snapshot, manifest and checksum"
+
+    opt "return_when = completed" {
+      agent <- dataContractChange.mcpProcess.mcpAdapter "capture_id and minimal overview"
+    }
+
+    agent -> dataContractChange.mcpProcess.mcpAdapter "jlink_hss view with cursor"
+    dataContractChange.mcpProcess.mcpAdapter -> dataContractChange.mcpProcess.captureQuery "overview, changes, window or around_event"
+    dataContractChange.mcpProcess.captureQuery -> dataContractChange.captureStore "read cursor-bound snapshot"
+    dataContractChange.mcpProcess.captureQuery <- dataContractChange.captureStore "bounded page and scoped quality evidence"
+    dataContractChange.mcpProcess.mcpAdapter <- dataContractChange.mcpProcess.captureQuery "structuredContent and optional raw resource link"
+    agent <- dataContractChange.mcpProcess.mcpAdapter "compact unambiguous result"
+
+    style element.tag = #added {
+      color green
+    }
+    style element.tag = #reused {
+      color muted
+    }
+    autoLayout TopBottom
+  }
+}

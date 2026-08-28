@@ -1,0 +1,119 @@
+model {
+  dataContractChange = change "V1 MCP and HSS data contract" {
+    #modified
+    summary "Confirmed Rust process boundaries, state ownership and compact Agent-facing responses."
+    metadata {
+      baselineStatus "confirmed"
+      designStatus "approved"
+      implementationStatus "not-started"
+      verificationStatus "not-run"
+      requirements ["Q1-Q67 confirmed in first-principles review", "Independent data-contract review findings accepted"]
+      interfaceContract "architecture/data-contract/mcp-interface-v1.md"
+    }
+
+    mcpProcess = process "MCP main process" {
+      #added
+      technology "Rust; local stdio"
+      metadata {
+        mutableStateOwner "MCP request lifecycle only"
+      }
+
+      mcpAdapter = component "MCP contract adapter" {
+        #added
+        description "Defines the six public tools, validates deterministic request boundaries and emits compact structured responses. It owns no probe or live-capture state."
+        metadata {
+          publicTools ["jlink_target", "jlink_program", "jlink_inspect", "jlink_write", "jlink_control", "jlink_hss"]
+          ruleOwner "Public request and response schema"
+        }
+      }
+
+      artifactResolver = component "ELF and DWARF resolver" {
+        #added
+        description "Resolves variable paths, structs, arrays, bitfields and unions into an immutable acquisition plan. Raw addresses are reserved for ordinary memory access."
+        metadata {
+          ruleOwner "Symbol and type-path resolution"
+        }
+      }
+
+      captureQuery = component "Capture query service" {
+        #added
+        description "Read-only projection over immutable capture snapshots. It returns bounded structured views and raw resource links without changing captured evidence."
+        metadata {
+          queryViews ["overview", "changes", "window", "around_event"]
+          ruleOwner "Pagination, filtering, threshold rules and view projection"
+        }
+      }
+    }
+
+    workerProcess = process "J-Link worker process" {
+      #added
+      technology "Rust child worker; MCP-owned lease"
+      metadata {
+        mutableStateOwner "Probe session and live capture"
+        lifecycle "Bound to the creating MCP/Codex; no cross-MCP takeover or orphan HSS continuation"
+      }
+
+      operationScheduler = component "Operation scheduler" {
+        #added
+        description "Owns accepted-operation ordering. During HSS it prioritizes buffer drains and may insert validated variable, RAM or MMIO writes between drains."
+        metadata {
+          ruleOwner "Probe operation ordering"
+        }
+      }
+
+      captureCoordinator = component "HSS capture coordinator" {
+        #added
+        description "Sole owner of live capture lifecycle, timeline sequence, integrity detection, fixed-duration automatic stop and bounded normal-shutdown drain. Interrupted captures remain non-completed."
+        metadata {
+          mutableStateOwner "Active capture, event sequence and quality counters"
+          durationSeconds "1-300"
+          limits ["10 top-level selectors", "requested rate up to 1 kHz best effort"]
+        }
+      }
+
+      dllGateway = component "J-Link DLL gateway" {
+        #added
+        description "Sole owner of the DLL handle and minimal dynamic FFI. Calls are serialized; the design does not depend on undocumented concurrent DLL access."
+        metadata {
+          mutableStateOwner "DLL handle and target connection"
+          ruleOwner "DLL ABI checks and invocation"
+        }
+      }
+    }
+
+    captureStore = store "Capture store" {
+      #added
+      description "Owns append-only raw samples, target events, quality evidence, self-describing type metadata and finalized immutable query snapshots."
+      metadata {
+        mutableStateOwner "Persisted capture bytes and finalized snapshots"
+        retention "No automatic historical deletion in V1"
+      }
+    }
+
+    validationGates = decision "V1 validation gates" {
+      #review_risk
+      description "Hardware evidence must validate the J-Link 6.98a mainline HSS ABI, millisecond source timestamps and timestamp_us normalization; J-Link 8.38 and 9.70 are compatibility sidelines. Client tests must validate structuredContent, cursor recovery, resource-link consumption, MCP-owned Worker shutdown and non-completed interruption recovery."
+      metadata {
+        unknowns ["HSS ABI and frame timestamps", "hardware loss and overflow behavior", "modern MCP client compatibility"]
+      }
+    }
+
+    mcpProcess.mcpAdapter -> mcpProcess.artifactResolver "resolve symbolic selectors"
+    mcpProcess.mcpAdapter -> mcpProcess.captureQuery "query a finalized capture"
+    mcpProcess.artifactResolver -> workerProcess.operationScheduler "immutable acquisition plan"
+    mcpProcess.mcpAdapter -> workerProcess.operationScheduler "versioned IPC commands and bounded shutdown"
+    workerProcess.operationScheduler -> workerProcess.captureCoordinator "start, stop or interleave HSS work"
+    workerProcess.operationScheduler -> workerProcess.dllGateway "ordinary target commands"
+    workerProcess.captureCoordinator -> workerProcess.dllGateway "serialized HSS calls and between-drain writes"
+    workerProcess.captureCoordinator -> captureStore "append samples, events and quality evidence"
+    mcpProcess.captureQuery -> captureStore "read a fixed snapshot"
+    workerProcess.dllGateway -> validationGates "requires ABI and hardware evidence"
+    mcpProcess.mcpAdapter -> validationGates "requires modern-client contract evidence"
+  }
+
+  v2Baseline -> dataContractChange "proposed target architecture"
+  agent -> dataContractChange.mcpProcess.mcpAdapter "six concise MCP tools" {
+    technology "MCP over stdio"
+  }
+  dataContractChange.workerProcess.dllGateway -> jlinkDll "minimal dynamic FFI"
+}

@@ -8,11 +8,8 @@
 /.codegraph/
 /.serena/
 
-# Local architecture and design review material
-/architecture/
-
-# Local OpenSpec development specifications
-/openspec/
+# Architecture and OpenSpec sources are version-controlled project inputs.
+# Keep only generated or machine-specific evidence excluded below.
 
 # Machine-specific J-Link and MCP configuration
 /jlink-mcp.toml
