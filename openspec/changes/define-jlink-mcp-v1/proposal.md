@@ -9,7 +9,7 @@
 - 首版只面向内部个人使用，不包含公开发布、多人权限或商业交付能力。
 - 对外提供 6 个领域工具：`jlink_target`、`jlink_program`、`jlink_inspect`、`jlink_write`、`jlink_control`、`jlink_hss`。
 - 使用工程配置和用户配置管理目标、本机 J-Link 环境、DLL 路径、版本及哈希，并允许 Agent 查询和修正配置。
-- 使用由当前 MCP 进程创建并管理的独立 Rust Worker 单一拥有探针会话和所有 J-Link DLL 调用；Worker 生命周期绑定当前 MCP/Codex，主 MCP 进程通过版本化 IPC 负责公共合同和查询，Capture Store 负责持久化采集。
+- 使用独立 Rust Worker 单一拥有探针会话和所有 J-Link DLL 调用；主 MCP 进程负责公共合同和查询，Capture Store 负责持久化采集。
 - 支持烧录、擦除、校验、内存/变量/核心寄存器读写和目标运行控制。
 - 使用 ELF/DWARF 解析静态变量、结构体、数组、位域、union 和柔性数组切片。
 - 使用固定 1–300 秒 HSS 采集，最多 10 个顶层选择项、请求频率最高 1 kHz；完整保存有效样本并提供质量证据。

@@ -1,6 +1,0 @@
-eoe 1
-exec SetRestartOnClose = 0
-exec SetSkipDebugDeInit = 1
-connect
-halt
-exit
