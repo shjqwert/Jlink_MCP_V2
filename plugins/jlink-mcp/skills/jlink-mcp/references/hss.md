@@ -11,6 +11,12 @@ Use this reference for `jlink_hss`. The tool exposes `start`, `status`, and `que
 - A requested rate is a target, not a guarantee of the actual rate or losslessness.
 - The Worker stops automatically at the fixed duration, drains the tail, and persists the terminal capture. Do not simulate cancel with disconnect or process termination.
 
+## Budget multi-call captures
+
+- For a multi-round workflow or concurrency matrix, choose a fixed duration of at least 60 seconds, or the estimated total Agent/tool round-trip time plus a 30-second safety margin. Use the value that actually covers the planned sequence within the 300-second limit; split a longer matrix rather than assuming a capture will remain active.
+- Start with `return_when: started`, group the planned calls, and check HSS `status` once immediately before the conflict matrix. Continue only while the capture is `running`; do not insert status before every individual call.
+- A completed capture cannot prove an operation was tested during the active-capture boundary. If it ended early, discard that concurrency result and repeat with a sufficient new duration/key.
+
 ## Capture-key recovery
 
 - Within the same MCP/Worker lifecycle, repeat `start` only when the original response was lost and the same key plus semantically equivalent normalized request can be reproduced. This recovers the same capture.
@@ -22,6 +28,8 @@ Use this reference for `jlink_hss`. The tool exposes `start`, `status`, and `que
 - Status and query for an existing persisted capture do not require an active target connection. Do not connect merely to read capture state or data.
 - Every status or query supplies exactly one of `capture_id` and `capture_key`.
 - Use the four fixed query views: `overview`, `changes`, `window`, and `around_event`. The live tool Schema and description own their exact flat fields; never create `query` or `resolution` wrapper objects.
+- A `completed` status is a compact query entrypoint. Use `overview` for the complete range and quality evidence instead of expecting status to duplicate it.
+- Use optional `around_event.series` when only selected leaf changes and relations are relevant. It resolves the same stable IDs or exact paths as `changes/window`; omitting it retains all series.
 - When a page returns `next_cursor`, continuation contains only `action: query`, the same one capture identity, and `cursor`. Omit `view` and every view-specific field.
 - `CURSOR_INVALID` or `CURSOR_EXPIRED` ends that pagination chain. Do not silently restart from page one; ask for or make an explicit new-query decision.
 

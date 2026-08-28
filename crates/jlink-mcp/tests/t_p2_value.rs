@@ -360,3 +360,63 @@ fn t_p2_value_exposes_write_slice_and_public_error_code() {
     );
     assert_eq!(response["result"]["isError"], true);
 }
+
+#[test]
+fn t_p2_value_schema_matches_the_recursive_runtime_contract() {
+    let catalog = tool_catalog();
+    let write = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_write")
+        .expect("write tool");
+    let inspect = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_inspect")
+        .expect("inspect tool");
+    let hss = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_hss")
+        .expect("HSS tool");
+
+    let schema = &write["inputSchema"];
+    for value in [
+        json!([17, 34]),
+        json!({ "rows": [[1, 2], [3, 4]], "enabled": true }),
+        json!({ "$int": "18364758544493064720", "bits": 64, "signed": false }),
+        json!({ "$float": "nan" }),
+        json!({ "$pointer": "0x20001000" }),
+        json!({ "$union": { "member": [1, 2] } }),
+    ] {
+        let request = json!({
+            "action": "variable",
+            "path": "stFixture",
+            "value": value
+        });
+        assert!(jsonschema::is_valid(schema, &request), "invalid {request}");
+    }
+    for value in [json!(["17", "34"]), json!("17"), Value::Null] {
+        let request = json!({
+            "action": "variable",
+            "path": "stFixture",
+            "value": value
+        });
+        assert!(!jsonschema::is_valid(schema, &request), "valid {request}");
+    }
+
+    let typed_value = &schema["$defs"]["typedValue"];
+    assert!(
+        !typed_value.is_null(),
+        "write Schema exposes typedValue definition"
+    );
+    assert_eq!(
+        inspect["outputSchema"]["$defs"]["typedValue"], *typed_value,
+        "variable reads use the same TypedValue definition"
+    );
+    assert_eq!(
+        hss["inputSchema"]["$defs"]["typedValue"], *typed_value,
+        "HSS rule values use the same TypedValue definition"
+    );
+    assert_eq!(
+        hss["outputSchema"]["$defs"]["typedValue"], *typed_value,
+        "HSS sample values use the same TypedValue definition"
+    );
+}

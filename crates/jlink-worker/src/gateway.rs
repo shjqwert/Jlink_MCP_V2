@@ -14,8 +14,8 @@ use std::{
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
     HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
-    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckKind,
-    ValidationReport, validate_write_count,
+    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckEvidence,
+    ValidationCheckKind, ValidationReport, validate_write_count,
 };
 use serde_json::json;
 use windows_sys::Win32::{
@@ -1183,13 +1183,16 @@ impl DllGateway {
             )));
         }
         if status != 0 {
-            return Err(JlinkError::new(
-                ErrorCode::RegisterNotFound,
-                format!("当前目标不能读取核心寄存器 {}", register.canonical_name()),
-                false,
-            )
-            .with_detail("register", serde_json::json!(register.canonical_name()))
-            .with_detail("dll_status", serde_json::json!(status)));
+            let target_state = self.observe_target_state().map_err(|error| {
+                error
+                    .with_detail("register", serde_json::json!(register.canonical_name()))
+                    .with_detail("dll_status", serde_json::json!(status))
+            })?;
+            return Err(classify_register_read_failure(
+                register,
+                status,
+                target_state,
+            ));
         }
         Ok(value)
     }
@@ -1461,8 +1464,13 @@ impl DllGateway {
         diagnostics
     }
 
-    /// Performs the fresh DLL, export, probe, target, access, and HSS checklist.
-    pub(crate) fn validation_report(&self, validation_runs: u64) -> ValidationReport {
+    /// Performs dynamic checks and reuses only explicitly supplied fingerprint-bound evidence.
+    pub(crate) fn validation_report(
+        &self,
+        validation_runs: u64,
+        reusable_checks: Option<&[ValidationCheck]>,
+        running_background_access: Option<&ValidationCheck>,
+    ) -> ValidationReport {
         let spec = self
             .connected_spec
             .as_ref()
@@ -1473,56 +1481,125 @@ impl DllGateway {
             .copied()
             .unwrap_or(TargetState::Unknown);
         let target_id = self.target_id;
-        // SAFETY: the DLL getter has no arguments and does not touch the target.
-        let dll_version = unsafe { (self.api.get_dll_version)() };
-        // SAFETY: the target connection is active and the getter has no arguments.
-        let actual_serial = unsafe { (self.api.get_serial)() };
         let mut checks = vec![
-            passed_check(
-                ValidationCheckKind::DllIdentity,
-                format!("已加载冻结 DLL，API 版本 {dll_version}"),
+            reusable_check(reusable_checks, ValidationCheckKind::DllIdentity).unwrap_or_else(
+                || {
+                    // SAFETY: the DLL getter has no arguments and does not touch the target.
+                    let dll_version = unsafe { (self.api.get_dll_version)() };
+                    passed_check(
+                        ValidationCheckKind::DllIdentity,
+                        format!("已加载冻结 DLL，API 版本 {dll_version}"),
+                    )
+                },
             ),
-            passed_check(
-                ValidationCheckKind::RequiredExports,
-                "2.5 所需导出已由唯一 gateway 解析",
+            reusable_check(reusable_checks, ValidationCheckKind::RequiredExports).unwrap_or_else(
+                || {
+                    passed_check(
+                        ValidationCheckKind::RequiredExports,
+                        "2.5 所需导出已由唯一 gateway 解析",
+                    )
+                },
             ),
-            check(
-                ValidationCheckKind::ProbeIdentity,
-                actual_serial == spec.probe_serial(),
-                format!("期望 {}，实际 {actual_serial}", spec.probe_serial()),
-                "检查 probe.serial、USB 连接和探针占用状态",
+            reusable_check(reusable_checks, ValidationCheckKind::ProbeIdentity).unwrap_or_else(
+                || {
+                    // SAFETY: the target connection is active and the getter has no arguments.
+                    let actual_serial = unsafe { (self.api.get_serial)() };
+                    check(
+                        ValidationCheckKind::ProbeIdentity,
+                        actual_serial == spec.probe_serial(),
+                        format!("期望 {}，实际 {actual_serial}", spec.probe_serial()),
+                        "检查 probe.serial、USB 连接和探针占用状态",
+                    )
+                },
             ),
             match target_state_result {
-                Ok(_) => check(
-                    ValidationCheckKind::TargetIdentity,
-                    target_id.is_some_and(|value| value != 0),
-                    format!("device={}，target_id={target_id:?}", spec.device()),
-                    "检查目标供电、器件型号和 SWD/JTAG 接线",
-                ),
+                Ok(_) => reusable_check(reusable_checks, ValidationCheckKind::TargetIdentity)
+                    .unwrap_or_else(|| {
+                        check(
+                            ValidationCheckKind::TargetIdentity,
+                            target_id.is_some_and(|value| value != 0),
+                            format!("device={}，target_id={target_id:?}", spec.device()),
+                            "检查目标供电、器件型号和 SWD/JTAG 接线",
+                        )
+                    }),
                 Err(error) => failed_check(
                     ValidationCheckKind::TargetIdentity,
                     error.to_string(),
                     "检查目标供电、器件型号、接口配置和调试链路",
                 ),
             },
-            passed_check(
-                ValidationCheckKind::Interface,
-                format!("{:?} {} kHz", spec.interface(), spec.speed_khz()),
-            ),
+            reusable_check(reusable_checks, ValidationCheckKind::Interface).unwrap_or_else(|| {
+                passed_check(
+                    ValidationCheckKind::Interface,
+                    format!("{:?} {} kHz", spec.interface(), spec.speed_khz()),
+                )
+            }),
         ];
-        checks.push(match self.read_word(ICSR) {
-            Ok(value) => passed_check(
+        checks.push(self.background_access_check(target_state, running_background_access));
+        checks.push(self.hss_validation_check(reusable_checks));
+        ValidationReport {
+            valid: checks.iter().all(|item| item.passed),
+            checks,
+            target_state,
+            target_id,
+            validation_runs,
+            recovery_notifications: Vec::new(),
+        }
+    }
+
+    fn background_access_check(
+        &self,
+        target_state: TargetState,
+        running_background_access: Option<&ValidationCheck>,
+    ) -> ValidationCheck {
+        match target_state {
+            TargetState::Running => match self.read_word(ICSR) {
+                Ok(value) => passed_check(
+                    ValidationCheckKind::BackgroundAccess,
+                    format!("本次在 running 状态执行 ICSR 读取成功：0x{value:08X}"),
+                ),
+                Err(error) => failed_check(
+                    ValidationCheckKind::BackgroundAccess,
+                    error.to_string(),
+                    "确认目标正在运行且支持后台内存访问",
+                ),
+            },
+            TargetState::Halted | TargetState::HardFault => running_background_access
+                .filter(|check| check.passed)
+                .map_or_else(
+                    || {
+                        failed_check(
+                            ValidationCheckKind::BackgroundAccess,
+                            format!(
+                                "目标当前为 {target_state:?}；没有同一连接中已成功的运行态后台访问证据"
+                            ),
+                            "先恢复 running 并执行 validate，再显式 halt",
+                        )
+                    },
+                    |check| {
+                        let mut reused = check.clone();
+                        reused.evidence = ValidationCheckEvidence::Reused;
+                        reused.detail = format!(
+                            "目标当前为 {target_state:?}；复用同一连接中已成功的运行态证据：{}",
+                            check.detail
+                        );
+                        reused
+                    },
+                ),
+            TargetState::Unknown => failed_check(
                 ValidationCheckKind::BackgroundAccess,
-                format!("运行态读取 ICSR 成功：0x{value:08X}"),
+                "目标状态 unknown，不能执行或复用运行态后台访问检查",
+                "重新建立可信目标连接后再验证",
             ),
-            Err(error) => failed_check(
-                ValidationCheckKind::BackgroundAccess,
-                error.to_string(),
-                "确认目标正在运行且支持后台内存访问",
-            ),
-        });
+        }
+    }
+
+    fn hss_validation_check(&self, reusable_checks: Option<&[ValidationCheck]>) -> ValidationCheck {
+        if let Some(check) = reusable_check(reusable_checks, ValidationCheckKind::HssCapability) {
+            return check;
+        }
         match self.hss_capabilities() {
-            Ok(caps) => checks.push(passed_check(
+            Ok(caps) => passed_check(
                 ValidationCheckKind::HssCapability,
                 format!(
                     "max_blocks={}，max_frequency_hz={}，source_timestamp={} Hz/{} us，monotonic={}",
@@ -1532,20 +1609,12 @@ impl DllGateway {
                     caps.source_timestamp_resolution_us(),
                     caps.source_timestamp_monotonic()
                 ),
-            )),
-            Err(error) => checks.push(failed_check(
+            ),
+            Err(error) => failed_check(
                 ValidationCheckKind::HssCapability,
                 error.to_string(),
                 "使用包含 GetCaps/Start/Read/Stop 的冻结 J-Link DLL；普通调试能力不受影响",
-            )),
-        }
-        ValidationReport {
-            valid: checks.iter().all(|item| item.passed),
-            checks,
-            target_state,
-            target_id,
-            validation_runs,
-            recovery_notifications: Vec::new(),
+            ),
         }
     }
 
@@ -1615,6 +1684,41 @@ fn classify_observed_target_state(
     }
 }
 
+fn classify_register_read_failure(
+    register: CoreRegister,
+    dll_status: u8,
+    target_state: TargetState,
+) -> JlinkError {
+    let (code, message) = if target_state == TargetState::Running {
+        (
+            ErrorCode::InvalidStateTransition,
+            format!(
+                "目标运行时不能读取核心寄存器 {}；请先显式 halt",
+                register.canonical_name()
+            ),
+        )
+    } else {
+        (
+            ErrorCode::TargetConnectFailed,
+            format!(
+                "目标处于 {target_state:?} 时读取核心寄存器 {} 失败",
+                register.canonical_name()
+            ),
+        )
+    };
+    let mut error = JlinkError::new(code, message, true)
+        .with_detail("register", serde_json::json!(register.canonical_name()))
+        .with_detail("dll_status", serde_json::json!(dll_status))
+        .with_detail("target_state", serde_json::json!(target_state));
+    if target_state == TargetState::Running {
+        error = error.with_detail(
+            "recommendation",
+            serde_json::json!("先调用 jlink_control.halt，再读取核心寄存器"),
+        );
+    }
+    error
+}
+
 fn hss_start_error(status: i32) -> JlinkError {
     JlinkError::new(
         ErrorCode::HssStartFailed,
@@ -1634,10 +1738,25 @@ fn require_flash_reset_halted(state: TargetState) -> Result<(), JlinkError> {
     }
 }
 
+fn reusable_check(
+    checks: Option<&[ValidationCheck]>,
+    kind: ValidationCheckKind,
+) -> Option<ValidationCheck> {
+    checks?
+        .iter()
+        .find(|check| check.kind == kind)
+        .map(|check| {
+            let mut reused = check.clone();
+            reused.evidence = ValidationCheckEvidence::Reused;
+            reused
+        })
+}
+
 fn passed_check(kind: ValidationCheckKind, detail: impl Into<String>) -> ValidationCheck {
     ValidationCheck {
         kind,
         passed: true,
+        evidence: ValidationCheckEvidence::Executed,
         detail: detail.into(),
         recommendation: None,
     }
@@ -1651,6 +1770,7 @@ fn failed_check(
     ValidationCheck {
         kind,
         passed: false,
+        evidence: ValidationCheckEvidence::Executed,
         detail: detail.into(),
         recommendation: Some(recommendation.into()),
     }
@@ -1726,13 +1846,15 @@ mod tests {
 
     use jlink_domain::{
         CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
-        TargetConnectionSpec, TargetInterface, TargetState,
+        TargetConnectionSpec, TargetInterface, TargetState, ValidationCheckEvidence,
+        ValidationCheckKind,
     };
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
-        HssCaps, classify_observed_target_state, hss_start_error, require_flash_reset_halted,
-        validate_exec_command_result, validate_read_mem_result,
+        HssCaps, classify_observed_target_state, classify_register_read_failure, hss_start_error,
+        passed_check, require_flash_reset_halted, reusable_check, validate_exec_command_result,
+        validate_read_mem_result,
     };
 
     unsafe extern "C" fn hss_get_caps_stub(_caps: *mut HssCaps) -> i32 {
@@ -1840,6 +1962,35 @@ mod tests {
         let hardfault = classify_observed_target_state(true, || Ok(3))
             .expect("halted HardFault is classified from ICSR");
         assert_eq!(hardfault, TargetState::HardFault);
+    }
+
+    #[test]
+    fn register_item_failure_distinguishes_running_from_halted_access() {
+        let running = classify_register_read_failure(CoreRegister::Pc, 255, TargetState::Running);
+        assert_eq!(running.code, ErrorCode::InvalidStateTransition);
+        assert!(running.retryable);
+        let running_details = running.details.expect("running details");
+        assert_eq!(
+            running_details["target_state"],
+            serde_json::json!("running")
+        );
+
+        let halted = classify_register_read_failure(CoreRegister::Pc, 255, TargetState::Halted);
+        assert_eq!(halted.code, ErrorCode::TargetConnectFailed);
+        assert!(halted.retryable);
+        let halted_details = halted.details.expect("halted details");
+        assert_eq!(halted_details["target_state"], serde_json::json!("halted"));
+    }
+
+    #[test]
+    fn validation_check_provenance_changes_only_when_evidence_is_reused() {
+        let executed = passed_check(ValidationCheckKind::DllIdentity, "frozen DLL");
+        assert_eq!(executed.evidence, ValidationCheckEvidence::Executed);
+
+        let reused = reusable_check(Some(std::slice::from_ref(&executed)), executed.kind)
+            .expect("same-fingerprint evidence");
+        assert_eq!(reused.evidence, ValidationCheckEvidence::Reused);
+        assert_eq!(reused.detail, executed.detail);
     }
 
     #[test]

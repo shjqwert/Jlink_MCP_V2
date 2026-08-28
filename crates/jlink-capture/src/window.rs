@@ -359,9 +359,10 @@ pub fn around_event(
     event_id: &str,
     before_us: u64,
     after_us: u64,
+    series: Option<Vec<String>>,
     limit: usize,
 ) -> Result<CaptureAroundEvent, JlinkError> {
-    around_event_page(snapshot, event_id, before_us, after_us, limit, 0)
+    around_event_page(snapshot, event_id, before_us, after_us, series, limit, 0)
 }
 
 /// Returns one cursor page for an event neighborhood.
@@ -374,6 +375,7 @@ pub fn around_event_page(
     event_id: &str,
     before_us: u64,
     after_us: u64,
+    series: Option<Vec<String>>,
     limit: usize,
     offset: usize,
 ) -> Result<CaptureAroundEvent, JlinkError> {
@@ -411,7 +413,7 @@ pub fn around_event_page(
     }
     let nearby = changes(
         snapshot,
-        &CaptureChangesQuery::new(None, Some(from_us), Some(to_us), Some(Vec::new()), limit)?
+        &CaptureChangesQuery::new(series, Some(from_us), Some(to_us), Some(Vec::new()), limit)?
             .with_offset(offset),
     )?;
     let quality = snapshot

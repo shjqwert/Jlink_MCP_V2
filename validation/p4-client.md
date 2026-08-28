@@ -24,7 +24,7 @@
 
 首次隔离查询最短复现发现两个相互独立、均在既有公共合同内的问题：
 
-1. 工具说明没有列出各查询视图的扁平 JSON 骨架，Codex 曾自行构造不存在的包装对象。保持 Schema 不变，在 `jlink_hss` 说明中明确 overview、changes、window raw/aggregate、around_event 和 cursor continuation 的完整扁平骨架，并增加目录合同回归。
+1. 早期工具说明没有帮助 Codex 识别查询视图的扁平参数，Codex 曾自行构造不存在的包装对象。修复阶段曾在 `jlink_hss` 说明中补齐骨架；全阶段 FT-003 后改由运行时严格 Schema 作为字段权威、按需 HSS reference 负责查询策略，避免在目录中复制完整骨架。
 2. overview 按合同返回复合变量顶层短 ID `s0`，但查询解析器只接受叶 ID `s0.0...`。解析器现将合法顶层短 ID 确定性展开为其全部叶序列；精确叶 ID 和路径行为不变，并增加 T-P4-CHANGES 回归。
 
 修复没有增加 action、字段、fallback 或宽松解析；客户端在修复后首次正确构造查询，不依赖重试、忽略错误或硬编码结果。
@@ -53,6 +53,8 @@
 - Codex 通过 `jlink-mcp://capture/cap_aab08eb4d3289ec2caa62277/raw` 调用 `resources/read`，观察到 MIME `application/vnd.jlink-mcp.capture.v1+binary` 和 `JMCPV101` 头。源文件为 465461 bytes，SHA-256 `8CA2427AC63578CF874993A1B47C8C68C93E216D5D0C464F5300FDD585806B9C`；完整字节一致性继续由 T-P4-RESOURCE 的主要测试负责。
 
 隔离 Codex thread：`01a04351-2c51-7a53-ae31-0d7661dff1b3`。客户端在总结资源内容时重复调用读取接口，但每次均成功且没有 Schema、业务、资源或状态错误；该冗余不触发服务端 fallback，也不改变验收结果。
+
+后续 FT-017 复核使用更大的不可变文件区分服务端与客户端边界：磁盘及服务端规范资源为 201,208 bytes、头 `JMCPV101`、SHA-256 `A57C54A9E44FEC68E267FD9C010713BACA3F6B6AB8FD52D231307A9AB3CB8060`，完整 Base64 应为 268,280 字符；Codex 通用资源链路只交付 47,798 字符且长度不能被 4 整除。该项标记为客户端 external-blocked，服务端继续返回完整标准资源，不增加本地路径字段或删除 `resources/read`。
 
 ## 最小回归与证据复用
 

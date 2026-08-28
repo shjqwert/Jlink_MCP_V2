@@ -21,6 +21,7 @@ fn verify_idle_orphan_exit(
     let orphan_spec = WorkerLaunchSpec {
         executable: worker.to_path_buf(),
         lease_root: lease_root.join("orphan-leases"),
+        capture_root: lease_root.join("orphan-captures"),
         probe_identity: orphan_probe.clone(),
         dll_path: PathBuf::from(DLL_PATH),
     };
@@ -30,6 +31,8 @@ fn verify_idle_orphan_exit(
     let mut orphan = Command::new(worker)
         .arg("--lease-root")
         .arg(&orphan_spec.lease_root)
+        .arg("--capture-root")
+        .arg(&orphan_spec.capture_root)
         .arg("--probe")
         .arg(&orphan_probe)
         .arg("--dll")
@@ -95,6 +98,8 @@ fn verify_competing_worker_rejected(
     let competing = Command::new(worker)
         .arg("--lease-root")
         .arg(&spec.lease_root)
+        .arg("--capture-root")
+        .arg(&spec.capture_root)
         .arg("--probe")
         .arg(probe_identity)
         .arg("--dll")
@@ -125,6 +130,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spec = WorkerLaunchSpec {
         executable: worker.clone(),
         lease_root: directory.path().join("leases"),
+        capture_root: directory.path().join("captures"),
         probe_identity: probe_identity.clone(),
         dll_path: PathBuf::from(DLL_PATH),
     };

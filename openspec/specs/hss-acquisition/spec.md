@@ -74,7 +74,7 @@ HSS 选择项 MUST 由 ELF/DWARF 静态变量路径解析，不得接受原始�
 - **THEN** 系统将采集标记为 `failed` 并返回 failure code 和是否存在部分数据
 
 ### Requirement: HSSA-006 有界且可恢复的本地存储
-系统 MUST 在启动前估算空间并执行工程配置的 `capture.max_bytes` 单次采集上限；未配置时默认 512 MiB。有效配置可以调低或调高该上限，但不得绕过可用磁盘空间预检。活动采集 MUST 写入可恢复的临时文件；只有完成终态元数据和校验信息后才能原子发布最终资源。启动时 MUST 检测并恢复或明确标记残留临时文件，且 MUST NOT 自动删除已完成采集。
+系统 MUST 在启动前估算空间并执行工程配置的 `capture.max_bytes` 单次采集上限；未配置时默认 512 MiB。有效配置可以调低或调高该上限，但不得绕过可用磁盘空间预检。活动采集 MUST 写入 `jlink-mcp.toml` 所在工程的 `.jlink-mcp/captures/<probe_identity_hash>`；探针跨进程租约 MUST 继续独立保存在用户级目录。只有完成终态元数据和校验信息后才能原子发布最终资源。启动时 MUST 检测并恢复或明确标记工程 Store 中的残留临时文件，且 MUST NOT 自动删除已完成采集。离线查询 MUST 先查当前工程 Store；只有显式 ID/key 在工程 Store 不存在时，才能只读回退旧用户 Store，且 MUST NOT 移动、覆盖或删除旧采集。
 
 #### Scenario: 预计超过单次上限
 - **WHEN** 根据采样计划、频率和时长估算的采集大小超过有效 `capture.max_bytes`
@@ -83,6 +83,14 @@ HSS 选择项 MUST 由 ELF/DWARF 静态变量路径解析，不得接受原始�
 #### Scenario: 进程退出留下临时文件
 - **WHEN** Worker 重启时发现未完成采集文件
 - **THEN** 系统依据可验证元数据恢复可用部分或标记为不可恢复，且不把它误报为完整采集
+
+#### Scenario: 两个工程使用同一探针
+- **WHEN** 两个工程先后使用同一探针创建采集
+- **THEN** 系统将新采集写入各自工程 Store，任一工程不得通过普通查询发现另一工程的新采集
+
+#### Scenario: 显式读取旧用户 Store
+- **WHEN** 当前工程 Store 不含请求的显式 capture ID 或 key，而旧用户 Store 含有该完成采集
+- **THEN** 系统只读返回旧采集，不创建工程文件，也不迁移或删除旧文件
 
 ### Requirement: HSSA-007 数据质量检测
 系统 MUST 检测并报告 DLL 缓冲溢出、短帧、帧格式异常、实际样本间隔异常和能够识别的丢样。丢样证据 MUST 区分 `confirmed`、`suspected` 和 `unknown`；缺少可靠计数依据时 MUST NOT 报告零丢样。

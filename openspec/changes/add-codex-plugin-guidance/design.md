@@ -31,7 +31,7 @@ Codex 官方网页当前未提供足以确定本地插件 MCP 路径展开方式
 
 `SKILL.md` 只保留触发、工具/action 路由、共享不变量和 reference 选择。`target-session.md`、`programming.md`、`debug-access.md`、`hss.md`、`errors.md` 分别承载独有的状态与解释规则；默认读取一个业务 reference，只有失败或未知执行才读取 `errors.md`。
 
-reference 使用决策表和少量跨字段骨架，不复制运行时 JSON Schema。HSS 已在 `hss_tool()` 描述中提供被测试锁定的查询骨架，`hss.md` 只解释游标、生命周期、质量和时间语义。
+reference 使用决策表和少量跨字段骨架，不复制运行时 JSON Schema。HSS 工具描述只保留能力摘要；查询编排、游标、生命周期、质量、时间语义和多轮捕获预算由 `hss.md` 按需承担，具体字段仍以 live Schema 为准。
 
 状态指导采用当前 MCP/Worker 生命周期内的会话快照复用：Agent 从成功调用及其声明的状态转换持续更新可信状态，连续调试时不机械插入 target status；只在新生命周期、未知或失效状态、未知执行、外部变化或返回冲突使快照不再可信时查询。Worker 仍是最终状态校验权威，Skill 不接管运行时安全职责。
 
@@ -56,6 +56,18 @@ reference 使用决策表和少量跨字段骨架，不复制运行时 JSON Sche
 ### 6. repo-local marketplace 只承担开发和验收分发
 
 仓库提供 `.agents/plugins/marketplace.json`。安装脚本先把 marketplace 与插件源复制到被 Git 忽略的 `.local-marketplace`，只在该暂存副本写入 cachebuster，再通过 `codex plugin marketplace add` 注册并安装插件。受控清单保持可复现，修改后的插件仍能通过重新安装进入新任务；公开分发机制留给独立变更。
+
+### 7. 调试编排按业务消费和工具往返分支
+
+HSS 多轮或并发矩阵不使用单次调用的最短时长，而以至少 60 秒或预计总往返时间加 30 秒余量覆盖 Agent/tool 延迟，并在矩阵开始前确认 capture 仍为 `running`。这只影响 Skill 编排，不改变 HSS 1–300 秒固定时长和无手动 stop 的公共合同。
+
+固件命令、触发、握手和自清零控制字不能用最终同步 readback 证明写入是否发生。`debug-access.md` 对这类变量使用 `verify=none`，再验证业务状态；`VERIFY_FAILED` 不授权自动重试。普通稳定 RAM 仍可按需求显式使用 readback。
+
+### 8. 错误三层和大资源保持兼容边界
+
+`structuredContent.error` 是 Agent 的机器可读权威；`isError` 服务通用 MCP 失败判定，`content.text` 服务只显示文本的客户端。三者的重复是兼容输出，不为压缩删除，并由同一序列化错误对象生成和测试。
+
+`resources/read` 继续返回完整规范 capture。若 Codex 集成层截断 Base64，验证记录服务端文件长度、头、SHA-256 与客户端实际交付并保持 external-blocked；服务端不暴露本地路径、不缩减资源、不删除读取能力。
 
 ## Risks / Trade-offs
 

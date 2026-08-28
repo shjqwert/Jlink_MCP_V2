@@ -262,6 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let launch = WorkerLaunchSpec {
         executable: worker,
         lease_root: directory.path().join("leases"),
+        capture_root: directory.path().join("captures"),
         probe_identity: PROBE_SERIAL.to_string(),
         dll_path: PathBuf::from(DLL_PATH),
     };

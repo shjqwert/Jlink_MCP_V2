@@ -102,6 +102,8 @@ MCP 包装层：
 
 写入结构体或数组时必须提供完整选中对象；局部写入通过成员或元素路径完成。写 union 时必须定位具体成员，或在 `$union` 中只提供一个成员。柔性或动态长度数组必须独立提供 `slice {start,count}`；路径中的 `[i]` 不能替代 `slice`，只选择一个元素时也使用 `count:1`。
 
+公开 Schema 使用根级 `$defs.typedValue` 表达上述递归合同；`jlink_write.variable`、`jlink_inspect.variable` 的值和 HSS 规则/采样值均通过 `$ref` 引用同一定义。普通 JSON 字符串和 `null` 不是 TypedValue；字符串只允许出现在 `$int`、`$float`、`$pointer` 的封闭标签对象中。
+
 ## 3. 工具总表
 
 | 工具 | actions | 用途 | MCP annotations（保守值） |
@@ -179,7 +181,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 { "action": "validate" }
 ```
 
-用于配置修正后的显式复检。它返回确定顺序的 `checks`、实际最终 `target_state`、`target_id`、`validation_runs`，以及本次发生时才出现的 `recovery_notifications`。失败项包含明确修正建议；执行失败通过稳定错误返回。断开状态缺少 `after`，或连接状态携带 `after`，均拒绝执行。
+用于配置修正后的显式复检。它返回确定顺序的 `checks`、实际最终 `target_state`、`target_id`、`validation_runs`，以及本次发生时才出现的 `recovery_notifications`。每项 check 必须包含 `evidence: "executed" | "reused"`。同一 Worker、连接和目标指纹内可复用 DLL、导出、探针、目标身份、接口和 HSS 能力；目标状态每次重新观察，running 时每次实际执行 ICSR 检查，halted/HardFault 时只能明确复用同一连接已成功的 running 证据。失败项包含明确修正建议；执行失败通过稳定错误返回。断开状态缺少 `after`，或连接状态携带 `after`，均拒绝执行。
 
 ### 4.5 `config_get`
 
@@ -255,6 +257,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 - `verify` 默认 `true`。
 - `after` 必填：`none | reset_halt | reset_run`。显式字段避免 Agent 误解烧录后的目标状态。
 - 已知 Flash 边界之外的镜像段返回 `FLASH_RANGE_INVALID`。
+- Flash 主操作成功后立即使固件身份和验证证据失效。若后置状态处理失败，关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`；`details` 固定包含 `operation`、`phase: "post_action"`、请求的 `after`、`flash_modified: true` 和原始 `cause_code`。
 - 完整成功返回 `{}`。
 
 ### 5.2 `erase`
@@ -276,7 +279,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 }
 ```
 
-`address` 和 `length` 必须同时存在或同时省略。范围必须落在已知 Flash 边界内。完整成功返回 `{}`。
+`address` 和 `length` 必须同时存在或同时省略。范围必须落在已知 Flash 边界内。Flash 主操作与后置状态失败使用 5.1 的同一不可重放语义；完整成功返回 `{}`。
 
 ### 5.3 `verify`
 
@@ -340,7 +343,7 @@ V1 单次长度范围为 `1..4096` 字节。结果仅包含按内存地址顺序
 { "value": "0x08001234" }
 ```
 
-V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`PSP`、`APSR`、`EPSR`、`IPSR`、`PRIMASK`、`BASEPRI`、`FAULTMASK`、`CONTROL`，并与当前目标实际目录取交集。名称区分大小写，不接受 `R13/R14/R15` 等别名；名称不准确或目标不支持时返回 `REGISTER_NOT_FOUND`。
+V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`PSP`、`APSR`、`EPSR`、`IPSR`、`PRIMASK`、`BASEPRI`、`FAULTMASK`、`CONTROL`，并与当前目标实际目录取交集。名称区分大小写，不接受 `R13/R14/R15` 等别名；只有名称未出现在目标目录时返回 `REGISTER_NOT_FOUND`。目录已命中但运行态不可读时返回 `TARGET_STATE_INVALID` 和 `target_state: "running"`；暂停态仍读取失败时返回 `TARGET_CONNECT_FAILED`。
 
 ### 6.4 `symbols`
 
@@ -580,6 +583,19 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 `state` 为 `starting | running | stopping | completed | failed | aborted`。
 
+`completed` 只返回进入离线查询所需的终态摘要，不重复完整 `quality` 或 `from_us/to_us`：
+
+```json
+{
+  "capture_id": "cap_01J...",
+  "state": "completed",
+  "elapsed_us": 30000000,
+  "complete_records": 29996
+}
+```
+
+随后使用同一 `capture_id` 请求 `overview` 获取完整范围、字典、导航计数和质量证据。
+
 - `failed`：采集流程能够完成故障收口，但没有形成正常完成的 capture；返回 `failure_code` 和 `partial_available`。
 - `aborted`：进程被强制终止、存储中断或遗留 `.partial` 被启动扫描发现；返回 `reason`、`recoverable` 和 `partial_available`。
 - `aborted` 只描述事实，不恢复公共 `stop/cancel` action。
@@ -643,6 +659,8 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 原始资源包含完整 path→`series_id` 字典、DWARF 路径规则、数组维度、位域范围、union 歧义、编码、格式版本、采集边界、完整性信息和校验和。
 
 `resources/read` 只接受上述规范 URI，并在返回前重新验证版本头、头/块/终态 CRC、原始 payload SHA-256、采集身份和终态清单。成功结果的 `contents` 只有一个二进制项：`uri` 为相同规范 URI，`mimeType` 为固定 MIME，`blob` 为完整 `.capture` 文件的标准 Base64；不得返回服务端生成的图片或仅抽取后的 payload。读取只依赖已完成的不可变 Capture Store 和已配置的探针身份，不要求活动 Worker 或目标连接。V1 格式按启动计划中顶层变量的稳定顺序定义 `s0..sN`，因此完整路径字典可由资源内计划独立恢复，无需当前 ELF 或会话。
+
+新采集固定写入 `jlink-mcp.toml` 所在工程的 `.jlink-mcp/captures/<probe_identity_hash>`；用户级探针租约目录不再承载新 capture。查询和资源读取先查当前工程 Store，仅在显式 ID/key 不存在时只读回退旧用户 Store；服务端不自动迁移、覆盖或删除旧采集。
 
 #### `changes`
 
@@ -751,11 +769,12 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
   "event_id": "e17",
   "before_us": 100000,
   "after_us": 200000,
+  "series": ["s0", "motor.speed"],
   "limit": 200
 }
 ```
 
-默认返回事件和附近变化，不返回原始波形；原始波形通过 `window` 获取。
+默认返回事件和附近全部序列的变化，不返回原始波形；可选 `series` 使用与 `changes/window` 相同的稳定短 ID 或精确叶路径解析，并只保留所选序列的字典、变化和关系。省略 `series` 保持全序列行为；原始波形通过 `window` 获取。
 
 结果包含所选 `event`、可直接复用于 `window` 的 sample 时钟半开边界、附近精确 `changes`、逐变化 `relations` 和重叠的质量证据。写入事件保留 `memory_write` 或 `variable_write`；旧格式 capture 未保存写入类别时只报告 `target_write`，不得猜测更具体类型。事件邻域按已持久化的 host→sample 映射误差扩展并裁剪到采集范围。
 
@@ -778,7 +797,7 @@ V1 规范名称固定为 `R0`–`R12`、`SP`、`LR`、`PC`、`XPSR`、`MSP`、`P
 
 - 游标绑定固定 capture 快照、查询字段、排序、schema 版本和页位置。
 - 同一游标序列不受后续追加数据影响；已完成 capture 的游标在资源存在期间有效。
-- 续页请求只提供原 capture 身份和不透明 `cursor`；视图、范围、变量、规则、mode、points、limit 和排序全部从已验证游标恢复，不接受调用方改写。
+- 续页请求只提供原 capture 身份和不透明 `cursor`；视图、范围、`series`、规则、mode、points、limit 和排序全部从已验证游标恢复，不接受调用方改写。
 - `truncated: true` 时必须返回 `next_cursor`；否则省略 `next_cursor`。
 - 首页返回当页需要的完整 `series` 字典；后续页只返回此前未登记的增量，未变化字典为空对象。
 - 每页只报告落在该页范围内的 gap、overflow、rate、frame 和 clock 问题。

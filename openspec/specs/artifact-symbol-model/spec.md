@@ -60,6 +60,10 @@
 - **WHEN** 变量值超出 IEEE-754 安全整数范围
 - **THEN** 系统使用十进制字符串并同时返回位宽和符号性，不以 JSON number 丢失精度
 
+#### Scenario: Agent 通过公共 Schema 提交递归值
+- **WHEN** Agent 提交数值数组、嵌套结构体数组或 `$int` 标签值
+- **THEN** 写入、读取和 HSS Schema 通过同一递归 TypedValue 定义解释该值，并拒绝普通字符串或 `null`
+
 ### Requirement: ART-007 精确解析与兼容声明
 变量路径 MUST 精确且唯一解析，系统 MUST NOT 静默模糊匹配。支持声明 MUST 依据实际通过的 ELF/DWARF 特性和 fixture；未验证编译器版本只能作为兼容候选。
 

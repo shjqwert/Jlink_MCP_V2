@@ -197,7 +197,7 @@ fn t_p4_window_around_event_reuses_sample_bounds_without_returning_raw_waveform(
         serde_json::from_value(legacy_status).expect("legacy write manifest");
     assert_eq!(legacy_status.writes[0].kind, HssWriteKind::TargetWrite);
 
-    let around = around_event(&snapshot, "e0", 0, 0, 10).expect("event neighborhood");
+    let around = around_event(&snapshot, "e0", 0, 0, None, 10).expect("event neighborhood");
     assert_eq!(around.event.kind, CaptureEventKind::MemoryWrite);
     assert_eq!(around.event.request_id.as_deref(), Some("write-1"));
     assert_eq!(around.window.from_us, 0);
@@ -210,6 +210,18 @@ fn t_p4_window_around_event_reuses_sample_bounds_without_returning_raw_waveform(
     );
     assert_eq!(around.quality.len(), 1);
     assert!(!around.truncated);
+
+    let filtered = around_event(&snapshot, "e0", 0, 0, Some(vec!["s0".to_owned()]), 10)
+        .expect("filtered event neighborhood");
+    assert_eq!(filtered.dictionary.len(), 1);
+    assert!(filtered.dictionary.contains_key("s0"));
+    assert!(filtered.changes.iter().all(|change| change.series == "s0"));
+    assert!(
+        filtered
+            .relations
+            .iter()
+            .all(|relation| relation.series == "s0")
+    );
 
     let reusable = CaptureWindowQuery::new(
         vec!["s0".to_owned()],
@@ -224,6 +236,6 @@ fn t_p4_window_around_event_reuses_sample_bounds_without_returning_raw_waveform(
     };
     assert_eq!(raw.time_us, vec![0, 1_000, 2_000, 3_000]);
 
-    let missing = around_event(&snapshot, "e99", 0, 0, 10).expect_err("unknown event ID");
+    let missing = around_event(&snapshot, "e99", 0, 0, None, 10).expect_err("unknown event ID");
     assert_eq!(missing.code, jlink_domain::ErrorCode::ValueInvalid);
 }

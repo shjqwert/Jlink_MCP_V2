@@ -1,6 +1,12 @@
 //! Process-owned configuration and Worker orchestration behind the MCP boundary.
 
-use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use jlink_capture::{
     CaptureChangesQuery, CaptureEvent, CaptureSnapshot, CaptureStore, CaptureWindow,
@@ -32,6 +38,7 @@ pub struct Runtime {
     config_paths: ConfigPaths,
     worker_executable: PathBuf,
     lease_root: PathBuf,
+    capture_root: PathBuf,
     attachment: Option<WorkerAttachment>,
     symbol_cache: SymbolCache,
 }
@@ -50,15 +57,13 @@ struct CursorPageContext<'a> {
 impl Runtime {
     /// Builds the runtime from explicit local paths.
     #[must_use]
-    pub const fn new(
-        config_paths: ConfigPaths,
-        worker_executable: PathBuf,
-        lease_root: PathBuf,
-    ) -> Self {
+    pub fn new(config_paths: ConfigPaths, worker_executable: PathBuf, lease_root: PathBuf) -> Self {
+        let capture_root = project_capture_root(&config_paths.project);
         Self {
             config_paths,
             worker_executable,
             lease_root,
+            capture_root,
             attachment: None,
             symbol_cache: SymbolCache::new(),
         }
@@ -573,18 +578,7 @@ impl Runtime {
         offset: usize,
         emitted_series: &[String],
     ) -> Result<ToolCall, JlinkError> {
-        let series = arguments.get("series").map(|value| {
-            value
-                .as_array()
-                .expect("changes.series passed MCP Schema")
-                .iter()
-                .map(|item| {
-                    item.as_str()
-                        .expect("changes.series item passed MCP Schema")
-                        .to_owned()
-                })
-                .collect::<Vec<_>>()
-        });
+        let series = hss_series(arguments, "changes");
         let rules = arguments
             .get("rules")
             .map(|value| {
@@ -770,6 +764,7 @@ impl Runtime {
             arguments["after_us"]
                 .as_u64()
                 .expect("around_event.after_us passed MCP Schema"),
+            hss_series(arguments, "around_event"),
             limit,
             offset,
         )?;
@@ -915,26 +910,28 @@ impl Runtime {
             )
         })?;
         let identity_hash = probe_identity_hash(&probe.value.to_string())?;
-        let root = self.lease_root.join("captures").join(identity_hash);
-        let Some(store) = CaptureStore::open_existing(root)? else {
-            return Err(capture_not_found(arguments));
-        };
-        match (
+        let identity = (
             arguments.get("capture_id").and_then(Value::as_str),
             arguments.get("capture_key").and_then(Value::as_str),
-        ) {
-            (Some(capture_id), None) => store
-                .find_snapshot(capture_id)?
-                .ok_or_else(|| capture_not_found(arguments)),
-            (None, Some(capture_key)) => store
-                .find_snapshot_by_key(capture_key)?
-                .ok_or_else(|| capture_not_found(arguments)),
-            _ => Err(JlinkError::new(
+        );
+        if !matches!(identity, (Some(_), None) | (None, Some(_))) {
+            return Err(JlinkError::new(
                 ErrorCode::ValueInvalid,
                 "HSS 查询必须且只能提供 capture_id 或 capture_key",
                 false,
-            )),
+            ));
         }
+        let project_root = self.capture_root.join(&identity_hash);
+        if let Some(snapshot) = find_completed_snapshot(&project_root, identity)? {
+            return Ok(snapshot);
+        }
+        let legacy_root = self.lease_root.join("captures").join(&identity_hash);
+        if legacy_root != project_root
+            && let Some(snapshot) = find_completed_snapshot(&legacy_root, identity)?
+        {
+            return Ok(snapshot);
+        }
+        Err(capture_not_found(arguments))
     }
 
     fn read_capture_resource(&self, uri: &str) -> Result<ToolCall, JlinkError> {
@@ -1218,6 +1215,7 @@ impl Runtime {
         let launch = WorkerLaunchSpec {
             executable: self.worker_executable.clone(),
             lease_root: self.lease_root.clone(),
+            capture_root: self.capture_root.clone(),
             probe_identity: probe.value.to_string(),
             dll_path: resolved.jlink.dll_path.value.clone(),
         };
@@ -1234,6 +1232,29 @@ impl Runtime {
             connected: status.connection_state == ConnectionState::Connected,
             capture_active: status.hss_active,
         })
+    }
+}
+
+fn project_capture_root(project_config: &Path) -> PathBuf {
+    project_config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".jlink-mcp")
+        .join("captures")
+}
+
+fn find_completed_snapshot(
+    root: &Path,
+    identity: (Option<&str>, Option<&str>),
+) -> Result<Option<CaptureSnapshot>, JlinkError> {
+    let Some(store) = CaptureStore::open_existing(root)? else {
+        return Ok(None);
+    };
+    match identity {
+        (Some(capture_id), None) => store.find_snapshot(capture_id),
+        (None, Some(capture_key)) => store.find_snapshot_by_key(capture_key),
+        _ => unreachable!("capture identity was validated before store lookup"),
     }
 }
 
@@ -1308,6 +1329,10 @@ fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
         "complete_records".to_owned(),
         json!(snapshot.complete_records),
     );
+    if snapshot.state == HssRunState::Completed {
+        result.remove("quality");
+        return Ok(Value::Object(result));
+    }
     if snapshot.quality.requested_rate_hz > 0 || snapshot.complete_records > 0 {
         let mut quality = serde_json::to_value(&snapshot.quality)
             .map_err(serialization_error)?
@@ -1322,6 +1347,21 @@ fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
         result.insert("to_us".to_owned(), json!(to_us));
     }
     Ok(Value::Object(result))
+}
+
+fn hss_series(arguments: &Value, context: &str) -> Option<Vec<String>> {
+    arguments.get("series").map(|value| {
+        value
+            .as_array()
+            .unwrap_or_else(|| panic!("{context}.series passed MCP Schema"))
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .unwrap_or_else(|| panic!("{context}.series item passed MCP Schema"))
+                    .to_owned()
+            })
+            .collect()
+    })
 }
 
 fn persisted_range(snapshot: &HssRunSnapshot) -> Result<Option<(u64, u64)>, JlinkError> {
@@ -1948,5 +1988,23 @@ mod hss_state_tests {
         assert_eq!(result["from_us"], 10_000);
         assert_eq!(result["to_us"], 11_000);
         assert_eq!(result["quality"]["integrity"], "unknown");
+    }
+
+    #[test]
+    fn completed_status_is_a_compact_query_entrypoint() {
+        let mut completed = snapshot(HssRunState::Completed, HssDataIntegrity::Unknown);
+        completed.quality.requested_rate_hz = 1_000;
+        completed.quality.expected_samples = 1_000;
+        completed.quality.actual_samples = 996;
+        completed.quality.clock.first_timestamp_us = Some(0);
+        completed.quality.clock.last_timestamp_us = Some(995_000);
+        let result = hss_status_result(&completed).expect("completed status result");
+        assert_eq!(result["capture_id"], "cap-state");
+        assert_eq!(result["state"], "completed");
+        assert_eq!(result["elapsed_us"], 10);
+        assert_eq!(result["complete_records"], 1);
+        assert!(result.get("quality").is_none());
+        assert!(result.get("from_us").is_none());
+        assert!(result.get("to_us").is_none());
     }
 }

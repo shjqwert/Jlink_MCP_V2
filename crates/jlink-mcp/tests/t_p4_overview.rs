@@ -98,7 +98,9 @@ fn runtime_fixture() -> (tempfile::TempDir, Runtime, PathBuf) {
     )
     .expect("user config");
     let lease_root = temporary.path().join("leases");
-    let store_root = lease_root
+    let store_root = temporary
+        .path()
+        .join(".jlink-mcp")
         .join("captures")
         .join(probe_identity_hash(&PROBE_SERIAL.to_string()).expect("probe identity hash"));
     let store = CaptureStore::open(&store_root).expect("capture store");
@@ -253,5 +255,52 @@ fn t_p4_overview_accepts_id_or_key_and_rejects_unknown_view_before_store_read() 
             .count(),
         before,
         "unknown identities and views must not create captures"
+    );
+}
+
+#[test]
+fn t_p4_overview_scopes_new_captures_to_the_project() {
+    let (temporary, mut project_a, store_root) = runtime_fixture();
+    let request = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": "jlink_hss",
+            "arguments": {
+                "action": "query",
+                "capture_id": "cap-mcp-overview",
+                "view": "overview"
+            }
+        }
+    });
+    let local_response = exchange(std::slice::from_ref(&request), &mut project_a);
+    assert_eq!(
+        local_response[0]["result"]["structuredContent"]["capture_id"],
+        "cap-mcp-overview"
+    );
+
+    let project_b_root = temporary.path().join("project-b");
+    fs::create_dir_all(&project_b_root).expect("second project root");
+    let project_b_config = project_b_root.join("jlink-mcp.toml");
+    fs::copy(temporary.path().join("jlink-mcp.toml"), &project_b_config)
+        .expect("second project config");
+    let mut project_b = Runtime::new(
+        ConfigPaths::new(project_b_config, temporary.path().join("user.toml")),
+        temporary.path().join("worker-must-not-run.exe"),
+        temporary.path().join("leases"),
+    );
+    let foreign_response = exchange(&[request], &mut project_b);
+    assert_eq!(
+        foreign_response[0]["result"]["structuredContent"]["error"]["code"], "VALUE_INVALID",
+        "another project cannot discover a new project-local capture"
+    );
+    assert!(
+        store_root.starts_with(temporary.path().join(".jlink-mcp").join("captures")),
+        "the first project owns its Capture Store"
+    );
+    assert!(
+        !project_b_root.join(".jlink-mcp").exists(),
+        "offline misses do not create a second project Store"
     );
 }

@@ -449,7 +449,7 @@ fn inspect_tool() -> Value {
 
 fn write_tool() -> Value {
     let verify = string_enum(&["none", "readback"]);
-    let input = action_union(vec![
+    let input = with_typed_value_definition(action_union(vec![
         action_object(
             "variable",
             vec![
@@ -474,7 +474,7 @@ fn write_tool() -> Value {
             vec![("name", non_empty_string()), ("value", address_schema())],
             &["name", "value"],
         ),
-    ]);
+    ]));
     tool_definition(
         "jlink_write",
         "Write a typed variable, RAM or MMIO bytes, or a writable core register.",
@@ -555,35 +555,31 @@ fn hss_tool() -> Value {
         ],
         &["view"],
     ));
-    for mode in ["raw", "transitions"] {
-        variants.extend(capture_identity_variants(
-            "query",
-            &[
-                ("view", json!({ "const": "window" })),
-                ("series", non_empty_unique_string_array()),
-                ("from_us", non_negative_integer()),
-                ("to_us", positive_integer()),
-                ("mode", json!({ "const": mode })),
-                ("limit", bounded_integer(1, 1_000)),
-            ],
-            &["view", "series", "from_us", "to_us", "mode"],
-        ));
-    }
-    for mode in ["min_max", "first_last"] {
-        variants.extend(capture_identity_variants(
-            "query",
-            &[
-                ("view", json!({ "const": "window" })),
-                ("series", non_empty_unique_string_array()),
-                ("from_us", non_negative_integer()),
-                ("to_us", positive_integer()),
-                ("mode", json!({ "const": mode })),
-                ("points", bounded_integer(1, 1_000)),
-                ("limit", bounded_integer(1, 1_000)),
-            ],
-            &["view", "series", "from_us", "to_us", "mode", "points"],
-        ));
-    }
+    variants.extend(capture_identity_variants(
+        "query",
+        &[
+            ("view", json!({ "const": "window" })),
+            ("series", non_empty_unique_string_array()),
+            ("from_us", non_negative_integer()),
+            ("to_us", positive_integer()),
+            ("mode", string_enum(&["raw", "transitions"])),
+            ("limit", bounded_integer(1, 1_000)),
+        ],
+        &["view", "series", "from_us", "to_us", "mode"],
+    ));
+    variants.extend(capture_identity_variants(
+        "query",
+        &[
+            ("view", json!({ "const": "window" })),
+            ("series", non_empty_unique_string_array()),
+            ("from_us", non_negative_integer()),
+            ("to_us", positive_integer()),
+            ("mode", string_enum(&["min_max", "first_last"])),
+            ("points", bounded_integer(1, 1_000)),
+            ("limit", bounded_integer(1, 1_000)),
+        ],
+        &["view", "series", "from_us", "to_us", "mode", "points"],
+    ));
     variants.extend(capture_identity_variants(
         "query",
         &[
@@ -591,14 +587,15 @@ fn hss_tool() -> Value {
             ("event_id", non_empty_string()),
             ("before_us", non_negative_integer()),
             ("after_us", non_negative_integer()),
+            ("series", non_empty_unique_string_array()),
             ("limit", bounded_integer(1, 1_000)),
         ],
         &["view", "event_id", "before_us", "after_us"],
     ));
     tool_definition(
         "jlink_hss",
-        r#"Start a fixed-duration HSS capture or inspect capture status. All status/query fields are flat top-level JSON; never use query or resolution wrapper objects. Each status/query uses exactly one identity, capture_id or capture_key; examples below use capture_id. Immutable query skeletons: overview={"action":"query","capture_id":"...","view":"overview"}; changes={"action":"query","capture_id":"...","view":"changes","series":["s0"],"from_us":0,"to_us":1000,"rules":[],"limit":100}; raw/transitions window={"action":"query","capture_id":"...","view":"window","series":["s0"],"from_us":0,"to_us":1000,"mode":"raw","limit":100}; min_max/first_last window uses the same flat fields with "mode":"min_max" and required "points":100; around_event={"action":"query","capture_id":"...","view":"around_event","event_id":"e0","before_us":1000,"after_us":1000,"limit":100}; cursor continuation={"action":"query","capture_id":"...","cursor":"..."} and omits view plus every view-specific field."#,
-        action_union(variants),
+        "Start a fixed-duration capture, read status, or query overview, changes, window, and around_event views. Requests use strict flat JSON and exactly one capture_id or capture_key; cursor continues a page.",
+        with_hss_input_definitions(action_union(variants)),
         hss_output_schema(),
         annotations(false, true, true),
     )
@@ -609,16 +606,21 @@ fn capture_identity_variants(
     fields: &[(&'static str, Value)],
     required: &[&str],
 ) -> Vec<Value> {
-    ["capture_id", "capture_key"]
-        .into_iter()
-        .map(|identity| {
-            let mut variant_fields = fields.to_vec();
-            variant_fields.push((identity, non_empty_string()));
-            let mut variant_required = required.to_vec();
-            variant_required.push(identity);
-            action_object(action, variant_fields, &variant_required)
-        })
-        .collect()
+    let mut variant_fields = fields.to_vec();
+    variant_fields.push(("capture_id", non_empty_string()));
+    variant_fields.push(("capture_key", non_empty_string()));
+    let mut variant = action_object(action, variant_fields, required);
+    variant
+        .as_object_mut()
+        .expect("capture identity action Schema is an object")
+        .insert(
+            "oneOf".to_owned(),
+            json!([
+                { "required": ["capture_id"] },
+                { "required": ["capture_key"] }
+            ]),
+        );
+    vec![variant]
 }
 
 fn target_output_schema() -> Value {
@@ -669,13 +671,13 @@ fn target_output_schema() -> Value {
 
 fn inspect_output_schema() -> Value {
     let variants = vec![
-        inspect_success_schema("variable"),
-        inspect_success_schema("memory"),
-        inspect_success_schema("register"),
-        inspect_success_schema("symbols"),
+        inspect_success_schema_body("variable"),
+        inspect_success_schema_body("memory"),
+        inspect_success_schema_body("register"),
+        inspect_success_schema_body("symbols"),
         closed_object(vec![("error", error_schema())], &["error"]),
     ];
-    json!({
+    with_typed_value_definition(json!({
         "type": "object",
         "properties": {
             "value": {},
@@ -685,7 +687,7 @@ fn inspect_output_schema() -> Value {
         },
         "additionalProperties": false,
         "oneOf": variants
-    })
+    }))
 }
 
 fn action_output_schema(name: &str, arguments: &Value) -> Option<Value> {
@@ -702,6 +704,10 @@ fn action_output_schema(name: &str, arguments: &Value) -> Option<Value> {
 }
 
 fn inspect_success_schema(action: &str) -> Value {
+    with_typed_value_definition(inspect_success_schema_body(action))
+}
+
+fn inspect_success_schema_body(action: &str) -> Value {
     match action {
         "variable" => closed_object(vec![("value", typed_value_schema())], &["value"]),
         "memory" => closed_object(vec![("data", byte_string_schema())], &["data"]),
@@ -712,6 +718,10 @@ fn inspect_success_schema(action: &str) -> Value {
 }
 
 fn hss_output_schema() -> Value {
+    with_hss_output_definitions(hss_output_schema_body())
+}
+
+fn hss_output_schema_body() -> Value {
     closed_schema_union(&[
         hss_status_output_schema(),
         hss_overview_output_schema(),
@@ -725,7 +735,7 @@ fn hss_output_schema() -> Value {
 }
 
 fn hss_action_output_schema(arguments: &Value) -> Value {
-    match arguments
+    let schema = match arguments
         .get("action")
         .and_then(Value::as_str)
         .expect("MCP Schema guarantees hss.action")
@@ -735,7 +745,7 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
             hss_completed_start_output_schema(),
         ]),
         "status" => hss_status_output_schema(),
-        "query" if arguments.get("cursor").is_some() => hss_output_schema(),
+        "query" if arguments.get("cursor").is_some() => hss_output_schema_body(),
         "query" => match arguments
             .get("view")
             .and_then(Value::as_str)
@@ -753,14 +763,15 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
                 _ => unreachable!("window mode passed closed MCP Schema"),
             },
             "around_event" => hss_around_event_output_schema(),
-            _ => hss_output_schema(),
+            _ => hss_output_schema_body(),
         },
         _ => unreachable!("HSS action was validated against the closed catalog"),
-    }
+    };
+    with_hss_output_definitions(schema)
 }
 
 fn hss_status_output_schema() -> Value {
-    closed_object(
+    let mut schema = closed_object(
         vec![
             ("capture_id", non_empty_string()),
             ("state", hss_state_schema()),
@@ -775,7 +786,30 @@ fn hss_status_output_schema() -> Value {
             ("quality", hss_quality_schema()),
         ],
         &["capture_id", "state"],
-    )
+    );
+    schema
+        .as_object_mut()
+        .expect("HSS status Schema is an object")
+        .insert(
+            "allOf".to_owned(),
+            json!([{
+                "if": {
+                    "properties": { "state": { "const": "completed" } },
+                    "required": ["state"]
+                },
+                "then": {
+                    "required": ["elapsed_us", "complete_records"],
+                    "not": {
+                        "anyOf": [
+                            { "required": ["from_us"] },
+                            { "required": ["to_us"] },
+                            { "required": ["quality"] }
+                        ]
+                    }
+                }
+            }]),
+        );
+    schema
 }
 
 fn hss_overview_output_schema() -> Value {
@@ -872,6 +906,10 @@ fn hss_changes_output_schema() -> Value {
 }
 
 fn hss_change_item_schema() -> Value {
+    schema_ref("hssChange")
+}
+
+fn hss_change_item_definition() -> Value {
     closed_object(
         vec![
             ("series", non_empty_string()),
@@ -996,6 +1034,10 @@ fn hss_around_event_output_schema() -> Value {
 }
 
 fn hss_capture_event_schema() -> Value {
+    schema_ref("hssEvent")
+}
+
+fn hss_capture_event_definition() -> Value {
     let host_time = || {
         closed_object(
             vec![
@@ -1040,6 +1082,10 @@ fn hss_capture_event_schema() -> Value {
 }
 
 fn hss_event_change_relation_schema() -> Value {
+    schema_ref("hssRelation")
+}
+
+fn hss_event_change_relation_definition() -> Value {
     closed_object(
         vec![
             ("event", non_empty_string()),
@@ -1086,6 +1132,10 @@ fn hss_state_schema() -> Value {
 }
 
 fn hss_quality_schema() -> Value {
+    schema_ref("hssQuality")
+}
+
+fn hss_quality_definition() -> Value {
     closed_object(
         vec![
             (
@@ -1186,6 +1236,10 @@ fn hss_clock_schema() -> Value {
 }
 
 fn hss_quality_events_schema() -> Value {
+    schema_ref("hssQualityEvents")
+}
+
+fn hss_quality_events_definition() -> Value {
     json!({
         "type": "array",
         "items": closed_object(
@@ -1277,10 +1331,11 @@ fn validation_check_schema() -> Value {
                 ]),
             ),
             ("passed", boolean()),
+            ("evidence", string_enum(&["executed", "reused"])),
             ("detail", non_empty_string()),
             ("recommendation", non_empty_string()),
         ],
-        &["kind", "passed", "detail"],
+        &["kind", "passed", "evidence", "detail"],
     )
 }
 
@@ -1302,6 +1357,10 @@ fn slice_schema() -> Value {
 }
 
 fn threshold_rule_schema() -> Value {
+    schema_ref("thresholdRule")
+}
+
+fn threshold_rule_definition() -> Value {
     tagged_union(
         "kind",
         vec![
@@ -1526,7 +1585,122 @@ fn byte_string_schema() -> Value {
 }
 
 fn typed_value_schema() -> Value {
-    json!({ "type": ["boolean", "number", "object", "array"] })
+    schema_ref("typedValue")
+}
+
+fn with_typed_value_definition(mut schema: Value) -> Value {
+    schema
+        .as_object_mut()
+        .expect("root Schema is an object")
+        .insert(
+            "$defs".to_owned(),
+            json!({ "typedValue": typed_value_definition() }),
+        );
+    schema
+}
+
+fn with_hss_input_definitions(mut schema: Value) -> Value {
+    schema
+        .as_object_mut()
+        .expect("root Schema is an object")
+        .insert(
+            "$defs".to_owned(),
+            json!({
+                "typedValue": typed_value_definition(),
+                "thresholdRule": threshold_rule_definition()
+            }),
+        );
+    schema
+}
+
+fn with_hss_output_definitions(mut schema: Value) -> Value {
+    schema
+        .as_object_mut()
+        .expect("root Schema is an object")
+        .insert(
+            "$defs".to_owned(),
+            json!({
+                "typedValue": typed_value_definition(),
+                "hssQuality": hss_quality_definition(),
+                "hssQualityEvents": hss_quality_events_definition(),
+                "hssEvent": hss_capture_event_definition(),
+                "hssChange": hss_change_item_definition(),
+                "hssRelation": hss_event_change_relation_definition()
+            }),
+        );
+    schema
+}
+
+fn schema_ref(name: &str) -> Value {
+    json!({ "$ref": format!("#/$defs/{name}") })
+}
+
+fn typed_value_definition() -> Value {
+    let recursive = || json!({ "$ref": "#/$defs/typedValue" });
+    json!({
+        "oneOf": [
+            { "type": ["boolean", "number"] },
+            {
+                "type": "array",
+                "items": recursive()
+            },
+            {
+                "type": "object",
+                "oneOf": [
+                    {
+                        "propertyNames": {
+                            "not": { "enum": ["$int", "$float", "$pointer", "$union"] }
+                        },
+                        "additionalProperties": recursive()
+                    },
+                    {
+                        "properties": {
+                            "$int": {
+                                "type": "string",
+                                "pattern": "^[+-]?[0-9]+$"
+                            },
+                            "bits": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 64
+                            },
+                            "signed": { "type": "boolean" }
+                        },
+                        "required": ["$int", "bits", "signed"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "properties": {
+                            "$float": { "enum": ["nan", "inf", "-inf"] }
+                        },
+                        "required": ["$float"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "properties": {
+                            "$pointer": {
+                                "type": "string",
+                                "pattern": "^0x[0-9a-fA-F]+$"
+                            }
+                        },
+                        "required": ["$pointer"],
+                        "additionalProperties": false
+                    },
+                    {
+                        "properties": {
+                            "$union": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "additionalProperties": recursive()
+                            }
+                        },
+                        "required": ["$union"],
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        ]
+    })
 }
 
 #[cfg(test)]
@@ -1537,16 +1711,27 @@ mod tests {
 
     #[test]
     fn frame_invalid_remains_a_structured_public_error() {
-        let result = public_tool_error(JlinkError::new(
-            ErrorCode::FrameInvalid,
-            "HSS frame tail is invalid",
-            false,
-        ))
+        let result = public_tool_error(
+            JlinkError::new(ErrorCode::FrameInvalid, "HSS frame tail is invalid", false)
+                .with_detail("capture_id", serde_json::json!("cap-1")),
+        )
         .expect("FRAME_INVALID is part of the public error contract");
 
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["content"][0]["type"], "text");
         assert_eq!(
-            result["structuredContent"]["error"]["code"],
-            "FRAME_INVALID"
+            result["content"][0]["text"],
+            "FRAME_INVALID: HSS frame tail is invalid"
+        );
+        assert_eq!(
+            result["structuredContent"]["error"],
+            serde_json::json!({
+                "code": "FRAME_INVALID",
+                "message": "HSS frame tail is invalid",
+                "retryable": false,
+                "details": { "capture_id": "cap-1" }
+            })
         );
     }
 

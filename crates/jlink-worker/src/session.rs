@@ -1,7 +1,7 @@
 use jlink_domain::{
     ConnectionState, DebugRequest, ErrorCode, FaultDiagnostics, JlinkError, RecoveryAction,
     RecoveryNotification, SessionEvent, TargetConnectionSpec, TargetState, ValidationAfter,
-    ValidationCheckKind, ValidationInvalidation, ValidationReport, WorkerStatus,
+    ValidationCheck, ValidationCheckKind, ValidationInvalidation, ValidationReport, WorkerStatus,
     ensure_disconnect_allowed, transition_session,
 };
 use serde_json::json;
@@ -66,6 +66,8 @@ pub(crate) struct TargetSessionManager {
     hss_active: bool,
     active_target: Option<TargetConnectionSpec>,
     validation_key: Option<TargetConnectionSpec>,
+    validation_checks: Vec<ValidationCheck>,
+    running_background_access: Option<ValidationCheck>,
     firmware_identity: Option<String>,
     validation_runs: u64,
     recovery_notifications: Vec<RecoveryNotification>,
@@ -81,6 +83,8 @@ impl TargetSessionManager {
             hss_active: false,
             active_target: None,
             validation_key: None,
+            validation_checks: Vec::new(),
+            running_background_access: None,
             firmware_identity: None,
             validation_runs: 0,
             recovery_notifications: Vec::new(),
@@ -271,12 +275,16 @@ impl TargetSessionManager {
         self.firmware_identity = Some(elf_sha256.to_owned());
     }
 
-    /// Records the actual final target state and invalidates Flash-derived caches.
-    pub(crate) fn record_program_result(&mut self, state: TargetState, flash_modified: bool) {
+    /// Records a confirmed Flash mutation before any fallible verification or post-action.
+    pub(crate) fn record_flash_modified(&mut self) {
+        self.firmware_identity = None;
+        self.running_background_access = None;
+        self.last_invalidation = Some(ValidationInvalidation::FlashModified);
+    }
+
+    /// Records the target state confirmed after programming or verification.
+    pub(crate) const fn record_program_state(&mut self, state: TargetState) {
         self.target_state = state;
-        if flash_modified {
-            self.invalidate_validation(ValidationInvalidation::FlashModified);
-        }
     }
 
     /// Marks the active connection untrusted after an indeterminate target side effect.
@@ -331,7 +339,7 @@ impl TargetSessionManager {
             }
         }
         self.validation_runs += 1;
-        let report = gateway.validation_report(self.validation_runs);
+        let report = gateway.validation_report(self.validation_runs, None, None);
         if !ordinary_debug_validation_passed(&report) {
             gateway.close_target();
             self.target_state = TargetState::Unknown;
@@ -347,7 +355,7 @@ impl TargetSessionManager {
         self.target_state = report.target_state;
         self.target_id = Some(observation.target_id);
         self.active_target = Some(spec.clone());
-        self.validation_key = Some(spec.clone());
+        self.record_validation_evidence(spec, &report);
         self.last_invalidation = None;
         self.connection_state = transition_session(self.connection_state, SessionEvent::Connected)?;
         Ok(())
@@ -378,9 +386,25 @@ impl TargetSessionManager {
                     ));
                 }
                 self.validation_runs += 1;
-                let report = gateway.validation_report(self.validation_runs);
+                let reusable_checks = (self.validation_key.as_ref() == Some(spec))
+                    .then(|| self.validation_checks.clone());
+                let running_background_access = self.running_background_access.clone();
+                let report = gateway.validation_report(
+                    self.validation_runs,
+                    reusable_checks.as_deref(),
+                    running_background_access.as_ref(),
+                );
                 self.target_state = report.target_state;
                 self.target_id = report.target_id;
+                if report.target_state == TargetState::Unknown
+                    || report.checks.iter().any(|check| {
+                        check.kind == ValidationCheckKind::TargetIdentity && !check.passed
+                    })
+                {
+                    self.invalidate_validation(ValidationInvalidation::ConnectionLost);
+                } else {
+                    self.record_validation_evidence(spec, &report);
+                }
                 Ok(report)
             }
             ValidationMode::Temporary(after) => self.validate_temporary(gateway, spec, after),
@@ -409,7 +433,7 @@ impl TargetSessionManager {
                     false,
                 ));
             }
-            let mut report = gateway.validation_report(next_validation_run);
+            let mut report = gateway.validation_report(next_validation_run, None, None);
             let final_state = match after {
                 ValidationAfter::Run => running_state,
                 ValidationAfter::Halt => gateway.halt_and_observe()?,
@@ -468,8 +492,31 @@ impl TargetSessionManager {
 
     fn invalidate_validation(&mut self, reason: ValidationInvalidation) {
         self.validation_key = None;
+        self.validation_checks.clear();
+        self.running_background_access = None;
         self.firmware_identity = None;
         self.last_invalidation = Some(reason);
+    }
+
+    fn record_validation_evidence(
+        &mut self,
+        spec: &TargetConnectionSpec,
+        report: &ValidationReport,
+    ) {
+        self.validation_key = Some(spec.clone());
+        self.validation_checks = report
+            .checks
+            .iter()
+            .filter(|check| check.kind != ValidationCheckKind::BackgroundAccess)
+            .cloned()
+            .collect();
+        if report.target_state == TargetState::Running {
+            self.running_background_access = report
+                .checks
+                .iter()
+                .find(|check| check.kind == ValidationCheckKind::BackgroundAccess && check.passed)
+                .cloned();
+        }
     }
 }
 
@@ -554,6 +601,7 @@ mod tests {
             checks: vec![jlink_domain::ValidationCheck {
                 kind: ValidationCheckKind::HssCapability,
                 passed: false,
+                evidence: jlink_domain::ValidationCheckEvidence::Executed,
                 detail: "missing JLINK_HSS_Start".to_owned(),
                 recommendation: Some("use a HSS-capable DLL".to_owned()),
             }],
@@ -567,6 +615,7 @@ mod tests {
         report.checks.push(jlink_domain::ValidationCheck {
             kind: ValidationCheckKind::BackgroundAccess,
             passed: false,
+            evidence: jlink_domain::ValidationCheckEvidence::Executed,
             detail: "background read failed".to_owned(),
             recommendation: None,
         });
@@ -816,18 +865,35 @@ mod tests {
         completed.connection_state = ConnectionState::Connected;
         completed.active_target = Some(spec.clone());
         completed.validation_key = Some(spec.clone());
+        completed.validation_checks = vec![jlink_domain::ValidationCheck {
+            kind: ValidationCheckKind::DllIdentity,
+            passed: true,
+            evidence: jlink_domain::ValidationCheckEvidence::Executed,
+            detail: "frozen DLL".to_owned(),
+            recommendation: None,
+        }];
+        completed.running_background_access = Some(jlink_domain::ValidationCheck {
+            kind: ValidationCheckKind::BackgroundAccess,
+            passed: true,
+            evidence: jlink_domain::ValidationCheckEvidence::Executed,
+            detail: "running ICSR read".to_owned(),
+            recommendation: None,
+        });
         completed.record_firmware_identity(&"a".repeat(64));
         completed
             .ensure_program_allowed(&spec)
             .expect("connected validated session");
-        completed.record_program_result(TargetState::Halted, true);
-        assert_eq!(completed.target_state, TargetState::Halted);
-        assert!(completed.validation_key.is_none());
+        completed.record_flash_modified();
+        assert_eq!(completed.validation_key.as_ref(), Some(&spec));
+        assert_eq!(completed.validation_checks.len(), 1);
+        assert!(completed.running_background_access.is_none());
         assert!(!completed.firmware_identity_cached(&"a".repeat(64)));
         assert_eq!(
             completed.last_invalidation,
             Some(ValidationInvalidation::FlashModified)
         );
+        completed.record_program_state(TargetState::Halted);
+        assert_eq!(completed.target_state, TargetState::Halted);
         completed
             .ensure_program_allowed(&spec)
             .expect("Flash invalidates cache without losing active target identity");

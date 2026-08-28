@@ -4,6 +4,7 @@
 
 - T-P4-RESOURCE 覆盖 HSSQ-010、HSSQ-011：`resources/read` 在无活动 Worker/目标连接时读取不可变完成文件，固定返回 `application/vnd.jlink-mcp.capture.v1+binary` 和完整文件的标准 Base64。
 - 返回内容是 Capture Store 的原始 `.capture` 数据，不是图片、文本、抽取后的 payload 或服务端生成曲线；数值曲线继续由 window 原始/显式聚合视图提供。
+- 当前工程 Store 是新采集和离线读取的首选位置；本文件的旧用户 Store 夹具保留用于证明显式 capture ID 的只读兼容回退，不触发迁移、覆盖或删除。
 - 读取前通过同一文件句柄重新验证 V1 magic/版本、自描述头 CRC、每块 CRC、终态 CRC、原始 payload SHA-256、采集身份和终态清单；失败返回资源错误，不返回部分数据或 fallback。
 
 ## 格式与依赖边界
@@ -21,6 +22,12 @@
   - 在隔离临时文件中翻转 payload 字节后，块 CRC 失败并返回 `FRAME_INVALID`，不返回损坏资源。
   - 内容项只有 `uri/mimeType/blob`，没有 text 或 image MIME。
 - T-P1-MCP 继续复核模板、链接和读取三处 URI/MIME 一致性，不承担 HSSQ-010、HSSQ-011 的主要断言。
+
+## FT-017 客户端交付边界
+
+- 服务端不可变 `.capture` 文件为 201,208 bytes，头为 `JMCPV101`，SHA-256 为 `A57C54A9E44FEC68E267FD9C010713BACA3F6B6AB8FD52D231307A9AB3CB8060`；独立资源路径得到完整文件，标准 Base64 长度应为 268,280 字符。
+- 当前 Codex 通用资源链路只向 Agent 交付 47,798 个 Base64 字符，且长度不能被 4 整除；这不是可解析的完整标准 Base64，也没有显式截断错误。
+- 因此 FT-017 标记为 Codex 客户端 external-blocked。服务端继续保留标准完整 `resources/read`、既有 URI 与二进制 MIME；不新增本地路径字段、不删除资源接口、不迁移或缩减规范文件。
 
 ## P4 阶段纵向 Smoke
 

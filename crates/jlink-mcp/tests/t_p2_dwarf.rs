@@ -1,6 +1,6 @@
 //! Primary T-P2-DWARF fixture and cache verification.
 
-use std::{fs, io::Cursor, path::PathBuf};
+use std::{env, fs, io::Cursor, path::PathBuf};
 
 use jlink_domain::{
     AccessLayout, ElementSlice, ErrorCode, JlinkError, TargetInterface, VariableSelector,
@@ -28,10 +28,16 @@ fn iar_fixture() -> Vec<u8> {
     })
 }
 
-fn actual_t26_out_path() -> PathBuf {
-    PathBuf::from(
-        "D:/SVN/DCU/T26_DCU/trunk/03_code/T26_DCU_APP_NXP/Appl/Output/Exe/T26_DCU_APP_NXP.out",
-    )
+fn external_t26_out_path() -> PathBuf {
+    env::var_os("JLINK_MCP_T26_ELF")
+        .map(PathBuf::from)
+        .expect("JLINK_MCP_T26_ELF must name the external T26 ELF/OUT artifact")
+}
+
+fn external_t26_expected_sha256() -> String {
+    env::var("JLINK_MCP_T26_ELF_SHA256")
+        .expect("JLINK_MCP_T26_ELF_SHA256 must identify the exact external artifact")
+        .to_ascii_lowercase()
 }
 
 #[test]
@@ -173,21 +179,18 @@ fn t_p2_dwarf_searches_stable_usable_paths_and_caches_by_exact_key() {
 }
 
 #[test]
-fn t_p2_dwarf_indexes_frozen_actual_t26_ref_sig8_artifact() {
-    let path = actual_t26_out_path();
+#[ignore = "requires explicit JLINK_MCP_T26_ELF and JLINK_MCP_T26_ELF_SHA256 inputs"]
+fn t_p2_dwarf_indexes_external_t26_ref_sig8_artifact() {
+    let path = external_t26_out_path();
     let index = SymbolIndex::from_elf_path(&path).unwrap_or_else(|error| {
         panic!(
-            "frozen actual T26 OUT is required at {}: {error}",
+            "external T26 ELF/OUT is required at {}: {error}",
             path.display()
         )
     });
-    assert_eq!(
-        index.elf_sha256(),
-        "f8adb9a2b9bbfd26b469c66f2478ee6e22735302706b83509b2d4f2ae7f7738d"
-    );
+    assert_eq!(index.elf_sha256(), external_t26_expected_sha256());
     assert_eq!(index.dwarf_versions(), vec![3, 4]);
-    assert_eq!(index.type_unit_count(), 35);
-    assert_eq!(index.type_count(), 7_177);
+    assert!(index.type_unit_count() > 0);
     assert!(index.signature_reference_count() > 0);
     assert!(
         index

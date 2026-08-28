@@ -36,6 +36,11 @@ flash 和 erase 请求 MUST 提供 `after: none | reset_halt | reset_run`；系�
 - **WHEN** flash 或 erase 使用 `after: none` 且 Flash 修改成功
 - **THEN** 系统在下载前已执行必要的 `reset_halt`，但成功后不再复位、暂停或恢复运行
 
+#### Scenario: Flash 已修改但后置状态失败
+- **WHEN** flash 或 erase 的主操作已成功，但请求的烧录后状态无法完成或确认
+- **THEN** 系统立即记录 Flash 已修改、关闭目标并清空可信会话状态，返回不可重放的 `EXECUTION_UNCERTAIN`
+- **AND** `details` 包含 `operation`、`phase=post_action`、请求的 `after`、`flash_modified=true` 和原始 `cause_code`
+
 ### Requirement: PRG-003 整片和范围擦除
 `jlink_program.erase` MUST 支持整片擦除或同时提供 address 和 length 的范围擦除。范围 MUST 完全位于已知 Flash 内；address 与 length 只提供一个时 MUST 拒绝请求。系统 MUST 在首个 `JLINK_EraseChip` 或 `BeginDownload` 前执行一次 `reset_halt` 并确认目标已暂停。
 

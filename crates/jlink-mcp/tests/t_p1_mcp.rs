@@ -146,30 +146,29 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
             "values": { "target.device": "S32K144" }
         })
     ));
-
     let hss = catalog
         .iter()
         .find(|tool| tool["name"] == "jlink_hss")
         .expect("HSS tool");
     let hss_description = hss["description"].as_str().expect("HSS description");
     for required in [
-        "flat top-level JSON",
-        "never use query or resolution wrapper objects",
-        r#"{"action":"query","capture_id":"...","view":"overview"}"#,
-        r#""view":"changes""#,
-        r#""view":"window""#,
-        r#""mode":"raw""#,
-        r#""mode":"min_max""#,
-        r#""points":100"#,
-        r#""view":"around_event""#,
-        r#"{"action":"query","capture_id":"...","cursor":"..."}"#,
-        "omits view plus every view-specific field",
+        "fixed-duration",
+        "status",
+        "overview",
+        "changes",
+        "window",
+        "around_event",
+        "capture_id",
+        "capture_key",
+        "cursor",
     ] {
         assert!(
             hss_description.contains(required),
             "HSS description is missing {required}"
         );
     }
+    assert!(hss_description.len() <= 240);
+    assert!(!hss_description.contains('{'));
     let window = json!({
         "action": "query",
         "capture_id": "cap_contract",
@@ -189,6 +188,22 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         &hss["inputSchema"],
         &window_with_points
     ));
+}
+
+#[test]
+fn t_p1_mcp_validation_checks_require_evidence_provenance() {
+    let catalog = tool_catalog();
+    let target = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_target")
+        .expect("target tool");
+    let validation_check = &target["outputSchema"]["properties"]["checks"]["items"];
+    assert!(
+        validation_check["required"]
+            .as_array()
+            .expect("validation check required fields")
+            .contains(&json!("evidence"))
+    );
 }
 
 #[test]
@@ -248,6 +263,59 @@ fn t_p1_mcp_inspect_output_schema_is_strict() {
 }
 
 #[test]
+fn t_p4_hss_catalog_is_bounded_and_around_event_accepts_series() {
+    let catalog = tool_catalog();
+    let catalog_bytes = serde_json::to_vec(&catalog).expect("serialize tool catalog");
+    assert!(
+        catalog_bytes.len() <= 32 * 1024,
+        "tools/list catalog is {} bytes",
+        catalog_bytes.len()
+    );
+    let hss = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_hss")
+        .expect("HSS tool");
+    let hss_bytes = serde_json::to_vec(hss).expect("serialize HSS tool");
+    assert!(
+        hss_bytes.len() <= 22 * 1024,
+        "jlink_hss is {} bytes",
+        hss_bytes.len()
+    );
+    assert!(jsonschema::is_valid(
+        &hss["inputSchema"],
+        &json!({
+            "action": "query",
+            "capture_id": "cap-1",
+            "view": "around_event",
+            "event_id": "e0",
+            "before_us": 1_000,
+            "after_us": 1_000,
+            "series": ["s0"],
+            "limit": 100
+        })
+    ));
+    assert!(jsonschema::is_valid(
+        &hss["outputSchema"],
+        &json!({
+            "capture_id": "cap-compact",
+            "state": "completed",
+            "elapsed_us": 60_000_000,
+            "complete_records": 59_993
+        })
+    ));
+    assert!(!jsonschema::is_valid(
+        &hss["outputSchema"],
+        &json!({
+            "capture_id": "cap-duplicated",
+            "state": "completed",
+            "elapsed_us": 60_000_000,
+            "complete_records": 59_993,
+            "from_us": 0
+        })
+    ));
+}
+
+#[test]
 fn t_p1_mcp_stdio_returns_minimal_results_and_public_errors() {
     let requests = [
         json!({
@@ -302,9 +370,15 @@ fn t_p1_mcp_stdio_returns_minimal_results_and_public_errors() {
         );
     }
     assert!(
-        instructions.len() <= 512,
-        "server instructions must remain self-contained and short"
+        instructions.chars().count() <= 300,
+        "server instructions must remain within 300 Unicode characters"
     );
+    for workflow_detail in ["capture_key", "cursor", "validate.after"] {
+        assert!(
+            !instructions.contains(workflow_detail),
+            "server instructions must not duplicate {workflow_detail} guidance"
+        );
+    }
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
         Some(6)
