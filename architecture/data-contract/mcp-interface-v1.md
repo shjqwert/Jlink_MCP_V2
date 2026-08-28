@@ -255,6 +255,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 - `verify` 默认 `true`。
 - `after` 必填：`none | reset_halt | reset_run`。显式字段避免 Agent 误解烧录后的目标状态。
 - 已知 Flash 边界之外的镜像段返回 `FLASH_RANGE_INVALID`。
+- Flash 主操作成功后立即使固件身份和验证证据失效。若后置状态处理失败，关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`；`details` 固定包含 `operation`、`phase: "post_action"`、请求的 `after`、`flash_modified: true` 和原始 `cause_code`。
 - 完整成功返回 `{}`。
 
 ### 5.2 `erase`
@@ -276,7 +277,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 }
 ```
 
-`address` 和 `length` 必须同时存在或同时省略。范围必须落在已知 Flash 边界内。完整成功返回 `{}`。
+`address` 和 `length` 必须同时存在或同时省略。范围必须落在已知 Flash 边界内。Flash 主操作与后置状态失败使用 5.1 的同一不可重放语义；完整成功返回 `{}`。
 
 ### 5.3 `verify`
 

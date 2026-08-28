@@ -271,12 +271,14 @@ impl TargetSessionManager {
         self.firmware_identity = Some(elf_sha256.to_owned());
     }
 
-    /// Records the actual final target state and invalidates Flash-derived caches.
-    pub(crate) fn record_program_result(&mut self, state: TargetState, flash_modified: bool) {
+    /// Records a confirmed Flash mutation before any fallible verification or post-action.
+    pub(crate) fn record_flash_modified(&mut self) {
+        self.invalidate_validation(ValidationInvalidation::FlashModified);
+    }
+
+    /// Records the target state confirmed after programming or verification.
+    pub(crate) const fn record_program_state(&mut self, state: TargetState) {
         self.target_state = state;
-        if flash_modified {
-            self.invalidate_validation(ValidationInvalidation::FlashModified);
-        }
     }
 
     /// Marks the active connection untrusted after an indeterminate target side effect.
@@ -820,14 +822,15 @@ mod tests {
         completed
             .ensure_program_allowed(&spec)
             .expect("connected validated session");
-        completed.record_program_result(TargetState::Halted, true);
-        assert_eq!(completed.target_state, TargetState::Halted);
+        completed.record_flash_modified();
         assert!(completed.validation_key.is_none());
         assert!(!completed.firmware_identity_cached(&"a".repeat(64)));
         assert_eq!(
             completed.last_invalidation,
             Some(ValidationInvalidation::FlashModified)
         );
+        completed.record_program_state(TargetState::Halted);
+        assert_eq!(completed.target_state, TargetState::Halted);
         completed
             .ensure_program_allowed(&spec)
             .expect("Flash invalidates cache without losing active target identity");

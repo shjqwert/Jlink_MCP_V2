@@ -18,7 +18,7 @@
 | FT-006 | 待调查 | 在阶段间首次读取 `PC` 返回 `TARGET_STATE_INVALID`，随后 `status` 确认 `disconnected`；重新连接返回 `resumed_from_halt`。目前不能证明这是预期 MCP/Worker 生命周期结束还是异常会话丢失。 | 后续阶段记录每次生命周期边界和最终状态；只有能稳定复现非预期断开时才转为实现缺陷。 |
 | FT-007 | 兼容性复核 | 错误同时出现在 `content.text`、`structuredContent.error` 和 `isError`，存在信息重复，但可能服务于不同 MCP 客户端兼容层。 | 先验证目标客户端实际消费路径；不得仅为减小文本删除结构化错误或破坏兼容性。 |
 | FT-008 | 已确认 | `jlink_write.variable` 的实时 Schema 将顶层数组限定为 `Array<string>`，但数组切片传入 `["17","34"]` 时运行时返回 `VALUE_INVALID`，并要求 JSON integer 或 `$int`；同一数组放入结构体对象并使用整数元素可以成功写入。 | 统一 Schema、反序列化和运行时整数模型；增加标量数组整写、切片写、结构体内嵌数组及超出安全整数范围的合同测试。 |
-| FT-009 | 已确认 | 整片擦除实际生效，但 `jlink_program.erase(after=reset_halt)` 在后置 ICSR 读取阶段返回 `TARGET_CONNECT_FAILED`；随后状态一度报告 `connected/running`，而 verify/halt 均无法访问目标。错误没有表达“擦除可能已完成、后置状态失败”，存在误导调用方重试破坏性操作的风险。 | 将 Flash 主操作结果与后置状态转换分阶段记录；主操作已派发但结果无法完整确认时返回不可重放的明确语义，并使状态快照立即失效。增加空片 `erase → reset_halt → verify → flash recovery` 真机回归。 |
+| FT-009 | 完成 | 根因是 Flash 主操作成功后，要到后置状态也成功才记录 Flash 已修改。修复后主操作成功立即使固件/验证证据失效；后置失败关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`，固定报告操作、阶段、`after`、Flash 修改事实和原始错误码。 | 单元测试、workspace 门禁和真机故障路径通过；擦除未重放，状态立即为 `faulted/unknown`，随后完成固件重烧、独立 verify 和 running 恢复。 |
 | FT-010 | 待复核 | 空片恢复后在暂停态执行 `validate`，结果为 `target_state=halted`，但 `background_access.detail` 文案仍为“运行态读取 ICSR 成功”。 | 明确该检查描述的是实际测试状态还是能力名称；确保 detail 与 `target_state` 不产生相互矛盾的反馈。 |
 | FT-011 | 待优化 | 固件变化或故障恢复后重新执行 `validate` 是必要的，但每次都完整返回未变化的 DLL 身份、导出、探针、目标、接口和 HSS 能力等检查，造成重复反馈和上下文占用。 | 以 DLL、配置、探针和能力指纹复用可信静态检查，仅重跑会失效的动态检查；返回结果必须清楚区分 `executed` 与 `reused`，并在指纹、Worker 生命周期或错误矛盾时强制失效，不能因此弱化验证证据。 |
 | FT-012 | 已确认 | 1 kHz 结构体采样下，`around_event` 在 5 ms 前后窗口返回所有连续变化成员及逐项 relation；单个写事件产生数十项与写入无直接关系的变化，而当前 Schema 没有 `series` 过滤字段。 | 保留事件、时间不确定度和相关变化证据；评估增加可选 `series` 过滤或默认有界摘要，完整原始变化继续通过 `window/changes` 获取，并验证分页确定性。 |
@@ -97,6 +97,12 @@ CPU 控制 action 本身通过；FT-005 是当前确认的公共错误分类问�
 | 固件运行 | `ucTestflg=0`、`stTest` 全零；`gucCddAdcCount` 连续回读 `1511 → 1518`。 |
 
 第 7 步最终通过，目标已经恢复为新固件并保持 `connected/running`。FT-009 是本阶段的主要可靠性问题：擦除已执行却返回普通可重试连接错误；正确处理必须禁止直接重放，并通过状态重建和只读证据确认实际 Flash 状态。
+
+### FT-009 修复回归
+
+- 使用修复后的本地 release 二进制再次执行一次整片擦除。主操作成功、后置 ICSR 读取失败时返回 `EXECUTION_UNCERTAIN`、`retryable=false`；`details` 为 `operation=erase`、`phase=post_action`、`after=reset_halt`、`flash_modified=true`、`cause_code=TARGET_CONNECT_FAILED`。
+- 紧随其后的只读 `status` 为 `faulted/unknown`，不再保留错误的可信连接状态；未重放 erase。原第 7 步已保留同一 DLL/探针路径下独立 verify 的 `VERIFY_FAILED` 空片证据。本次空片运行态 Flash 读取和 halt 均不可用，因此没有把访问失败冒充内容证据。
+- 断开并重建会话后，`flash(verify=true, after=reset_run)` 和独立 `verify` 均返回 `{}`，`status` 为 `connected/running`；最终安全断开且测试固件继续处于运行态。
 
 ## HSS 1 kHz 与并发阶段证据摘要
 
