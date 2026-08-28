@@ -47,9 +47,10 @@ model {
 
     workerProcess = process "J-Link worker process" {
       #added
-      technology "Rust worker; durable lease"
+      technology "Rust child worker; MCP-owned lease"
       metadata {
         mutableStateOwner "Probe session and live capture"
+        lifecycle "Bound to the creating MCP/Codex; no cross-MCP takeover or orphan HSS continuation"
       }
 
       operationScheduler = component "Operation scheduler" {
@@ -62,7 +63,7 @@ model {
 
       captureCoordinator = component "HSS capture coordinator" {
         #added
-        description "Sole owner of live capture lifecycle, timeline sequence, integrity detection and fixed-duration automatic stop."
+        description "Sole owner of live capture lifecycle, timeline sequence, integrity detection, fixed-duration automatic stop and bounded normal-shutdown drain. Interrupted captures remain non-completed."
         metadata {
           mutableStateOwner "Active capture, event sequence and quality counters"
           durationSeconds "1-300"
@@ -91,7 +92,7 @@ model {
 
     validationGates = decision "V1 validation gates" {
       #review_risk
-      description "Hardware evidence must validate the J-Link 6.98a mainline HSS ABI, millisecond source timestamps and timestamp_us normalization; J-Link 8.38 and 9.70 are compatibility sidelines. Client tests must validate structuredContent, cursor recovery and resource-link consumption."
+      description "Hardware evidence must validate the J-Link 6.98a mainline HSS ABI, millisecond source timestamps and timestamp_us normalization; J-Link 8.38 and 9.70 are compatibility sidelines. Client tests must validate structuredContent, cursor recovery, resource-link consumption, MCP-owned Worker shutdown and non-completed interruption recovery."
       metadata {
         unknowns ["HSS ABI and frame timestamps", "hardware loss and overflow behavior", "modern MCP client compatibility"]
       }
@@ -100,7 +101,7 @@ model {
     mcpProcess.mcpAdapter -> mcpProcess.artifactResolver "resolve symbolic selectors"
     mcpProcess.mcpAdapter -> mcpProcess.captureQuery "query a finalized capture"
     mcpProcess.artifactResolver -> workerProcess.operationScheduler "immutable acquisition plan"
-    mcpProcess.mcpAdapter -> workerProcess.operationScheduler "versioned IPC commands"
+    mcpProcess.mcpAdapter -> workerProcess.operationScheduler "versioned IPC commands and bounded shutdown"
     workerProcess.operationScheduler -> workerProcess.captureCoordinator "start, stop or interleave HSS work"
     workerProcess.operationScheduler -> workerProcess.dllGateway "ordinary target commands"
     workerProcess.captureCoordinator -> workerProcess.dllGateway "serialized HSS calls and between-drain writes"

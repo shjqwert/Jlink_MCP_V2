@@ -5,7 +5,7 @@
 ## ADDED Requirements
 
 ### Requirement: HSSQ-001 采集状态查询
-系统 MUST 支持通过采集 ID 或 `capture_key` 查询生命周期、进度、完整性和可用资源；状态和四种视图请求 MUST 且只能提供这两个标识之一。活动或异常终止的采集 MUST 明确报告已持久化范围，不得把部分数据表示为完整结果。
+系统 MUST 支持通过采集 ID 或 `capture_key` 查询生命周期、进度、完整性和可用资源；状态和四种视图请求 MUST 且只能提供这两个标识之一。活动或异常终止的采集 MUST 以 `complete_records` 及可用时的半开区间 `from_us/to_us` 明确报告已持久化范围，不得把部分数据表示为完整结果。
 
 #### Scenario: 查询运行中采集
 - **WHEN** Agent 使用有效采集 ID 查询状态
@@ -23,7 +23,7 @@
 - **THEN** 系统在读取采集数据前拒绝请求并列出允许视图
 
 ### Requirement: HSSQ-003 低冗余概览
-`overview` MUST 返回采集时间范围、事件数量、完整原始资源链接，并为每个顶层变量只返回 `samples` 和 `changes` 导航计数；完整路径只通过首次所需字典登记。覆盖与质量字段只在异常时出现，正常且为空的质量类别 MUST 省略。具体变化路径和值只能通过 `changes` 或 `window` 获取，不得在 overview 增加成员预览。
+`overview` MUST 以半开区间 `from_us/to_us` 返回采集时间范围、事件数量、完整原始资源链接，并为每个顶层变量只返回短 `series` ID 及 `samples` 和 `changes` 导航计数；完整路径只通过首次所需 `dictionary` 登记。覆盖与质量字段只在异常时出现，正常且为空的质量类别 MUST 省略。具体变化路径和值只能通过 `changes` 或 `window` 获取，不得在 overview 增加成员预览。
 
 #### Scenario: 正常采集包含变量变化
 - **WHEN** Agent 请求完整性为 `complete` 的采集概览

@@ -1,0 +1,19 @@
+[package]
+name = "jlink-worker"
+description = "Isolated J-Link probe worker for J-Link MCP V2"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+jlink-capture = { path = "../jlink-capture" }
+jlink-domain = { path = "../jlink-domain" }
+serde_json.workspace = true
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true

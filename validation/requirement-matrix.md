@@ -24,71 +24,71 @@ public contract and is recorded in the implementation constraints.
 
 | Requirement | Primary test | Evidence route | Phase 0 prerequisite |
 |---|---|---|---|
-| MCP-001 | T-P1-MCP | Local integration + target client | F0-D |
-| MCP-002 | T-P1-MCP | Local integration + target client | F0-D |
-| MCP-003 | T-P1-MCP | Local integration + target client | F0-D |
-| MCP-004 | T-P1-DOM | Unit/contract fixture | None |
-| MCP-005 | T-P1-MCP | Windows Codex | F0-D |
-| CFG-001 | T-P1-CFG | Local integration | None |
-| CFG-002 | T-P1-CFG | Local integration | None |
-| CFG-003 | T-P1-CFG | Local integration | None |
-| CFG-004 | T-P1-CFG | DLL identity fixture | F0-A identity |
-| CFG-005 | T-P1-CFG | Repository/config fixture | None |
-| RUN-001 | T-P1-IPC | Windows process integration | F0-B |
-| RUN-002 | T-P3-RUN | J-Link hardware timeline | F0-A |
-| RUN-003 | T-P1-IPC | Windows process integration | F0-B |
-| RUN-004 | T-P3-RECOVER | Windows process integration | F0-B |
-| RUN-005 | T-P1-DOM | Unit/contract fixture | F0-B fault model |
-| RUN-006 | T-P3-ABI | J-Link hardware/DLL exports | F0-A |
-| SES-001 | T-P1-SES | J-Link hardware integration | F0-A identity |
-| SES-002 | T-P1-SES | J-Link hardware integration | F0-A |
-| SES-003 | T-P1-SES | J-Link hardware state recovery | F0-A |
-| SES-004 | T-P1-SES | J-Link hardware integration | F0-A |
-| SES-005 | T-P1-SES | Hardware + identity fixture | F0-A |
-| SES-006 | T-P1-SES | J-Link hardware diagnostics | F0-A |
+| MCP-001 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
+| MCP-002 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
+| MCP-003 | T-P1-MCP | `validation/p1-mcp.md` local integration + target client | F0-D |
+| MCP-004 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | None |
+| MCP-005 | T-P1-MCP | `validation/p1-mcp.md` + `validation/p4-client.md` Windows Codex | F0-D |
+| CFG-001 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-002 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-003 | T-P1-CFG | `validation/p1-stage.md` local integration | None |
+| CFG-004 | T-P1-CFG | `validation/p1-stage.md` DLL identity fixture | F0-A identity |
+| CFG-005 | T-P1-CFG | `validation/p1-stage.md` repository/config fixture | None |
+| RUN-001 | T-P1-IPC | `validation/p3-recover.md` MCP-owned Worker process integration + prior `validation/p1-stage.md` child-process evidence | F0-B IPC/lease subset |
+| RUN-002 | T-P3-RUN | `validation/p3-run.md` scheduler trace + `validation/p3-stage.md` J-Link hardware timeline | F0-A |
+| RUN-003 | T-P1-IPC | `validation/p3-recover.md` no-takeover/lease process integration + existing kernel lease evidence | F0-B lease subset |
+| RUN-004 | T-P3-RECOVER | `validation/p3-recover.md` normal-shutdown cleanup + parent-exit termination + non-completed partial recovery | F0-B IPC/recovery subset |
+| RUN-005 | T-P1-DOM | `validation/p1-stage.md` unit/contract fixture | F0-B fault model |
+| RUN-006 | T-P3-ABI | `validation/p3-abi.md` frozen DLL exports/ABI/raw-frame fixture | F0-A |
+| SES-001 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` single-target hardware integration | F0-A identity |
+| SES-002 | T-P1-SES | `validation/p1-ses.md` + `validation/p1-stage.md` hardware integration | F0-A |
+| SES-003 | T-P1-SES | `validation/p1-ses.md` hardware state recovery | F0-A |
+| SES-004 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
+| SES-005 | T-P1-SES | `validation/p1-ses.md` hardware + identity fixture | F0-A |
+| SES-006 | T-P1-SES | `validation/p1-ses.md` hardware diagnostics | F0-A |
 | ART-001 | T-P2-IMG | Image-format fixture | F0-C ELF fixture |
-| ART-002 | T-P2-IMG | ELF fixture + target Flash | F0-A + F0-C |
-| ART-003 | T-P2-DWARF | IAR DWARF fixture | F0-C |
-| ART-004 | T-P2-VALUE | IAR DWARF/value fixture | F0-C |
-| ART-005 | T-P2-DWARF | DWARF rejection fixture | F0-C |
-| ART-006 | T-P2-VALUE | Value round-trip fixture | F0-C |
-| ART-007 | T-P2-DWARF | Compiler compatibility fixture | F0-C |
-| PRG-001 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-002 | T-P2-PRG | Contract + J-Link hardware | F0-A |
-| PRG-003 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-004 | T-P2-PRG | J-Link hardware | F0-A |
-| PRG-005 | T-P2-PRG | Contract + J-Link hardware | F0-A |
-| PRG-006 | T-P2-PRG | Active-capture hardware | F0-A |
-| DBG-001 | T-P2-VALUE | IAR fixture + J-Link hardware | F0-A + F0-C |
-| DBG-002 | T-P2-MEM | J-Link hardware | F0-A |
-| DBG-003 | T-P2-MEM | J-Link hardware | F0-A |
-| DBG-004 | T-P2-CTL | J-Link hardware | F0-A |
-| DBG-005 | T-P2-CTL | J-Link hardware | F0-A |
-| DBG-006 | T-P2-MEM | Contract + J-Link hardware | F0-A |
-| DBG-007 | T-P3-RUN | Active-capture hardware timeline | F0-A |
-| DBG-008 | T-P2-DWARF | IAR DWARF fixture | F0-C |
-| HSSA-001 | T-P3-START | Contract + J-Link hardware | F0-A |
-| HSSA-002 | T-P3-START | IAR fixture + J-Link hardware | F0-A + F0-C |
-| HSSA-003 | T-P3-START | J-Link hardware diagnostics | F0-A |
-| HSSA-004 | T-P3-RUN | Timed J-Link hardware capture | F0-A |
-| HSSA-005 | T-P3-STATE | State-machine/fault fixture | F0-A + F0-B |
-| HSSA-006 | T-P3-STORE | Local storage integration | F0-A throughput |
-| HSSA-007 | T-P3-QUALITY | J-Link raw-frame fixture/hardware | F0-A |
-| HSSA-008 | T-P3-RUN | J-Link write-interleaving timeline | F0-A |
-| HSSA-009 | T-P3-RECOVER | Windows process + hardware integration | F0-B |
-| HSSA-010 | T-P3-QUALITY | J-Link timing evidence | F0-A |
-| HSSA-011 | T-P3-QUALITY | J-Link/host clock evidence | F0-A |
-| HSSQ-001 | T-P4-OVERVIEW | Capture fixture integration | None |
-| HSSQ-002 | T-P4-OVERVIEW | Capture fixture integration | None |
-| HSSQ-003 | T-P4-OVERVIEW | Capture fixture integration | F0-D resource observation |
-| HSSQ-004 | T-P4-CHANGES | Deterministic query fixture | None |
-| HSSQ-005 | T-P4-WINDOW | Deterministic query fixture | None |
-| HSSQ-006 | T-P4-WINDOW | Deterministic query fixture | None |
-| HSSQ-007 | T-P4-TIMELINE | Deterministic timeline fixture | F0-A clock evidence |
-| HSSQ-008 | T-P4-TIMELINE | Deterministic pagination fixture | None |
-| HSSQ-009 | T-P4-TIMELINE | Immutable snapshot fixture | None |
-| HSSQ-010 | T-P4-RESOURCE | Capture resource integration | F0-A format + F0-D link |
-| HSSQ-011 | T-P4-RESOURCE | Contract/resource integration | F0-D |
+| ART-002 | T-P2-IMG | ELF fixture + `validation/p2-stage.md` target Flash | F0-A + F0-C |
+| ART-003 | T-P2-DWARF | `validation/p2-dwarf.md` IAR AccessPlan fixture | F0-C |
+| ART-004 | T-P2-VALUE | `validation/p2-value.md` IAR DWARF/value 与 slice 契约 | F0-C |
+| ART-005 | T-P2-DWARF | `validation/p2-dwarf.md` dynamic/pointer rejection | F0-C |
+| ART-006 | T-P2-VALUE | `validation/p2-value.md` 无损 Value round-trip fixture | F0-C |
+| ART-007 | T-P2-DWARF | `validation/p2-dwarf.md` IAR compatibility evidence | F0-C |
+| PRG-001 | T-P2-PRG | `validation/p2-program.md` image/region unit + frozen DLL；`validation/p2-stage.md` actual Flash | F0-A |
+| PRG-002 | T-P2-PRG | `validation/p2-program.md` strict Schema/state fixture；`validation/p2-stage.md` state smoke | F0-A |
+| PRG-003 | T-P2-PRG | `validation/p2-program.md` range/device-algorithm primary evidence；3.7 does not add erase hardware evidence | F0-A |
+| PRG-004 | T-P2-PRG | `validation/p2-program.md` compact mismatch fixture；`validation/p2-stage.md` matching readback | F0-A |
+| PRG-005 | T-P2-PRG | `validation/p2-program.md` closed Schema/no-token contract；3.7 hardware | F0-A |
+| PRG-006 | T-P2-PRG | `validation/p2-program.md` HSS-first state fixture；`validation/p2-stage.md` conflict route | F0-A |
+| DBG-001 | T-P2-VALUE | `validation/p2-value.md` 预校验 + `validation/p2-memory.md` 执行链路；`validation/p2-stage.md` scalar hardware | F0-A + F0-C |
+| DBG-002 | T-P2-MEM | `validation/p2-memory.md` unit/contract/IAR fixture；`validation/p2-stage.md` RAM hardware | F0-A |
+| DBG-003 | T-P2-MEM | `validation/p2-memory.md` readback fixture；`validation/p2-stage.md` readback hardware | F0-A |
+| DBG-004 | T-P2-CTL | `validation/p2-control.md` domain/MCP/IPC + J-Link hardware；`validation/p2-stage.md` | F0-A |
+| DBG-005 | T-P2-CTL | `validation/p2-control.md` state rules + J-Link hardware；`validation/p2-stage.md` | F0-A |
+| DBG-006 | T-P2-MEM | `validation/p2-memory.md` closed contract + frozen DLL；`validation/p2-stage.md` | F0-A |
+| DBG-007 | T-P3-RUN | `validation/p3-run.md` session conflict tests + `validation/p3-stage.md` active-capture timeline | F0-A |
+| DBG-008 | T-P2-DWARF | `validation/p2-dwarf.md` symbols route evidence | F0-C |
+| HSSA-001 | T-P3-START | `validation/p3-start.md` normalized request/key fixture + frozen J-Link capability preflight | F0-A |
+| HSSA-002 | T-P3-START | `validation/p3-start.md` IAR DWARF AccessPlan/frame fixture + frozen J-Link capability preflight | F0-A + F0-C |
+| HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
+| HSSA-004 | T-P3-RUN | `validation/p3-run.md` automatic Stop/tail trace + `validation/p3-stage.md` timed capture | F0-A |
+| HSSA-005 | T-P3-STATE | Production state-machine/fault-retention fixture | F0-A + F0-B |
+| HSSA-006 | T-P3-STORE | `validation/p3-store.md` Store fixture + `validation/p3-stage.md` 300-second atomic resource | F0-A throughput |
+| HSSA-007 | T-P3-QUALITY | `validation/p3-quality.md` classifier + `validation/p3-stage.md` hardware quality | F0-A |
+| HSSA-008 | T-P3-RUN | `validation/p3-run.md` write trace + `validation/p3-stage.md` J-Link interleaving | F0-A |
+| HSSA-009 | T-P3-RECOVER | `validation/p3-recover.md` lifecycle-local key retirement + aborted/unknown partial recovery | F0-B recovery subset |
+| HSSA-010 | T-P3-QUALITY | `validation/p3-quality.md` rate/interval fixture + `validation/p3-stage.md` hardware rate | F0-A |
+| HSSA-011 | T-P3-QUALITY | `validation/p3-quality.md` clock fixture + `validation/p3-stage.md` hardware clock | F0-A |
+| HSSQ-001 | T-P4-OVERVIEW | `validation/p4-overview.md` status range + immutable lookup | None |
+| HSSQ-002 | T-P4-OVERVIEW | `validation/p4-overview.md` strict view Schema | None |
+| HSSQ-003 | T-P4-OVERVIEW | `validation/p4-overview.md` navigation counts + `validation/p4-client.md` raw link | F0-D resource observation |
+| HSSQ-004 | T-P4-CHANGES | `validation/p4-changes.md` deterministic Capture Store + stdio MCP fixture | None |
+| HSSQ-005 | T-P4-WINDOW | `validation/p4-window.md` raw/transition/aggregate immutable fixture | None |
+| HSSQ-006 | T-P4-WINDOW | `validation/p4-window.md` event-neighborhood + reusable bounds fixture | None |
+| HSSQ-007 | T-P4-TIMELINE | `validation/p4-timeline.md` interval + uncertainty relation fixture | F0-A clock evidence |
+| HSSQ-008 | T-P4-TIMELINE | `validation/p4-timeline.md` incremental dictionary pages | None |
+| HSSQ-009 | T-P4-TIMELINE | `validation/p4-timeline.md` cursor binding/tamper/expiry fixture + `validation/p4-client.md` pagination | None |
+| HSSQ-010 | T-P4-RESOURCE | `validation/p4-resource.md` immutable full-file/read-after-disconnect/checksum fixture + `validation/p4-client.md` | F0-A format + F0-D link |
+| HSSQ-011 | T-P4-RESOURCE | `validation/p4-resource.md` binary-data/no-image + `validation/p4-client.md` | F0-D |
 
 ## Stage smoke and evidence reuse
 
