@@ -202,6 +202,28 @@ FT-016 修复后新增真机采集 `cap_b194591611163ca6306e1102`：1 秒、1 kH
 - 查询分页必须在同一调试上下文保留 cursor；本轮最终核查确认续页本身没有 dictionary 重复。
 - MCP 与 Skill 侧 FT-001～FT-016 均已完成；FT-017 已定位为 Codex 资源交付链路的外部阻塞，服务端合同保持不变。
 
-## 后续统一修复门禁
+## 修复后最终 11 阶段回归
 
-按照上述顺序在当前修复流程中实施，以本清单和 P002 为输入，不另建 OpenSpec change。最终回归至少验证：单一插件服务发现、六工具严格 Schema、数组值模型、Flash 分阶段副作用语义、空片恢复、`validate` 证据复用及失效、寄存器错误分类、三层错误兼容、HSS 四种查询、分页字典复用、`around_event` 过滤、终态 quality 去重、工程 Capture Store、并发捕获预算、自清零写入流程、Skill 触发与状态复用，以及优化前后上下文测量。FT-017 只要求继续证明服务端资源完整并保持 external-blocked，不把客户端截断误报为通过。
+最终回归使用重新安装的插件 `0.1.0+codex.20260828102524`，产品 MCP SHA-256 为 `B2ED72DED15C3638110F532E628A0F67961C51A41AEA8777E7492EB138F59DCD`，Worker SHA-256 为 `F2903443929559F5DB10FAF72B6D2DD1F7A4D5BCEB6F09C86CD958694407C302`。第 7 步整片擦除复用同一 Flash/Worker 实现指纹下的 FT-009 故障路径证据，只重做无副作用 verify；没有为重复测试再次制造空片。
+
+| 阶段 | 最终结果 |
+|---|---|
+| 1. 目录与配置 | 固定六工具；instructions 294 字符；`tools/list=32,555` bytes、`jlink_hss=18,875` bytes；`config_get` 为 S32K144/SWD/4000 kHz。 |
+| 2. 连接 | 初始 disconnected；connect 成功并报告 `resumed_from_halt`，CPU 收口为 running。 |
+| 3. 验证 | 连续 validate 均通过；第二次六项静态检查为 `reused`，`background_access` 为 `executed`。 |
+| 4. 读取 | `gucCddAdcCount=184`；通过 symbols 发现并逐项成功读取 `gstDriveDoorHandleMotorInfo` 的 19 个叶成员，避免把含 union 的顶层结构误作单值读取。 |
+| 5. CPU 控制 | running 读取 PC 正确返回 `TARGET_STATE_INVALID`；halt 后 `PC=0x0002956A`，step 与 resume 成功，最终 running。 |
+| 6. 安全写入 | `ucTestflg=1` 使用 `verify=none`；1 ms 任务清零控制字并产生 `stTest={ucNum:1,uwData:4660,uwData1:305419896,ucData2:[17,34,0,0,0,0,0,0,0,0]}`；命令 2 完成恢复。 |
+| 7. Flash | 独立 verify 通过；整片擦除不重放，复用 FT-009 的 `EXECUTION_UNCERTAIN/post_action/flash_modified=true` 与重烧恢复证据。 |
+| 8. HSS 1 kHz | 动态 capture `cap_6052765827305f7f2aef67fe`：60 秒、预计 60,000、实际 59,998、实际速率 1,000,000 millihz；59,997 个已记录间隔均为 1,000 us，gap/collision/regression 为 0。 |
+| 8. HSS 查询 | overview、changes、window raw、window min_max、around_event 均通过；changes 首/续页各 20 条，续页 dictionary 为 0；raw 5 点、聚合 10 桶、事件邻域 20 条变化，`series=s0` 过滤有效。 |
+| 9. 活动期矩阵 | 矩阵前确认 running；变量写与内存写成功并形成 `e0/e1`，halt 返回 `OPERATION_CONFLICT`，capture 继续 running 后自动完成。 |
+| 10. 离线 Store/资源 | 断开后 status/overview/query 继续成功；原始资源 2,360,072 bytes、Base64 3,146,764 字符、头 `JMCPV101`、SHA-256 `1ACB669549643863DC55941935505EFFD3424769411430E82E504946824008B3`。 |
+| 11. 错误边界 | 非法 action 与额外字段均为 `-32602`；缺失符号为 `SYMBOL_NOT_FOUND`；普通内存写 Flash 为 `ADDRESS_OUT_OF_RANGE`；随后 verify 仍通过。 |
+| 最终恢复 | `gucHssTestCtrl`、`gulHssVariableCmd`、`gulHssMemoryCmd`、`ucTestflg` 均回读为 0；CPU running 后 disconnect；无残留 Worker/JLink。 |
+
+quality 继续报告 integrity/loss/overflow 为 `unknown`，因为 DLL 仍无独立 overflow 或 sequence 证据；59,998/60,000 的终止边界差异没有被错误解释为丢样。回归编排期间发现并修正的 `ValidationCheck.kind`、顶层 union 读取、PowerShell 空对象计数和精确样本数硬编码均属于测试脚本假设，不需要修改产品实现。
+
+## 最终交付门禁
+
+上述最终回归已验证单一插件服务发现、六工具严格 Schema、数组值模型、Flash 分阶段副作用语义、空片恢复、`validate` 证据复用及失效、寄存器错误分类、三层错误兼容、HSS 四种查询、分页字典复用、`around_event` 过滤、终态 quality 去重、工程 Capture Store、并发捕获预算、自清零写入流程、Skill 触发与状态复用，以及优化前后上下文测量。FT-017 继续以服务端完整资源证据保持 external-blocked，不把客户端截断误报为通过。
