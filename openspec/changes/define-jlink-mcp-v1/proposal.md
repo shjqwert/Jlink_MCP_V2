@@ -5,7 +5,7 @@
 ## What Changes
 
 - **BREAKING**：V2 不兼容旧版 MCP 工具、配置文件或采集格式，不包含 RTT、任意 GDB/J-Link 命令、SVD、断点、图表、CSV 和历史数据库。
-- 在 Windows x64 上提供本机 stdio MCP，面向 SEGGER J-Link、ARM Cortex-M、SWD/JTAG。
+- 在 Windows x64 上提供本机 stdio MCP，面向 SEGGER J-Link 和 ARM Cortex-M；公共配置保留 SWD/JTAG 枚举，V1 发布支持只冻结实际通过真机验收的 SWD，JTAG 在取得独立真机证据前不得声明受支持。
 - 首版只面向内部个人使用，不包含公开发布、多人权限或商业交付能力。
 - 对外提供 6 个领域工具：`jlink_target`、`jlink_program`、`jlink_inspect`、`jlink_write`、`jlink_control`、`jlink_hss`。
 - 使用工程配置和用户配置管理目标、本机 J-Link 环境、DLL 路径、版本及哈希，并允许 Agent 查询和修正配置。

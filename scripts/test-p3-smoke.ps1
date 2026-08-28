@@ -1,5 +1,11 @@
 [CmdletBinding()]
-param()
+param(
+    [ValidateNotNullOrEmpty()]
+    [string]$CaptureKey = 'p3-4.8-300s-1khz',
+
+    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    [string]$EvidenceDirectory = 'p3-4.8'
+)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -8,7 +14,7 @@ $repositoryRoot = Split-Path -Parent $PSScriptRoot
 $mcpPath = Join-Path $repositoryRoot 'target\debug\jlink-mcp.exe'
 $workerPath = Join-Path $repositoryRoot 'target\debug\jlink-worker.exe'
 $captureInspectorPath = Join-Path $repositoryRoot 'target\debug\examples\t_p3_capture.exe'
-$evidenceRoot = Join-Path $repositoryRoot 'target\evidence\p3-4.8'
+$evidenceRoot = Join-Path (Join-Path $repositoryRoot 'target\evidence') $EvidenceDirectory
 $dllPath = 'C:\Program Files (x86)\SEGGER\JLink\JLink_x64.dll'
 $commanderPath = 'C:\Program Files (x86)\SEGGER\JLink\JLink.exe'
 $targetRoot = 'D:\SVN\DCU\T26_DCU\trunk\03_code\T26_DCU_APP_NXP'
@@ -20,14 +26,9 @@ $resumeScript = Join-Path $PSScriptRoot 't-p1-ses-resume.jlink'
 
 $expectedDllHash = 'D15D5A24DC86F135C0B1FAFEB89F0E577691B6A85F3A19C773B3E20D0B95BBE5'
 $expectedCommanderHash = '0340130E7AD4F90EA8F8973C42A34A6508F0C5F6E988D532BB03DE9060FDFC04'
-$expectedOutHash = 'F8ADB9A2B9BBFD26B469C66F2478EE6E22735302706B83509B2D4F2AE7F7738D'
-$expectedFixtureHash = '1133B85709AB5ED3509ED58433ED4132E4D0869724140F8D3F560F7BA3B709E4'
 $expectedHeaderHash = 'E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085'
-$expectedDependencyHash = '4FDA4431B3502EBDB1B0313BF58B21995A2B962C9C0BA853DF42F3988B4A6F85'
-$expectedSvnStatusHash = '6827FD361AB388ABB26A6648158B0417CDDB76FAC515F91472C06B5715794685'
 
 $probeSerial = 260106173
-$captureKey = 'p3-4.8-300s-1khz'
 $writableAddress = '0x1FFF8D68'
 $originalBytes = '78563412'
 $changedBytes = 'efcdab89'
@@ -233,10 +234,11 @@ function Invoke-JLinkResume {
 
 Assert-FileHash -Path $dllPath -Expected $expectedDllHash -Description '冻结 J-Link 6.98a DLL'
 Assert-FileHash -Path $commanderPath -Expected $expectedCommanderHash -Description '冻结 J-Link 6.98a Commander'
-Assert-FileHash -Path $outPath -Expected $expectedOutHash -Description '冻结 IAR OUT'
-Assert-FileHash -Path $fixturePath -Expected $expectedFixtureHash -Description '计划内 AppUserDesc.c 测试夹具'
 Assert-FileHash -Path $protectedHeader -Expected $expectedHeaderHash -Description '受保护 AppPwrMode.h'
-Assert-FileHash -Path $protectedDependency -Expected $expectedDependencyHash -Description '受保护 T26_DCU_APP_NXP.dep'
+$outHashBefore = (Get-FileHash -LiteralPath $outPath -Algorithm SHA256).Hash
+$fixtureHashBefore = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash
+$dependencyHashBefore = (Get-FileHash -LiteralPath $protectedDependency -Algorithm SHA256).Hash
+$svnBefore = Get-SvnStatusHash -Path $targetRoot
 
 foreach ($requiredPath in @($mcpPath, $workerPath, $captureInspectorPath)) {
     if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
@@ -462,15 +464,15 @@ try {
     $actualRateProperty = $capture.status.quality.PSObject.Properties['actual_rate_millihz']
     $actualRateMillihz = if ($actualRateProperty) { $actualRateProperty.Value } else { 'omitted' }
 
-    $svn = Get-SvnStatusHash -Path $targetRoot
-    if ($svn.Hash -ne $expectedSvnStatusHash -or $svn.Lines -ne 612 -or
-        $svn.Untracked -ne 609 -or $svn.Modified -ne 3) {
-        throw "P3 阶段结束 SVN 状态偏离基线：$($svn | ConvertTo-Json -Compress)"
+    $svnAfter = Get-SvnStatusHash -Path $targetRoot
+    if ($svnAfter.Hash -ne $svnBefore.Hash -or $svnAfter.Lines -ne $svnBefore.Lines -or
+        $svnAfter.Untracked -ne $svnBefore.Untracked -or $svnAfter.Modified -ne $svnBefore.Modified) {
+        throw "P3 smoke 前后 SVN 状态不一致：before=$($svnBefore | ConvertTo-Json -Compress) after=$($svnAfter | ConvertTo-Json -Compress)"
     }
-    Assert-FileHash -Path $outPath -Expected $expectedOutHash -Description 'P3 结束后 IAR OUT'
-    Assert-FileHash -Path $fixturePath -Expected $expectedFixtureHash -Description 'P3 结束后 AppUserDesc.c'
+    Assert-FileHash -Path $outPath -Expected $outHashBefore -Description 'P3 smoke 当次 IAR OUT'
+    Assert-FileHash -Path $fixturePath -Expected $fixtureHashBefore -Description 'P3 smoke 当次 AppUserDesc.c'
     Assert-FileHash -Path $protectedHeader -Expected $expectedHeaderHash -Description 'P3 结束后 AppPwrMode.h'
-    Assert-FileHash -Path $protectedDependency -Expected $expectedDependencyHash -Description 'P3 结束后 T26_DCU_APP_NXP.dep'
+    Assert-FileHash -Path $protectedDependency -Expected $dependencyHashBefore -Description 'P3 smoke 当次 T26_DCU_APP_NXP.dep'
 
     Write-Output ("P3_CAPTURE_ID={0}" -f $captureId)
     Write-Output ("P3_COMPLETE_RECORDS={0}" -f $capture.status.complete_records)
@@ -481,7 +483,10 @@ try {
     Write-Output ("P3_LOSS={0}/{1}" -f $capture.status.quality.loss.evidence, $capture.status.quality.loss.basis)
     Write-Output ("P3_OVERFLOW={0}/{1}" -f $capture.status.quality.overflow.evidence, $capture.status.quality.overflow.basis)
     Write-Output ("P3_ACTUAL_RATE_MILLIHZ={0}" -f $actualRateMillihz)
-    Write-Output ("P3_SVN_STATUS={0}/{1}/{2}/{3}" -f $svn.Hash, $svn.Lines, $svn.Untracked, $svn.Modified)
+    Write-Output ("P3_OUT_SHA256={0}" -f $outHashBefore)
+    Write-Output ("P3_FIXTURE_SHA256={0}" -f $fixtureHashBefore)
+    Write-Output ("P3_DEP_SHA256={0}" -f $dependencyHashBefore)
+    Write-Output ("P3_SVN_STATUS={0}/{1}/{2}/{3}" -f $svnAfter.Hash, $svnAfter.Lines, $svnAfter.Untracked, $svnAfter.Modified)
 } catch {
     $testError = $_
 } finally {

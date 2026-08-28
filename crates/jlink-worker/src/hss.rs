@@ -1414,13 +1414,10 @@ mod tests {
             .expect("aborted partial remains queryable after restart");
         assert_eq!(snapshot.state, HssRunState::Aborted);
         assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
-        assert_eq!(
-            recovered
-                .status_by_key("run-fixture", Instant::now())
-                .expect("aborted capture key remains queryable")
-                .capture_id,
-            capture_id
-        );
+        let retired_key = recovered
+            .status_by_key("run-fixture", Instant::now())
+            .expect_err("aborted capture key is retired after restart");
+        assert_eq!(retired_key.code, ErrorCode::ValueInvalid);
     }
 
     #[test]

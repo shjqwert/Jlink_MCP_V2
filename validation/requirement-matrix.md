@@ -46,7 +46,7 @@ public contract and is recorded in the implementation constraints.
 | SES-004 | T-P1-SES | `validation/p1-ses.md` hardware integration | F0-A |
 | SES-005 | T-P1-SES | `validation/p1-ses.md` hardware + identity fixture | F0-A |
 | SES-006 | T-P1-SES | `validation/p1-ses.md` hardware diagnostics | F0-A |
-| ART-001 | T-P2-IMG | Image-format fixture | F0-C ELF fixture |
+| ART-001 | T-P2-IMG | `validation/p2-image.md` image-format fixture | F0-C ELF fixture |
 | ART-002 | T-P2-IMG | ELF fixture + `validation/p2-stage.md` target Flash | F0-A + F0-C |
 | ART-003 | T-P2-DWARF | `validation/p2-dwarf.md` IAR AccessPlan fixture | F0-C |
 | ART-004 | T-P2-VALUE | `validation/p2-value.md` IAR DWARF/value 与 slice 契约 | F0-C |
@@ -71,7 +71,7 @@ public contract and is recorded in the implementation constraints.
 | HSSA-002 | T-P3-START | `validation/p3-start.md` IAR DWARF AccessPlan/frame fixture + frozen J-Link capability preflight | F0-A + F0-C |
 | HSSA-003 | T-P3-START | `validation/p3-start.md` shared recovery fixture + read-only J-Link target diagnostics | F0-A |
 | HSSA-004 | T-P3-RUN | `validation/p3-run.md` automatic Stop/tail trace + `validation/p3-stage.md` timed capture | F0-A |
-| HSSA-005 | T-P3-STATE | Production state-machine/fault-retention fixture | F0-A + F0-B |
+| HSSA-005 | T-P3-STATE | `validation/p3-state.md` production state-machine/fault-retention fixture | F0-A + F0-B |
 | HSSA-006 | T-P3-STORE | `validation/p3-store.md` Store fixture + `validation/p3-stage.md` 300-second atomic resource | F0-A throughput |
 | HSSA-007 | T-P3-QUALITY | `validation/p3-quality.md` classifier + `validation/p3-stage.md` hardware quality | F0-A |
 | HSSA-008 | T-P3-RUN | `validation/p3-run.md` write trace + `validation/p3-stage.md` J-Link interleaving | F0-A |
@@ -102,3 +102,9 @@ public contract and is recorded in the implementation constraints.
   parser, and access-plan format fingerprints are unchanged.
 - F0-D evidence may be reused by P1/P4 only while Windows Codex, the MCP
   protocol/Schema, server binary, and resource behavior fingerprints are unchanged.
+
+## 5.7 release audit
+
+- Final audit: `65/65` requirements have one primary test and at least one concrete `validation/*.md` evidence route; missing `0`, duplicate `0`, unresolved placeholder `0`.
+- The complete software gate, SWD hardware acceptance, current Windows Codex revalidation, frozen support matrix, and evidence invalidation rules are recorded in `validation/p4-release.md`.
+- JTAG remains unverified and is not part of this release audit; no row uses a JTAG claim or SWD fallback as evidence.

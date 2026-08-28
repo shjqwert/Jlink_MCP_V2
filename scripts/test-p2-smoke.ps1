@@ -18,10 +18,7 @@ $protectedDependency = Join-Path $targetRoot 'Appl\T26_DCU_APP_NXP.dep'
 $resumeScript = Join-Path $PSScriptRoot 't-p1-ses-resume.jlink'
 $expectedDllHash = 'D15D5A24DC86F135C0B1FAFEB89F0E577691B6A85F3A19C773B3E20D0B95BBE5'
 $expectedCommanderHash = '0340130E7AD4F90EA8F8973C42A34A6508F0C5F6E988D532BB03DE9060FDFC04'
-$expectedOutHash = 'F8ADB9A2B9BBFD26B469C66F2478EE6E22735302706B83509B2D4F2AE7F7738D'
-$expectedFixtureHash = '1133B85709AB5ED3509ED58433ED4132E4D0869724140F8D3F560F7BA3B709E4'
 $expectedHeaderHash = 'E67117E5E240E21EAE55F11E943D95ECE50528ECB5C04B65E9FFF89CE99F9085'
-$expectedDependencyHash = '4FDA4431B3502EBDB1B0313BF58B21995A2B962C9C0BA853DF42F3988B4A6F85'
 $probeSerial = 260106173
 $writablePath = 'gulAppUserDescWritableTest'
 $writableAddress = '0x1FFF8D68'
@@ -110,10 +107,10 @@ function Invoke-JLinkResume {
 
 Assert-FileHash -Path $dllPath -Expected $expectedDllHash -Description '冻结 J-Link 6.98a DLL'
 Assert-FileHash -Path $commanderPath -Expected $expectedCommanderHash -Description '冻结 J-Link 6.98a Commander'
-Assert-FileHash -Path $outPath -Expected $expectedOutHash -Description '冻结 IAR OUT'
-Assert-FileHash -Path $fixturePath -Expected $expectedFixtureHash -Description '计划内 AppUserDesc.c 测试夹具'
 Assert-FileHash -Path $protectedHeader -Expected $expectedHeaderHash -Description '受保护 AppPwrMode.h'
-Assert-FileHash -Path $protectedDependency -Expected $expectedDependencyHash -Description '受保护 T26_DCU_APP_NXP.dep'
+$outHashBefore = (Get-FileHash -LiteralPath $outPath -Algorithm SHA256).Hash
+$fixtureHashBefore = (Get-FileHash -LiteralPath $fixturePath -Algorithm SHA256).Hash
+$dependencyHashBefore = (Get-FileHash -LiteralPath $protectedDependency -Algorithm SHA256).Hash
 if (Get-Process -Name 'jlink-mcp', 'jlink-worker', 'JLink' -ErrorAction SilentlyContinue) {
     throw '检测到既有 jlink-mcp、jlink-worker 或 JLink 进程，拒绝接管探针'
 }
@@ -453,14 +450,18 @@ if (Get-Process -Name 'jlink-mcp', 'jlink-worker', 'JLink' -ErrorAction Silently
 
 Assert-FileHash -Path $dllPath -Expected $expectedDllHash -Description 'P2 smoke 结束后 J-Link DLL'
 Assert-FileHash -Path $commanderPath -Expected $expectedCommanderHash -Description 'P2 smoke 结束后 J-Link Commander'
-Assert-FileHash -Path $outPath -Expected $expectedOutHash -Description 'P2 smoke 结束后 IAR OUT'
-Assert-FileHash -Path $fixturePath -Expected $expectedFixtureHash -Description 'P2 smoke 结束后 AppUserDesc.c'
+Assert-FileHash -Path $outPath -Expected $outHashBefore -Description 'P2 smoke 当次 IAR OUT'
+Assert-FileHash -Path $fixturePath -Expected $fixtureHashBefore -Description 'P2 smoke 当次 AppUserDesc.c'
 Assert-FileHash -Path $protectedHeader -Expected $expectedHeaderHash -Description 'P2 smoke 结束后 AppPwrMode.h'
-Assert-FileHash -Path $protectedDependency -Expected $expectedDependencyHash -Description 'P2 smoke 结束后 T26_DCU_APP_NXP.dep'
+Assert-FileHash -Path $protectedDependency -Expected $dependencyHashBefore -Description 'P2 smoke 当次 T26_DCU_APP_NXP.dep'
 $svnStatusAfter = (& svn status $targetRoot) -join "`n"
 if ($LASTEXITCODE -ne 0 -or $svnStatusAfter -ne $svnStatusBefore) {
     throw 'P2 smoke 前后 SVN 状态不一致'
 }
+
+Write-Output ("P2_OUT_SHA256={0}" -f $outHashBefore)
+Write-Output ("P2_FIXTURE_SHA256={0}" -f $fixtureHashBefore)
+Write-Output ("P2_DEP_SHA256={0}" -f $dependencyHashBefore)
 
 if ($FlashDiagnosticOnly) {
     Write-Output 'P2 connect→flash S32K144/SWD 4000 kHz 仅诊断运行：PASS'

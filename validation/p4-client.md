@@ -62,6 +62,12 @@
 - `cargo fmt --all -- --check`、`cargo clippy -p jlink-mcp --all-targets -- -D warnings`、`git diff --check`：PASS。
 - 当前 MCP Worker 关闭和中断恢复实现及主要测试复用 `validation/p3-recover.md`；10×32-bit、1 kHz、写入交错和目标恢复硬件事实复用 `validation/p3-stage.md`。相关代码路径、DLL、OUT、探针、目标、接口、速度和测试输入指纹均未变化，因此不重复真机 smoke。
 
+## 5.7 客户端指纹变更后定向复核
+
+5.7 发布门禁发现 Windows Codex 和最终产品二进制指纹已变化，因此只重做客户端敏感路线。`OpenAI.Codex 26.820.10647.0`、`codex-cli 0.150.1` 使用 `--ignore-user-config --ephemeral`，仅加载 required server `jlink_mcp_v2_acceptance`；产品 `jlink-mcp.exe` SHA-256 为 `E4BBAF457E7D9355179D497A4D1411F051B44EE1FF4E03D2FA47CB494F909F9B`。
+
+定向复核在不可变完成 capture `cap_0373e535731d6433da7d43bd` 上再次通过六工具闭集、严格 Schema `-32602`、结构化断开态、overview、window 首/续页和 raw resource。分页时间为 `[0,1000]` 与 `[2000,3000]`，续页只携带 `action/capture_id/cursor`；资源 MIME 和 `JMCPV101` 头保持正确。全局旧 `jlink` 未加载或调用，结束后无相关残留进程。完整发布证据与当前支持矩阵见 `validation/p4-release.md`。
+
 ## 证据失效条件
 
 - Windows Codex 应用包、CLI、MCP 产品二进制、六工具 metadata、严格 Schema、资源处理或审批行为变化。
