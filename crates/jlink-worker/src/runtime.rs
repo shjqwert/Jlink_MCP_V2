@@ -34,6 +34,8 @@ use crate::{
 pub struct WorkerOptions {
     /// Directory containing stable probe lock files.
     pub lease_root: PathBuf,
+    /// Project-local root for capture files, before probe identity partitioning.
+    pub capture_root: PathBuf,
     /// Configured probe serial or other unique local identity.
     pub probe_identity: String,
     /// Identity-validated J-Link x64 DLL path.
@@ -74,7 +76,7 @@ impl WorkerOptions {
         for pair in pairs {
             if !matches!(
                 pair[0].as_str(),
-                "--lease-root" | "--probe" | "--dll" | "--parent-pid"
+                "--lease-root" | "--capture-root" | "--probe" | "--dll" | "--parent-pid"
             ) {
                 return Err(JlinkError::new(
                     ErrorCode::ConfigInvalid,
@@ -115,6 +117,7 @@ impl WorkerOptions {
         }
         Ok(Self {
             lease_root: PathBuf::from(required("--lease-root")?),
+            capture_root: PathBuf::from(required("--capture-root")?),
             probe_identity: required("--probe")?,
             dll_path: PathBuf::from(required("--dll")?),
             parent_pid,
@@ -785,7 +788,7 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     let lease = ProbeLease::acquire(&options.lease_root, &options.probe_identity)?;
     let identity_hash = probe_identity_hash(&options.probe_identity)?;
     let hss = HssCoordinator::open(
-        options.lease_root.join("captures").join(&identity_hash),
+        options.capture_root.join(&identity_hash),
         &options.probe_identity,
     )?;
     let gateway = DllGateway::load(&options.dll_path)?;
@@ -863,6 +866,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn worker_options_keep_probe_leases_and_project_captures_separate() {
+        let options = WorkerOptions::parse([
+            OsString::from("--lease-root"),
+            OsString::from("user-leases"),
+            OsString::from("--capture-root"),
+            OsString::from("project-captures"),
+            OsString::from("--probe"),
+            OsString::from("260106173"),
+            OsString::from("--dll"),
+            OsString::from("JLink_x64.dll"),
+            OsString::from("--parent-pid"),
+            OsString::from("42"),
+        ])
+        .expect("complete Worker startup contract");
+        assert_eq!(options.lease_root, PathBuf::from("user-leases"));
+        assert_eq!(options.capture_root, PathBuf::from("project-captures"));
+    }
 
     #[test]
     fn program_command_and_payload_must_match_exactly() {

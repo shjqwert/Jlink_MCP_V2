@@ -77,7 +77,9 @@ fn runtime_fixture() -> (tempfile::TempDir, Runtime, PathBuf) {
     write_query_configs(&project, &user);
 
     let lease_root = temporary.path().join("leases");
-    let store_root = lease_root
+    let store_root = temporary
+        .path()
+        .join(".jlink-mcp")
         .join("captures")
         .join(probe_identity_hash(&PROBE_SERIAL.to_string()).expect("probe identity hash"));
     let store = CaptureStore::open(store_root).expect("capture store");

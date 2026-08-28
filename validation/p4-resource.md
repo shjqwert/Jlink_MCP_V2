@@ -4,6 +4,7 @@
 
 - T-P4-RESOURCE 覆盖 HSSQ-010、HSSQ-011：`resources/read` 在无活动 Worker/目标连接时读取不可变完成文件，固定返回 `application/vnd.jlink-mcp.capture.v1+binary` 和完整文件的标准 Base64。
 - 返回内容是 Capture Store 的原始 `.capture` 数据，不是图片、文本、抽取后的 payload 或服务端生成曲线；数值曲线继续由 window 原始/显式聚合视图提供。
+- 当前工程 Store 是新采集和离线读取的首选位置；本文件的旧用户 Store 夹具保留用于证明显式 capture ID 的只读兼容回退，不触发迁移、覆盖或删除。
 - 读取前通过同一文件句柄重新验证 V1 magic/版本、自描述头 CRC、每块 CRC、终态 CRC、原始 payload SHA-256、采集身份和终态清单；失败返回资源错误，不返回部分数据或 fallback。
 
 ## 格式与依赖边界

@@ -24,6 +24,7 @@
 /.mcp.json
 
 # Local captures, validation evidence, and transient files
+/.jlink-mcp/
 /captures/
 /validation/evidence/
 /openspec/changes/*/evidence/

@@ -1,6 +1,12 @@
 //! Process-owned configuration and Worker orchestration behind the MCP boundary.
 
-use std::{fs, path::PathBuf, sync::Arc, thread, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread,
+    time::Duration,
+};
 
 use jlink_capture::{
     CaptureChangesQuery, CaptureEvent, CaptureSnapshot, CaptureStore, CaptureWindow,
@@ -32,6 +38,7 @@ pub struct Runtime {
     config_paths: ConfigPaths,
     worker_executable: PathBuf,
     lease_root: PathBuf,
+    capture_root: PathBuf,
     attachment: Option<WorkerAttachment>,
     symbol_cache: SymbolCache,
 }
@@ -50,15 +57,13 @@ struct CursorPageContext<'a> {
 impl Runtime {
     /// Builds the runtime from explicit local paths.
     #[must_use]
-    pub const fn new(
-        config_paths: ConfigPaths,
-        worker_executable: PathBuf,
-        lease_root: PathBuf,
-    ) -> Self {
+    pub fn new(config_paths: ConfigPaths, worker_executable: PathBuf, lease_root: PathBuf) -> Self {
+        let capture_root = project_capture_root(&config_paths.project);
         Self {
             config_paths,
             worker_executable,
             lease_root,
+            capture_root,
             attachment: None,
             symbol_cache: SymbolCache::new(),
         }
@@ -915,26 +920,28 @@ impl Runtime {
             )
         })?;
         let identity_hash = probe_identity_hash(&probe.value.to_string())?;
-        let root = self.lease_root.join("captures").join(identity_hash);
-        let Some(store) = CaptureStore::open_existing(root)? else {
-            return Err(capture_not_found(arguments));
-        };
-        match (
+        let identity = (
             arguments.get("capture_id").and_then(Value::as_str),
             arguments.get("capture_key").and_then(Value::as_str),
-        ) {
-            (Some(capture_id), None) => store
-                .find_snapshot(capture_id)?
-                .ok_or_else(|| capture_not_found(arguments)),
-            (None, Some(capture_key)) => store
-                .find_snapshot_by_key(capture_key)?
-                .ok_or_else(|| capture_not_found(arguments)),
-            _ => Err(JlinkError::new(
+        );
+        if !matches!(identity, (Some(_), None) | (None, Some(_))) {
+            return Err(JlinkError::new(
                 ErrorCode::ValueInvalid,
                 "HSS 查询必须且只能提供 capture_id 或 capture_key",
                 false,
-            )),
+            ));
         }
+        let project_root = self.capture_root.join(&identity_hash);
+        if let Some(snapshot) = find_completed_snapshot(&project_root, identity)? {
+            return Ok(snapshot);
+        }
+        let legacy_root = self.lease_root.join("captures").join(&identity_hash);
+        if legacy_root != project_root
+            && let Some(snapshot) = find_completed_snapshot(&legacy_root, identity)?
+        {
+            return Ok(snapshot);
+        }
+        Err(capture_not_found(arguments))
     }
 
     fn read_capture_resource(&self, uri: &str) -> Result<ToolCall, JlinkError> {
@@ -1218,6 +1225,7 @@ impl Runtime {
         let launch = WorkerLaunchSpec {
             executable: self.worker_executable.clone(),
             lease_root: self.lease_root.clone(),
+            capture_root: self.capture_root.clone(),
             probe_identity: probe.value.to_string(),
             dll_path: resolved.jlink.dll_path.value.clone(),
         };
@@ -1234,6 +1242,29 @@ impl Runtime {
             connected: status.connection_state == ConnectionState::Connected,
             capture_active: status.hss_active,
         })
+    }
+}
+
+fn project_capture_root(project_config: &Path) -> PathBuf {
+    project_config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join(".jlink-mcp")
+        .join("captures")
+}
+
+fn find_completed_snapshot(
+    root: &Path,
+    identity: (Option<&str>, Option<&str>),
+) -> Result<Option<CaptureSnapshot>, JlinkError> {
+    let Some(store) = CaptureStore::open_existing(root)? else {
+        return Ok(None);
+    };
+    match identity {
+        (Some(capture_id), None) => store.find_snapshot(capture_id),
+        (None, Some(capture_key)) => store.find_snapshot_by_key(capture_key),
+        _ => unreachable!("capture identity was validated before store lookup"),
     }
 }
 

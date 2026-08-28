@@ -40,6 +40,8 @@ pub struct WorkerLaunchSpec {
     pub executable: PathBuf,
     /// Directory containing stable probe lease files.
     pub lease_root: PathBuf,
+    /// Project-local root for capture files, before probe identity partitioning.
+    pub capture_root: PathBuf,
     /// Configured probe serial or other unique local identity.
     pub probe_identity: String,
     /// Identity-validated J-Link DLL path.
@@ -429,6 +431,8 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
     command
         .arg("--lease-root")
         .arg(&spec.lease_root)
+        .arg("--capture-root")
+        .arg(&spec.capture_root)
         .arg("--probe")
         .arg(&spec.probe_identity)
         .arg("--dll")

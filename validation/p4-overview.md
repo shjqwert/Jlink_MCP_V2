@@ -2,11 +2,12 @@
 
 ## 结论
 
-PASS。T-P4-OVERVIEW 已覆盖 HSSQ-001、HSSQ-002、HSSQ-003 的只读完成快照路径；未连接探针，未修改目标 SVN 工程，也未复跑 P3 真机证据。
+PASS。T-P4-OVERVIEW 已覆盖 HSSQ-001、HSSQ-002、HSSQ-003 的只读完成快照路径；FT-016 扩展回归进一步证明工程级 Store 隔离、旧用户 Store 只读回退和真机新路径落盘。未修改目标 SVN 工程。
 
 ## 实现边界
 
 - Capture Store 新增不创建目录的只读打开，以及按 `capture_id`/`capture_key` 查找不可变完成文件。
+- 新采集根目录由工程配置路径确定为 `.jlink-mcp/captures/<probe_identity_hash>`；用户级 probe lease 继续独立存在。离线查询先查工程 Store，显式身份缺失时才只读回退旧用户 Store。
 - overview 在重新校验文件头、块 CRC、终态清单和原始 SHA-256 后读取拼接 payload；启动扫描仍不保留 payload，避免常驻复制完整采集。
 - 时间范围固定为半开区间 `from_us/to_us`，结束边界为最后一条完整记录的源时间加 6.98a 已声明的 1 ms 源分辨率。
 - 顶层变量按请求顺序登记稳定 `s0..sN`；完整路径只在 `dictionary` 出现，变量项只含 `series/samples/changes`。
@@ -24,6 +25,9 @@ PASS。T-P4-OVERVIEW 已覆盖 HSSQ-001、HSSQ-002、HSSQ-003 的只读完成快
   - 通过 stdio MCP 分别按 ID/key 查询相同 overview，并由严格 action 结果 Schema 校验。
   - 验证 `from_us/to_us`、顶层导航计数和 `application/vnd.jlink-mcp.capture.v1+binary` 资源链接。
   - 未知 key 返回稳定 `VALUE_INVALID`；未知 view 在读取 Capture Store 前由输入 Schema 拒绝。
+  - 同一 probe 的工程 A capture 在工程 B 中不可见，且查询缺失不会创建工程 B Store。
+- `crates/jlink-mcp/tests/t_p4_resource.rs` 使用旧 `lease_root/captures` 夹具证明显式资源 ID 的只读兼容回退。
+- 真机使用 1 秒、1 kHz、`ucTestflg` 创建 `cap_b194591611163ca6306e1102`；文件写入当前仓库 `.jlink-mcp/captures/1659...949b9/`，长度 9,594 bytes，SHA-256 `CBDAB01C62DF60F5A44CE8DC954CF7A9992052F3CA71CDE88A4016C385C2769B`。断开后按 ID 和 key 的 overview 均成功，目标断开前为 running。
 - `crates/jlink-mcp/src/runtime.rs` 的状态投影回归验证活动 capture 返回 `complete_records`、已持久化半开区间和独立完整性质量。
 
 ## 开发循环测试

@@ -22,7 +22,11 @@ const PROBE_SERIAL: u32 = 260_106_173;
 
 #[test]
 fn t_p4_resource_reads_the_complete_self_describing_capture_while_disconnected() {
-    let (_temporary, mut runtime, capture_path) = runtime_fixture();
+    let (temporary, mut runtime, capture_path) = runtime_fixture();
+    assert!(
+        capture_path.starts_with(temporary.path().join("leases").join("captures")),
+        "fixture exercises the read-only legacy user Store fallback"
+    );
     let uri = format!("jlink-mcp://capture/{CAPTURE_ID}/raw");
     let request = json!({
         "jsonrpc": "2.0",
