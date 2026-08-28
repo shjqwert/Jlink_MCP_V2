@@ -51,8 +51,8 @@ pub use program::{
 };
 pub use session::{
     FaultDiagnostics, RecoveryAction, RecoveryNotification, TargetConnectionSpec, ValidationAfter,
-    ValidationCheck, ValidationCheckKind, ValidationInvalidation, ValidationReport,
-    ensure_disconnect_allowed,
+    ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationInvalidation,
+    ValidationReport, ensure_disconnect_allowed,
 };
 pub use state::{
     ConnectionState, DispatchState, ExecutionKind, SessionEvent, TargetInterface, TargetState,

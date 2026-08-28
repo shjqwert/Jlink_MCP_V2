@@ -195,7 +195,17 @@ pub enum ValidationCheckKind {
     HssCapability,
 }
 
-/// One completed validation observation with actionable failure advice.
+/// Whether a validation check was executed now or reused from the bound session fingerprint.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationCheckEvidence {
+    /// The check was executed during this validation pass.
+    Executed,
+    /// The check reuses evidence from the current Worker and target fingerprint.
+    Reused,
+}
+
+/// One executed or fingerprint-bound reused validation observation.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationCheck {
@@ -203,14 +213,16 @@ pub struct ValidationCheck {
     pub kind: ValidationCheckKind,
     /// Whether the observed condition met the V1 requirement.
     pub passed: bool,
-    /// Actual observed result.
+    /// Whether this result was executed now or reused from the current session.
+    pub evidence: ValidationCheckEvidence,
+    /// Actual result or an explicit explanation of the reused evidence.
     pub detail: String,
     /// Corrective action for a failed check.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommendation: Option<String>,
 }
 
-/// Result of one fresh, side-effect-bounded environment validation pass.
+/// Result of one side-effect-bounded validation pass with explicit evidence provenance.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ValidationReport {

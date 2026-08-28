@@ -19,8 +19,8 @@
 | FT-007 | 兼容性复核 | 错误同时出现在 `content.text`、`structuredContent.error` 和 `isError`，存在信息重复，但可能服务于不同 MCP 客户端兼容层。 | 先验证目标客户端实际消费路径；不得仅为减小文本删除结构化错误或破坏兼容性。 |
 | FT-008 | 已确认 | `jlink_write.variable` 的实时 Schema 将顶层数组限定为 `Array<string>`，但数组切片传入 `["17","34"]` 时运行时返回 `VALUE_INVALID`，并要求 JSON integer 或 `$int`；同一数组放入结构体对象并使用整数元素可以成功写入。 | 统一 Schema、反序列化和运行时整数模型；增加标量数组整写、切片写、结构体内嵌数组及超出安全整数范围的合同测试。 |
 | FT-009 | 完成 | 根因是 Flash 主操作成功后，要到后置状态也成功才记录 Flash 已修改。修复后主操作成功立即使固件/验证证据失效；后置失败关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`，固定报告操作、阶段、`after`、Flash 修改事实和原始错误码。 | 单元测试、workspace 门禁和真机故障路径通过；擦除未重放，状态立即为 `faulted/unknown`，随后完成固件重烧、独立 verify 和 running 恢复。 |
-| FT-010 | 待复核 | 空片恢复后在暂停态执行 `validate`，结果为 `target_state=halted`，但 `background_access.detail` 文案仍为“运行态读取 ICSR 成功”。 | 明确该检查描述的是实际测试状态还是能力名称；确保 detail 与 `target_state` 不产生相互矛盾的反馈。 |
-| FT-011 | 待优化 | 固件变化或故障恢复后重新执行 `validate` 是必要的，但每次都完整返回未变化的 DLL 身份、导出、探针、目标、接口和 HSS 能力等检查，造成重复反馈和上下文占用。 | 以 DLL、配置、探针和能力指纹复用可信静态检查，仅重跑会失效的动态检查；返回结果必须清楚区分 `executed` 与 `reused`，并在指纹、Worker 生命周期或错误矛盾时强制失效，不能因此弱化验证证据。 |
+| FT-010 | 完成 | 每项检查新增必填 `evidence`。running 每次实际执行 ICSR；halted/HardFault 只能复用同一连接中已成功的 running 证据，detail 明确当前状态和复用来源。 | 真机 halted validate 返回 `target_state=halted`、`background_access.evidence=reused`，不再伪称本次在 running 执行。 |
+| FT-011 | 完成 | 当前 Worker/目标指纹内复用 DLL、导出、探针、目标身份、接口和 HSS 能力；目标状态始终重观测。Flash 清固件身份和动态后台证据，连接/Worker 变化全清。 | 首次、连续复用、halted、Flash 后失效、resume 重建和新 Worker 全执行矩阵通过。 |
 | FT-012 | 已确认 | 1 kHz 结构体采样下，`around_event` 在 5 ms 前后窗口返回所有连续变化成员及逐项 relation；单个写事件产生数十项与写入无直接关系的变化，而当前 Schema 没有 `series` 过滤字段。 | 保留事件、时间不确定度和相关变化证据；评估增加可选 `series` 过滤或默认有界摘要，完整原始变化继续通过 `window/changes` 获取，并验证分页确定性。 |
 | FT-013 | 待优化 | `status(completed)` 与紧随其后的 `query(overview)` 重复返回完整 quality、采样范围和捕获身份；异步流程又需要先等待终态再进入查询，形成正常调用链中的固定重复。 | 在保持 `status` 和离线 `overview` 可独立解释的前提下，比较终态摘要、客户端可信缓存或增量响应方案；不得删除质量证据或让客户端猜测捕获完整性。 |
 | FT-014 | 待优化 | 并发矩阵首次使用 15 s 固定捕获，但 Agent 与工具多次往返消耗了捕获窗口；执行 `halt` 时捕获已自然结束，导致该结果不能证明运行期冲突，并额外重做一次 60 s 捕获。 | 在 Skill 和测试编排中根据操作数量、往返耗时上界和安全余量选择捕获时长，并在批量操作前确认捕获仍为 `running`；不得改变 HSS 固定时长或无手动停止的合同。 |
@@ -66,6 +66,13 @@ CPU 控制 action 本身通过；FT-005 的公共错误分类已在后续修复�
 - 第一生命周期固定为 MCP PID `6984`、Worker PID `63616`。running 状态读取 `PC` 返回 `TARGET_STATE_INVALID`，详情为 `dll_status=255`、`target_state=running` 和显式 halt 建议；不再误报 `REGISTER_NOT_FOUND`。
 - `halt` 返回 `{}`，连续两次读取 `PC` 均成功并返回 `0x00029566`；MCP/Worker PID 在连续调用前后未变化。`resume` 返回 `{}`，只读状态证据为 `connected/running`。
 - MCP 进程结束后，原 MCP/Worker 均在 5 秒内退出。新生命周期先返回 `connection=disconnected`，随后 connect 建立新的 MCP PID `53396`、Worker PID `19748`；这证明 FT-006 是父进程边界，不是同一 MCP 内 Worker 丢失。最终断开时 CPU 保持 running。
+
+### FT-010/011 修复回归
+
+- 断开态 `validate(after=run)` 的七项检查全部为 `evidence=executed`。连接后连续两次 running validate 中，DLL、导出、探针、目标身份、接口和 HSS 六项均为 `reused`，`background_access` 每次为 `executed`，`validation_runs` 单调递增。
+- 显式 halt 后 validate 返回 `target_state=halted`；后台检查为 `reused`，detail 明确“目标当前为 Halted；复用同一连接中已成功的运行态证据”，没有伪称本次在 running 执行。
+- `flash(verify=true, after=none)` 成功后目标保持 halted；下一次 validate 仍复用六项静态证据，但后台检查为 `executed/failed` 并明确不存在同一连接的成功 running 证据，证明 Flash 已清除动态缓存。resume 后 running validate 重新执行 ICSR 并恢复 `valid=true`。
+- 结束 MCP/Worker 后启动新生命周期，首次 `validate(after=run)` 的七项再次全部为 `executed`、`validation_runs=1`；旧 Worker 证据没有跨生命周期复用。最终 CPU 保持 running。
 
 ## 安全写入与 Flash 阶段证据摘要
 

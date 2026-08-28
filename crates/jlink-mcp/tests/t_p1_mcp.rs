@@ -146,7 +146,6 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
             "values": { "target.device": "S32K144" }
         })
     ));
-
     let hss = catalog
         .iter()
         .find(|tool| tool["name"] == "jlink_hss")
@@ -189,6 +188,22 @@ fn t_p1_mcp_catalog_is_closed_and_action_strict() {
         &hss["inputSchema"],
         &window_with_points
     ));
+}
+
+#[test]
+fn t_p1_mcp_validation_checks_require_evidence_provenance() {
+    let catalog = tool_catalog();
+    let target = catalog
+        .iter()
+        .find(|tool| tool["name"] == "jlink_target")
+        .expect("target tool");
+    let validation_check = &target["outputSchema"]["properties"]["checks"]["items"];
+    assert!(
+        validation_check["required"]
+            .as_array()
+            .expect("validation check required fields")
+            .contains(&json!("evidence"))
+    );
 }
 
 #[test]

@@ -55,14 +55,30 @@ Worker 建立并持有 J-Link 目标会话后，连接完成检查或 HSS 启动
 - **THEN** 系统返回 `OPERATION_CONFLICT` 且采集继续
 
 ### Requirement: SES-005 验证缓存失效
-连接丢失、Worker 异常退出、烧录/擦除/其他 Flash 修改，或 DLL、ELF、目标、接口、核心配置变化时，系统 MUST 使相关验证缓存失效。UI 窗口和永久配置 MUST NOT 被视为连接仍有效的证据。
+连接丢失、Worker 异常退出，或 DLL、目标、接口、核心配置变化时，系统 MUST 使对应验证证据全部失效。烧录、擦除、其他 Flash 修改或 ELF 变化 MUST 至少使固件身份和相关动态证据失效；与当前 Worker、连接和目标指纹仍一致的 DLL、导出、探针、目标身份、接口和 HSS 能力证据 MAY 保留。UI 窗口和永久配置 MUST NOT 被视为连接仍有效的证据。
 
 #### Scenario: 烧录后启动符号读取
 - **WHEN** 当前连接执行了 Flash 修改
 - **THEN** 下一次变量或 HSS 操作重新验证固件与 ELF 身份
 
+#### Scenario: Flash 后验证动态状态
+- **WHEN** 当前连接完成 Flash 修改并再次调用 validate
+- **THEN** 系统不得复用修改前的目标状态或后台访问证据，但可复用指纹未变化的静态检查
+
+#### Scenario: Worker 重启后验证
+- **WHEN** 原 Worker 已退出并由新生命周期执行 validate
+- **THEN** 所有检查均重新执行，不复用旧 Worker 的任何证据
+
 ### Requirement: SES-006 显式诊断
-`jlink_target.validate` MUST 返回实际完成的 DLL、导出、探针、HSS 和目标检查结果；失败 MUST 给出可操作修正建议。活动目标已经连接时，validate MUST 只观察当前会话，MUST NOT 接受 `after` 或改变目标状态。目标未连接且目标级检查需要建立临时会话时，请求 MUST 显式提供 `after: run | halt`；Worker MUST 先复用 SES-003 的唯一恢复流程得到可控运行状态，再收口到请求的最终状态，并返回实际最终状态和全部恢复通知。系统 MUST NOT 根据临时建连后的状态推断建连前状态。除显式目标状态收口外，validate MUST NOT 修改 Flash、RAM、MMIO、业务变量或用户请求的核心寄存器。
+`jlink_target.validate` MUST 为每项检查返回必填 `evidence: executed | reused`。活动目标已经连接时，validate MUST 每次重新观察目标状态；running 时 MUST 本次执行 ICSR 后台访问检查，halted 或 HardFault 时只能复用同一连接中已成功的 running 证据，并 MUST 在 detail 中明确复用。其余指纹未变化的 DLL、导出、探针、目标身份、接口和 HSS 能力证据 MAY 复用。失败 MUST 给出可操作修正建议。活动连接中的 validate MUST NOT 接受 `after` 或改变目标状态。目标未连接且目标级检查需要建立临时会话时，请求 MUST 显式提供 `after: run | halt`；Worker MUST 先复用 SES-003 的唯一恢复流程得到可控运行状态，再收口到请求的最终状态，并返回实际最终状态和全部恢复通知。系统 MUST NOT 根据临时建连后的状态推断建连前状态。除显式目标状态收口外，validate MUST NOT 修改 Flash、RAM、MMIO、业务变量或用户请求的核心寄存器。
+
+#### Scenario: 同一连接连续验证
+- **WHEN** running 的同一目标连接连续调用 validate 且指纹未变化
+- **THEN** 静态检查标记 `reused`，目标状态和后台访问检查标记 `executed`
+
+#### Scenario: 暂停态复用运行证据
+- **WHEN** 同一连接已成功完成 running 后台访问检查，随后显式 halt 并调用 validate
+- **THEN** 后台访问检查标记 `reused`，detail 明确证据来自同一连接的 running 检查，不伪称本次在 running 执行
 
 #### Scenario: Agent 修正配置后复检
 - **WHEN** Agent 修改 DLL 路径并在断开状态调用带 `after: run` 的 validate

@@ -179,7 +179,7 @@ annotations 只是客户端提示，不构成 MCP 写入授权或阻塞逻辑。
 { "action": "validate" }
 ```
 
-用于配置修正后的显式复检。它返回确定顺序的 `checks`、实际最终 `target_state`、`target_id`、`validation_runs`，以及本次发生时才出现的 `recovery_notifications`。失败项包含明确修正建议；执行失败通过稳定错误返回。断开状态缺少 `after`，或连接状态携带 `after`，均拒绝执行。
+用于配置修正后的显式复检。它返回确定顺序的 `checks`、实际最终 `target_state`、`target_id`、`validation_runs`，以及本次发生时才出现的 `recovery_notifications`。每项 check 必须包含 `evidence: "executed" | "reused"`。同一 Worker、连接和目标指纹内可复用 DLL、导出、探针、目标身份、接口和 HSS 能力；目标状态每次重新观察，running 时每次实际执行 ICSR 检查，halted/HardFault 时只能明确复用同一连接已成功的 running 证据。失败项包含明确修正建议；执行失败通过稳定错误返回。断开状态缺少 `after`，或连接状态携带 `after`，均拒绝执行。
 
 ### 4.5 `config_get`
 

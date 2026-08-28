@@ -1277,10 +1277,11 @@ fn validation_check_schema() -> Value {
                 ]),
             ),
             ("passed", boolean()),
+            ("evidence", string_enum(&["executed", "reused"])),
             ("detail", non_empty_string()),
             ("recommendation", non_empty_string()),
         ],
-        &["kind", "passed", "detail"],
+        &["kind", "passed", "evidence", "detail"],
     )
 }
 
