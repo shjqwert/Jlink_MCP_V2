@@ -1,9 +1,8 @@
 # Rust build output
 /target/
 
-# Local Agent context and generated indexes
-/AGENTS.md
-/.agent/
+# Project Agent instructions and durable context are version-controlled.
+# Generated local Agent indexes and caches remain excluded.
 /.agents/
 /.codegraph/
 /.serena/
