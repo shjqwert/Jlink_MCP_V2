@@ -370,9 +370,15 @@ fn t_p1_mcp_stdio_returns_minimal_results_and_public_errors() {
         );
     }
     assert!(
-        instructions.len() <= 512,
-        "server instructions must remain self-contained and short"
+        instructions.chars().count() <= 300,
+        "server instructions must remain within 300 Unicode characters"
     );
+    for workflow_detail in ["capture_key", "cursor", "validate.after"] {
+        assert!(
+            !instructions.contains(workflow_detail),
+            "server instructions must not duplicate {workflow_detail} guidance"
+        );
+    }
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
         Some(6)

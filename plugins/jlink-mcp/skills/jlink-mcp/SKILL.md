@@ -21,13 +21,10 @@ Read only the relevant business reference. Read [errors.md](references/errors.md
 
 ## Invariants for every call
 
-1. Use only tools exposed by the `jlink_mcp` server. Do not substitute another installed server with similar tool names.
-2. Inspect the current tool definition, choose one declared `action`, and send the smallest object that satisfies that action's strict Schema. Do not invent wrappers, aliases, defaults, or extra fields.
-3. Within the current MCP/Worker lifecycle, reuse trustworthy session state established by successful calls and their declared transitions; do not mechanically call target `status` between consecutive operations. Query `status` only when state is unknown, invalidated, or contradicted by a result. A previous task, window, UI, or persistent configuration never proves a live connection.
-4. Treat successful `structuredContent` as authoritative. An empty `{}` is a completed success with no payload; it is not missing data. Treat `structuredContent.error` as the authoritative tool failure.
-5. A live-target read may establish a missing connection as a necessary prerequisite, but `connect` can resume or reset-plus-resume the CPU and its notices must be reported. If the user requires preserving the pre-connect CPU state, stop instead. Offline reads must not connect, and no read-only request authorizes `jlink_program`, `jlink_write`, or mutating `jlink_control` actions.
-6. Never automatically repeat an uncertain side effect. Apply the recovery rules in `errors.md`.
-7. During an active HSS capture, only target `status`, HSS `status/query`, and variable or RAM/MMIO writes are allowed. Other device operations conflict; allowed writes are serialized with capture drain rather than executed concurrently in the DLL.
-8. Interpret measurements as evidence, not diagnosis. The MCP projects deterministic facts; causal analysis remains an Agent conclusion and must retain uncertainty.
+1. Use only the current `jlink_mcp` server. Choose one declared `action` and send the smallest object accepted by its live strict Schema; do not invent wrappers, aliases, defaults, or extra fields.
+2. Reuse trustworthy state established in the current MCP/Worker lifecycle. Do not insert target `status` between consecutive operations; query only when state is unknown, invalidated, or contradicted. Earlier tasks, UI state, and configuration do not prove a live connection.
+3. Successful `structuredContent` is authoritative and `{}` means completed success. On failure, load `errors.md` and use `structuredContent.error`; never replay an uncertain side effect automatically.
+4. Offline operations must not connect. A necessary live connection can resume or reset-plus-resume the CPU, so follow `target-session.md` and report notices; a read request never authorizes programming, writes, or mutating control.
+5. During active HSS, only target `status`, HSS `status/query`, and variable or RAM/MMIO writes are allowed. Other device operations conflict; accepted writes are serialized with capture drain.
 
 Current release evidence covers Windows x64 and SWD. The Schema can represent JTAG, but JTAG has not passed the hardware release gate; disclose that limitation instead of claiming verified support.

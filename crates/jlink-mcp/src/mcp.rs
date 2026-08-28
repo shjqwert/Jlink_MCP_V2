@@ -1711,16 +1711,27 @@ mod tests {
 
     #[test]
     fn frame_invalid_remains_a_structured_public_error() {
-        let result = public_tool_error(JlinkError::new(
-            ErrorCode::FrameInvalid,
-            "HSS frame tail is invalid",
-            false,
-        ))
+        let result = public_tool_error(
+            JlinkError::new(ErrorCode::FrameInvalid, "HSS frame tail is invalid", false)
+                .with_detail("capture_id", serde_json::json!("cap-1")),
+        )
         .expect("FRAME_INVALID is part of the public error contract");
 
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(result["content"][0]["type"], "text");
         assert_eq!(
-            result["structuredContent"]["error"]["code"],
-            "FRAME_INVALID"
+            result["content"][0]["text"],
+            "FRAME_INVALID: HSS frame tail is invalid"
+        );
+        assert_eq!(
+            result["structuredContent"]["error"],
+            serde_json::json!({
+                "code": "FRAME_INVALID",
+                "message": "HSS frame tail is invalid",
+                "retryable": false,
+                "details": { "capture_id": "cap-1" }
+            })
         );
     }
 

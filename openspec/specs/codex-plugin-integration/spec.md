@@ -1,8 +1,10 @@
+# Codex Plugin Integration Specification
+
 ## Purpose
 
 定义 J-Link MCP 在 Codex 中的可安装插件边界，使新的本地环境能够发现服务器和使用指南，并以低上下文成本安全选择、调用和解释固定六工具 V1 合同。
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: CPI-001 仓库内插件可安装
 系统 MUST 提供有效的 repo-local Codex marketplace 条目和 `jlink-mcp` 插件清单；插件 MUST 同时声明一个 MCP server 和一个可隐式发现的同域 Skill。安装配置 MUST NOT 固化开发电脑的绝对仓库路径，启动时 MUST 使用可移植的插件或安装位置，并确保 `jlink-mcp.exe` 与其同目录 `jlink-worker.exe` 成对可用。

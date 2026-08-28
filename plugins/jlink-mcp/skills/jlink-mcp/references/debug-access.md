@@ -28,6 +28,8 @@ Use this reference for `jlink_inspect`, `jlink_write`, and `jlink_control`.
 
 - Variable and memory writes default to no readback. Request `readback` only when the user needs verification and accepts the extra device access.
 - Readback proves only that the same J-Link connection observed the requested value. It does not prove firmware behavior, consumption, persistence, or correctness.
+- Treat command, trigger, handshake, and self-clearing control variables as firmware-consumed values. Write them with `verify=none`, then verify the intended business state, response field, or other safe read-only evidence.
+- If firmware can consume or clear a value before readback, `VERIFY_FAILED` proves only that the final observed value differs. It does not prove the write never happened and must not trigger an automatic retry.
 - A successful write returns `{}`. An empty result is not permission to issue a second write.
 - For an uncertain response, follow [errors.md](errors.md); never retry a register, memory, or variable write automatically.
 

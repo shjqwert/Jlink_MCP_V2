@@ -16,7 +16,8 @@ Load this reference only after a failed call, a lost response, or an uncertain s
 | `OPERATION_CONFLICT` | Reconcile error details with the current session snapshot; query target/HSS status only if the conflict leaves state unknown. Wait or change the explicit plan, but do not queue an operation implicitly or interrupt HSS. |
 | `CURSOR_INVALID`, `CURSOR_EXPIRED` | End pagination. A new query must be an explicit restart decision; never splice pages from different snapshots. |
 | `CAPTURE_KEY_CONFLICT` | Do not alter and resend under the same key. Use the original equivalent request for recovery or choose a new key for a genuinely new capture. |
-| `VERIFY_FAILED`, `FIRMWARE_ELF_MISMATCH`, `FIRMWARE_IDENTITY_UNKNOWN` | Report the observed identity/verification facts. Do not continue symbol-based interpretation as if firmware identity were proven. |
+| `VERIFY_FAILED` | Report the final mismatch. For a firmware-consumed command, trigger, handshake, or self-clearing variable, this does not prove the write never occurred and never authorizes automatic replay; verify business state instead. |
+| `FIRMWARE_ELF_MISMATCH`, `FIRMWARE_IDENTITY_UNKNOWN` | Report the observed identity facts. Do not continue symbol-based interpretation as if firmware identity were proven. |
 | `FRAME_INVALID` | Do not interpret affected raw bytes as samples. Preserve the error and any separately verified capture data. |
 
 ## Correct before retrying

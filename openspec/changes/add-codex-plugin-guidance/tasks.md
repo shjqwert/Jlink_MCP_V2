@@ -31,3 +31,10 @@
 
 - [x] 6.1 检查完整 diff、未跟踪文件和敏感信息，确认只包含本次变更且所有必需验证仍通过
 - [x] 6.2 在当前 `codex/` 功能分支创建原子提交并推送到已配置远端，不改写历史或强制推送
+
+## 7. 全阶段反馈收敛
+
+- [x] 7.1 将 server instructions 收敛到 300 字符内的四项不变量，并补充严格长度/内容回归
+- [x] 7.2 精简根 Skill；在 HSS reference 增加 60 秒或往返加 30 秒预算和 running 前置，在 debug reference 增加自清零 `verify=none`、业务验证及不自动重试规则
+- [x] 7.3 补充 `isError`、`content.text`、`structuredContent.error` 三层一致性测试，并记录服务端完整资源与 Codex 截断的 FT-017 external-blocked 证据
+- [x] 7.4 运行 Skill/plugin 校验、受影响 Rust 测试、workspace 门禁、OpenSpec strict validation 和重新安装后的新任务验收

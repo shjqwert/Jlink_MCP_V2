@@ -59,3 +59,26 @@ release 构建使用被 Git 忽略的 `target/plugin-build`，避免覆盖其他
 ### 证据边界
 
 本次验收证明插件在当前 Windows x64 Codex 环境中可发现、可启动、可枚举固定六工具，并能完成不连接硬件的代表性调用、严格参数拒绝和结构化错误处理。由于本机配置缺少 `target.device`，本次没有重复既有的硬件纵向验收；硬件发布证据仍复用正式 V1 的 SWD 门禁。JTAG 只由 Schema 表达，未完成真机发布验证。
+
+## 全阶段反馈收敛
+
+- initialize instructions 资源正文从 452 缩至 293 个 Unicode 字符（-35.2%），线上值含结尾换行共 294 字符；仅保留六工具边界、运行时 Schema 权威、`structuredContent` 权威和不重放不确定副作用。
+- 根 Skill 从 3,711 缩至 2,994 个 Unicode 字符（-19.3%），只保留 action 路由和跨工具不变量；目标会话、编程、调试、HSS 与错误恢复细节按需加载。
+- HSS reference 对多轮/并发矩阵规定至少 60 秒，或“预计总往返时间 + 30 秒安全余量”，并要求执行矩阵前确认 capture 仍为 `running`。
+- debug/error reference 对命令、触发、握手和自清零变量规定 `verify=none`、业务状态验证及不得因 `VERIFY_FAILED` 自动重放。
+- `isError`、`content.text`、`structuredContent.error` 分别承担通用失败标志、可显示文本和机器可读权威错误；三层一致性由 MCP 回归锁定，不作为可删除重复。
+- FT-017 保持 external-blocked：服务端资源完整，Codex 客户端交付发生静默截断；没有删除 `resources/read`、加入本地路径字段或缩减规范资源。
+
+### 全阶段修订后重装验收
+
+| 项目 | 结果 |
+|---|---|
+| 插件版本 | `0.1.0+codex.20260828102524`；`jlink-mcp@jlink-mcp-v2` 为 `installed, enabled` |
+| `jlink-mcp.exe` | 7,559,680 bytes；SHA-256 `B2ED72DED15C3638110F532E628A0F67961C51A41AEA8777E7492EB138F59DCD` |
+| `jlink-worker.exe` | 2,081,280 bytes；SHA-256 `F2903443929559F5DB10FAF72B6D2DD1F7A4D5BCEB6F09C86CD958694407C302` |
+| 原始目录合同 | initialize instructions 294 字符；`tools/list` 32,555 bytes；`jlink_hss` 18,875 bytes；固定六工具 |
+| 新任务 | 临时任务 `01a047e7-9292-7192-a37f-c9b00055f0f3`；加载 `jlink-mcp:jlink-mcp`，只发现插件 `jlink_mcp` 的六工具 |
+| 代表调用 | `jlink_target.status` 返回 `connection=disconnected`；未 connect、未执行硬件副作用 |
+| 严格拒绝 | `status` 增加 `unexpected=true` 返回 JSON-RPC `-32602`，请求未进入工具实现 |
+
+重装前精确确认产品目录只有空闲 MCP 子进程，没有 `jlink-worker` 或 `JLink`；按重启验收边界停止这些子进程后安装。隔离 release 与产品目录二进制哈希一致。新任务总 token 计数为 26,321，其中还包含项目上下文、交接检索和 reference；它不是六工具目录的独立 token 计量，因此上下文压缩结论以可重复的 raw 字节数和 Skill 字符数为准。
