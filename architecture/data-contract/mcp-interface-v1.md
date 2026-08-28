@@ -102,6 +102,8 @@ MCP 包装层：
 
 写入结构体或数组时必须提供完整选中对象；局部写入通过成员或元素路径完成。写 union 时必须定位具体成员，或在 `$union` 中只提供一个成员。柔性或动态长度数组必须独立提供 `slice {start,count}`；路径中的 `[i]` 不能替代 `slice`，只选择一个元素时也使用 `count:1`。
 
+公开 Schema 使用根级 `$defs.typedValue` 表达上述递归合同；`jlink_write.variable`、`jlink_inspect.variable` 的值和 HSS 规则/采样值均通过 `$ref` 引用同一定义。普通 JSON 字符串和 `null` 不是 TypedValue；字符串只允许出现在 `$int`、`$float`、`$pointer` 的封闭标签对象中。
+
 ## 3. 工具总表
 
 | 工具 | actions | 用途 | MCP annotations（保守值） |

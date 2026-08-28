@@ -449,7 +449,7 @@ fn inspect_tool() -> Value {
 
 fn write_tool() -> Value {
     let verify = string_enum(&["none", "readback"]);
-    let input = action_union(vec![
+    let input = with_typed_value_definition(action_union(vec![
         action_object(
             "variable",
             vec![
@@ -474,7 +474,7 @@ fn write_tool() -> Value {
             vec![("name", non_empty_string()), ("value", address_schema())],
             &["name", "value"],
         ),
-    ]);
+    ]));
     tool_definition(
         "jlink_write",
         "Write a typed variable, RAM or MMIO bytes, or a writable core register.",
@@ -598,7 +598,7 @@ fn hss_tool() -> Value {
     tool_definition(
         "jlink_hss",
         r#"Start a fixed-duration HSS capture or inspect capture status. All status/query fields are flat top-level JSON; never use query or resolution wrapper objects. Each status/query uses exactly one identity, capture_id or capture_key; examples below use capture_id. Immutable query skeletons: overview={"action":"query","capture_id":"...","view":"overview"}; changes={"action":"query","capture_id":"...","view":"changes","series":["s0"],"from_us":0,"to_us":1000,"rules":[],"limit":100}; raw/transitions window={"action":"query","capture_id":"...","view":"window","series":["s0"],"from_us":0,"to_us":1000,"mode":"raw","limit":100}; min_max/first_last window uses the same flat fields with "mode":"min_max" and required "points":100; around_event={"action":"query","capture_id":"...","view":"around_event","event_id":"e0","before_us":1000,"after_us":1000,"limit":100}; cursor continuation={"action":"query","capture_id":"...","cursor":"..."} and omits view plus every view-specific field."#,
-        action_union(variants),
+        with_typed_value_definition(action_union(variants)),
         hss_output_schema(),
         annotations(false, true, true),
     )
@@ -669,13 +669,13 @@ fn target_output_schema() -> Value {
 
 fn inspect_output_schema() -> Value {
     let variants = vec![
-        inspect_success_schema("variable"),
-        inspect_success_schema("memory"),
-        inspect_success_schema("register"),
-        inspect_success_schema("symbols"),
+        inspect_success_schema_body("variable"),
+        inspect_success_schema_body("memory"),
+        inspect_success_schema_body("register"),
+        inspect_success_schema_body("symbols"),
         closed_object(vec![("error", error_schema())], &["error"]),
     ];
-    json!({
+    with_typed_value_definition(json!({
         "type": "object",
         "properties": {
             "value": {},
@@ -685,7 +685,7 @@ fn inspect_output_schema() -> Value {
         },
         "additionalProperties": false,
         "oneOf": variants
-    })
+    }))
 }
 
 fn action_output_schema(name: &str, arguments: &Value) -> Option<Value> {
@@ -702,6 +702,10 @@ fn action_output_schema(name: &str, arguments: &Value) -> Option<Value> {
 }
 
 fn inspect_success_schema(action: &str) -> Value {
+    with_typed_value_definition(inspect_success_schema_body(action))
+}
+
+fn inspect_success_schema_body(action: &str) -> Value {
     match action {
         "variable" => closed_object(vec![("value", typed_value_schema())], &["value"]),
         "memory" => closed_object(vec![("data", byte_string_schema())], &["data"]),
@@ -712,6 +716,10 @@ fn inspect_success_schema(action: &str) -> Value {
 }
 
 fn hss_output_schema() -> Value {
+    with_typed_value_definition(hss_output_schema_body())
+}
+
+fn hss_output_schema_body() -> Value {
     closed_schema_union(&[
         hss_status_output_schema(),
         hss_overview_output_schema(),
@@ -725,7 +733,7 @@ fn hss_output_schema() -> Value {
 }
 
 fn hss_action_output_schema(arguments: &Value) -> Value {
-    match arguments
+    let schema = match arguments
         .get("action")
         .and_then(Value::as_str)
         .expect("MCP Schema guarantees hss.action")
@@ -735,7 +743,7 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
             hss_completed_start_output_schema(),
         ]),
         "status" => hss_status_output_schema(),
-        "query" if arguments.get("cursor").is_some() => hss_output_schema(),
+        "query" if arguments.get("cursor").is_some() => hss_output_schema_body(),
         "query" => match arguments
             .get("view")
             .and_then(Value::as_str)
@@ -753,10 +761,11 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
                 _ => unreachable!("window mode passed closed MCP Schema"),
             },
             "around_event" => hss_around_event_output_schema(),
-            _ => hss_output_schema(),
+            _ => hss_output_schema_body(),
         },
         _ => unreachable!("HSS action was validated against the closed catalog"),
-    }
+    };
+    with_typed_value_definition(schema)
 }
 
 fn hss_status_output_schema() -> Value {
@@ -1527,7 +1536,92 @@ fn byte_string_schema() -> Value {
 }
 
 fn typed_value_schema() -> Value {
-    json!({ "type": ["boolean", "number", "object", "array"] })
+    json!({ "$ref": "#/$defs/typedValue" })
+}
+
+fn with_typed_value_definition(mut schema: Value) -> Value {
+    schema
+        .as_object_mut()
+        .expect("root Schema is an object")
+        .insert(
+            "$defs".to_owned(),
+            json!({ "typedValue": typed_value_definition() }),
+        );
+    schema
+}
+
+fn typed_value_definition() -> Value {
+    let recursive = || json!({ "$ref": "#/$defs/typedValue" });
+    json!({
+        "oneOf": [
+            { "type": "boolean" },
+            { "type": "number" },
+            {
+                "type": "array",
+                "items": recursive()
+            },
+            {
+                "type": "object",
+                "not": {
+                    "anyOf": [
+                        { "required": ["$int"] },
+                        { "required": ["$float"] },
+                        { "required": ["$pointer"] },
+                        { "required": ["$union"] }
+                    ]
+                },
+                "additionalProperties": recursive()
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "$int": {
+                        "type": "string",
+                        "pattern": "^[+-]?[0-9]+$"
+                    },
+                    "bits": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64
+                    },
+                    "signed": { "type": "boolean" }
+                },
+                "required": ["$int", "bits", "signed"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "$float": { "enum": ["nan", "inf", "-inf"] }
+                },
+                "required": ["$float"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "$pointer": {
+                        "type": "string",
+                        "pattern": "^0x[0-9a-fA-F]+$"
+                    }
+                },
+                "required": ["$pointer"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "$union": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "additionalProperties": recursive()
+                    }
+                },
+                "required": ["$union"],
+                "additionalProperties": false
+            }
+        ]
+    })
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 | FT-005 | 完成 | 根因是寄存器已在目录中命中后，DLL 单项读取状态非零仍被映射成 `REGISTER_NOT_FOUND`。修复后只有目录缺失返回该错误；running 返回 `TARGET_STATE_INVALID`，halted 仍失败返回 `TARGET_CONNECT_FAILED`。 | 单元、公共 Schema/错误 smoke、真机 running→halted→running 回归通过。 |
 | FT-006 | 完成（预期生命周期） | 同一 MCP PID 内 Worker PID 稳定，连续寄存器/控制调用没有断连；MCP 结束后 Worker 随父进程退出，新 MCP 生命周期从 `disconnected` 和新 PID 对重新开始。 | 已证明阶段间断连与 MCP 父进程生命周期一致，不修改 Worker 生命周期代码。 |
 | FT-007 | 兼容性复核 | 错误同时出现在 `content.text`、`structuredContent.error` 和 `isError`，存在信息重复，但可能服务于不同 MCP 客户端兼容层。 | 先验证目标客户端实际消费路径；不得仅为减小文本删除结构化错误或破坏兼容性。 |
-| FT-008 | 已确认 | `jlink_write.variable` 的实时 Schema 将顶层数组限定为 `Array<string>`，但数组切片传入 `["17","34"]` 时运行时返回 `VALUE_INVALID`，并要求 JSON integer 或 `$int`；同一数组放入结构体对象并使用整数元素可以成功写入。 | 统一 Schema、反序列化和运行时整数模型；增加标量数组整写、切片写、结构体内嵌数组及超出安全整数范围的合同测试。 |
+| FT-008 | 完成 | 根因是公共 Schema 只声明裸 `array/object`，没有递归元素模型，导致客户端类型转换与运行时整数规则矛盾。写入、读取和 HSS 现统一引用根级 `$defs.typedValue`，普通字符串和 `null` 被拒绝，运行时编码规则未放宽。 | Schema 回归覆盖数值数组、嵌套结构体数组、`$int/$float/$pointer/$union` 和拒绝边界；真机 `stTest.ucData2` 切片写入 `[17,34]`、独立回读、原值恢复及 running 状态均通过。 |
 | FT-009 | 完成 | 根因是 Flash 主操作成功后，要到后置状态也成功才记录 Flash 已修改。修复后主操作成功立即使固件/验证证据失效；后置失败关闭目标并返回不可重放的 `EXECUTION_UNCERTAIN`，固定报告操作、阶段、`after`、Flash 修改事实和原始错误码。 | 单元测试、workspace 门禁和真机故障路径通过；擦除未重放，状态立即为 `faulted/unknown`，随后完成固件重烧、独立 verify 和 running 恢复。 |
 | FT-010 | 完成 | 每项检查新增必填 `evidence`。running 每次实际执行 ICSR；halted/HardFault 只能复用同一连接中已成功的 running 证据，detail 明确当前状态和复用来源。 | 真机 halted validate 返回 `target_state=halted`、`background_access.evidence=reused`，不再伪称本次在 running 执行。 |
 | FT-011 | 完成 | 当前 Worker/目标指纹内复用 DLL、导出、探针、目标身份、接口和 HSS 能力；目标状态始终重观测。Flash 清固件身份和动态后台证据，连接/Worker 变化全清。 | 首次、连续复用、halted、Flash 后失效、resume 重建和新 Worker 全执行矩阵通过。 |
