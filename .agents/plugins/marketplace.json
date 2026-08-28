@@ -1,0 +1,20 @@
+{
+  "name": "jlink-mcp-v2",
+  "interface": {
+    "displayName": "J-Link MCP V2"
+  },
+  "plugins": [
+    {
+      "name": "jlink-mcp",
+      "source": {
+        "source": "local",
+        "path": "./plugins/jlink-mcp"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

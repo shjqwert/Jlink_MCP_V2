@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "jlink_mcp": {
+      "title": "J-Link MCP V1",
+      "description": "Windows x64 local stdio MCP for one SEGGER J-Link target.",
+      "command": "powershell.exe",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "$dir = Join-Path $env:LOCALAPPDATA 'Programs\\jlink-mcp'; $mcp = Join-Path $dir 'jlink-mcp.exe'; $worker = Join-Path $dir 'jlink-worker.exe'; if (-not (Test-Path -LiteralPath $mcp -PathType Leaf) -or -not (Test-Path -LiteralPath $worker -PathType Leaf)) { [Console]::Error.WriteLine('J-Link MCP binaries are missing. Run scripts/install-codex-plugin.ps1 from the jlink-mcp-V2 repository.'); exit 127 }; & $mcp; exit $LASTEXITCODE"
+      ]
+    }
+  }
+}

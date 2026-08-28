@@ -1,0 +1,26 @@
+{
+  "name": "jlink-mcp",
+  "version": "0.1.0",
+  "description": "Operate one local SEGGER J-Link target through the fixed six-tool MCP V1 contract.",
+  "author": {
+    "name": "jlink-mcp-V2 contributors"
+  },
+  "repository": "https://github.com/shjqwert/Jlink_MCP_V2",
+  "license": "MIT",
+  "keywords": ["j-link", "cortex-m", "embedded", "debugging", "mcp"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "J-Link MCP",
+    "shortDescription": "Operate and inspect one local J-Link target.",
+    "longDescription": "Adds the Windows x64 J-Link MCP server and focused guidance for target sessions, firmware programming, debug access, and fixed-duration HSS captures.",
+    "developerName": "jlink-mcp-V2 contributors",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Show the current J-Link target status.",
+      "Inspect a firmware variable through J-Link.",
+      "Plan a fixed-duration HSS capture."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}

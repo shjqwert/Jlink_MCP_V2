@@ -8,6 +8,14 @@
 /.codegraph/
 /.serena/
 
+# Repository Codex marketplace is a version-controlled product surface.
+!/.agents/
+/.agents/*
+!/.agents/plugins/
+/.agents/plugins/*
+!/.agents/plugins/marketplace.json
+/.local-marketplace/
+
 # Architecture and OpenSpec sources are version-controlled project inputs.
 # Keep only generated or machine-specific evidence excluded below.
 

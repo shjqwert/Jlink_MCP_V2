@@ -286,6 +286,25 @@ fn t_p1_mcp_stdio_returns_minimal_results_and_public_errors() {
     let responses = exchange(&requests, &mut fixture);
 
     assert_eq!(responses[0]["result"]["protocolVersion"], "2025-11-25");
+    let instructions = responses[0]["result"]["instructions"]
+        .as_str()
+        .expect("server instructions");
+    for required in [
+        "exactly six tools",
+        "tools/list",
+        "structuredContent",
+        "EXECUTION_UNCERTAIN",
+        "do not repeat the side effect",
+    ] {
+        assert!(
+            instructions.contains(required),
+            "server instructions are missing {required}"
+        );
+    }
+    assert!(
+        instructions.len() <= 512,
+        "server instructions must remain self-contained and short"
+    );
     assert_eq!(
         responses[1]["result"]["tools"].as_array().map(Vec::len),
         Some(6)

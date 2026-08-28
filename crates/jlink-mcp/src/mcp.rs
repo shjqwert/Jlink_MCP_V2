@@ -13,6 +13,7 @@ pub const RAW_CAPTURE_MIME: &str = "application/vnd.jlink-mcp.capture.v1+binary"
 pub const RAW_CAPTURE_URI_TEMPLATE: &str = "jlink-mcp://capture/{capture_id}/raw";
 
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
+const SERVER_INSTRUCTIONS: &str = include_str!("../resources/server-instructions.md");
 
 /// Result produced by the process-owned tool dispatcher.
 pub enum ToolCall {
@@ -149,7 +150,7 @@ fn handle_request<D: ToolDispatcher>(request: &Value, dispatcher: &mut D) -> Opt
                 "resources": { "subscribe": false, "listChanged": false }
             },
             "serverInfo": { "name": "jlink-mcp", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "Six-tool J-Link MCP V1 for one local target and immutable captures."
+            "instructions": SERVER_INSTRUCTIONS
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_catalog() })),
