@@ -8,8 +8,10 @@
         "-NoLogo",
         "-NoProfile",
         "-NonInteractive",
+        "-ExecutionPolicy",
+        "RemoteSigned",
         "-Command",
-        "$dir = Join-Path $env:LOCALAPPDATA 'Programs\\jlink-mcp'; $mcp = Join-Path $dir 'jlink-mcp.exe'; $worker = Join-Path $dir 'jlink-worker.exe'; if (-not (Test-Path -LiteralPath $mcp -PathType Leaf) -or -not (Test-Path -LiteralPath $worker -PathType Leaf)) { [Console]::Error.WriteLine('J-Link MCP binaries are missing. Run scripts/install-codex-plugin.ps1 from the jlink-mcp-V2 repository.'); exit 127 }; & $mcp; exit $LASTEXITCODE"
+        "$ErrorActionPreference = 'Stop'; try { $root = Join-Path $env:LOCALAPPDATA 'Programs\\jlink-mcp'; $pointer = Get-Content -LiteralPath (Join-Path $root 'current.json') -Raw -Encoding UTF8 | ConvertFrom-Json; if ($pointer.schema_version -ne 1 -or $pointer.deployment -notmatch '^deployments/\\d+\\.\\d+\\.\\d+-[a-f0-9]{16}(-[a-f0-9]{8})?$') { throw 'Invalid deployment pointer' }; & (Join-Path (Join-Path $root $pointer.deployment) 'scripts\\launch-jlink-mcp.ps1'); exit $LASTEXITCODE } catch { [Console]::Error.WriteLine('J-Link MCP is unavailable. Install the complete precompiled package with scripts/install-codex-plugin.ps1. ' + $_.Exception.Message); exit 127 }"
       ]
     }
   }

@@ -1,122 +1,223 @@
+#requires -Version 5.1
 [CmdletBinding()]
 param(
+    [string]$PackageDirectory = '',
     [string]$BinaryDirectory = '',
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = 'Stop'
-
-$repositoryRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
-$sourcePlugin = Join-Path $repositoryRoot 'plugins\jlink-mcp'
-$sourceMarketplace = Join-Path $repositoryRoot '.agents\plugins\marketplace.json'
-$marketplaceRoot = Join-Path $repositoryRoot '.local-marketplace'
-$stagedPlugin = Join-Path $marketplaceRoot 'plugins\jlink-mcp'
-$stagedMarketplace = Join-Path $marketplaceRoot '.agents\plugins\marketplace.json'
-
-if ([string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-    throw 'LOCALAPPDATA is unavailable; cannot select the per-user product directory'
+[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+$OutputEncoding = [Text.UTF8Encoding]::new($false)
+. (Join-Path $PSScriptRoot 'release-common.ps1')
+if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or -not [Environment]::Is64BitProcess) {
+    throw 'Run this installer in 64-bit Windows PowerShell 5.1 or later'
 }
-$productDirectory = Join-Path $env:LOCALAPPDATA 'Programs\jlink-mcp'
-if (-not (Test-Path -LiteralPath $sourcePlugin -PathType Container)) {
-    throw "Plugin source is missing: $sourcePlugin"
+if ($BinaryDirectory) {
+    throw 'Bare binaries are no longer installed. Build a release package, then use -PackageDirectory. No compilation is performed here.'
 }
-if (-not (Test-Path -LiteralPath $sourceMarketplace -PathType Leaf)) {
-    throw "Marketplace source is missing: $sourceMarketplace"
-}
-$productExecutables = @(
-    [System.IO.Path]::GetFullPath((Join-Path $productDirectory 'jlink-mcp.exe'))
-    [System.IO.Path]::GetFullPath((Join-Path $productDirectory 'jlink-worker.exe'))
-)
-$activeProductProcesses = Get-Process -Name 'jlink-mcp', 'jlink-worker' -ErrorAction SilentlyContinue |
-    Where-Object {
-        try {
-            $productExecutables -contains [System.IO.Path]::GetFullPath($_.Path)
-        }
-        catch {
-            $false
-        }
-    }
-if ($activeProductProcesses) {
-    throw 'Stop active jlink-mcp and jlink-worker processes from the product directory before updating the installed binaries'
-}
-
-if ([string]::IsNullOrWhiteSpace($BinaryDirectory)) {
-    $BinaryDirectory = Join-Path $repositoryRoot 'target\release'
-}
-elseif (-not [System.IO.Path]::IsPathRooted($BinaryDirectory)) {
-    $BinaryDirectory = Join-Path $repositoryRoot $BinaryDirectory
-}
-$BinaryDirectory = [System.IO.Path]::GetFullPath($BinaryDirectory)
-
-if (-not $SkipBuild) {
-    cargo build --release -p jlink-mcp -p jlink-worker
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Release build failed'
-    }
-}
-
-$sourceMcp = Join-Path $BinaryDirectory 'jlink-mcp.exe'
-$sourceWorker = Join-Path $BinaryDirectory 'jlink-worker.exe'
-if (-not (Test-Path -LiteralPath $sourceMcp -PathType Leaf)) {
-    throw "MCP binary is missing: $sourceMcp"
-}
-if (-not (Test-Path -LiteralPath $sourceWorker -PathType Leaf)) {
-    throw "Worker binary is missing: $sourceWorker"
-}
-
-$null = New-Item -ItemType Directory -Force -Path $productDirectory
-Copy-Item -LiteralPath $sourceMcp -Destination (Join-Path $productDirectory 'jlink-mcp.exe') -Force
-Copy-Item -LiteralPath $sourceWorker -Destination (Join-Path $productDirectory 'jlink-worker.exe') -Force
-
-$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stagedMarketplace)
-$null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $stagedPlugin)
-Copy-Item -LiteralPath $sourceMarketplace -Destination $stagedMarketplace -Force
-$null = New-Item -ItemType Directory -Force -Path $stagedPlugin
-Get-ChildItem -LiteralPath $sourcePlugin -Force |
-    Copy-Item -Destination $stagedPlugin -Recurse -Force
-
-$stagedManifestPath = Join-Path $stagedPlugin '.codex-plugin\plugin.json'
-$stagedManifest = Get-Content -Raw -LiteralPath $stagedManifestPath | ConvertFrom-Json -Depth 20
-$baseVersion = ($stagedManifest.version -split '\+', 2)[0]
-$cachebuster = [DateTime]::UtcNow.ToString('yyyyMMddHHmmss')
-$stagedManifest.version = "$baseVersion+codex.$cachebuster"
-$stagedManifestJson = $stagedManifest | ConvertTo-Json -Depth 20
-[System.IO.File]::WriteAllText(
-    $stagedManifestPath,
-    $stagedManifestJson + [Environment]::NewLine,
-    [System.Text.UTF8Encoding]::new($false)
-)
-
+if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSScriptRoot }
+$PackageDirectory = [IO.Path]::GetFullPath($PackageDirectory)
+$manifest = Read-ReleasePackage $PackageDirectory
+$manifestHash = (Get-FileHash -LiteralPath (Join-Path $PackageDirectory 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
 $codexCommand = Get-Command codex -ErrorAction Stop
-$pluginListing = (& $codexCommand.Source plugin list 2>&1) -join [Environment]::NewLine
-if ($pluginListing -match [regex]::Escape('jlink-mcp@jlink-mcp-v2')) {
-    & $codexCommand.Source plugin remove 'jlink-mcp@jlink-mcp-v2'
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to remove the previous jlink-mcp plugin installation'
+$productRoot = Get-ProductRoot
+
+function Invoke-PluginCli {
+    param([string[]]$Arguments)
+    # The executable/arguments are separate values. Never build a shell command from a path.
+    # In Windows PowerShell, native stderr becomes ErrorRecord objects. A warning
+    # with exit code zero must neither abort installation nor contaminate JSON.
+    $savedPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $result = @(& $codexCommand.Source @Arguments 2>&1)
+        $commandExitCode = $LASTEXITCODE
     }
-}
-$marketplaceListing = (& $codexCommand.Source plugin marketplace list 2>&1) -join [Environment]::NewLine
-if ($marketplaceListing -match '(?m)^jlink-mcp-v2\s') {
-    & $codexCommand.Source plugin marketplace remove 'jlink-mcp-v2'
-    if ($LASTEXITCODE -ne 0) {
-        throw 'Failed to remove the previous jlink-mcp-v2 marketplace registration'
-    }
+    finally { $ErrorActionPreference = $savedPreference }
+    $stderr = @($result | Where-Object { $_ -is [Management.Automation.ErrorRecord] })
+    $stdout = @($result | Where-Object { $_ -isnot [Management.Automation.ErrorRecord] })
+    if ($commandExitCode -ne 0) { throw "Codex $($Arguments -join ' ') failed (exit $commandExitCode): $($result -join [Environment]::NewLine)" }
+    foreach ($line in $stderr) { [Console]::Error.WriteLine([string]$line) }
+    return ($stdout -join [Environment]::NewLine)
 }
 
-& $codexCommand.Source plugin marketplace add $marketplaceRoot
-if ($LASTEXITCODE -ne 0) {
-    throw 'Failed to register the staged jlink-mcp-v2 marketplace'
-}
-& $codexCommand.Source plugin add 'jlink-mcp@jlink-mcp-v2' --json
-if ($LASTEXITCODE -ne 0) {
-    throw 'Failed to install the jlink-mcp plugin'
+function Get-PluginState {
+    $markets = Invoke-PluginCli @('plugin', 'marketplace', 'list', '--json') | ConvertFrom-Json
+    $market = @($markets.marketplaces | Where-Object { $_.name -eq 'jlink-mcp-v2' })
+    if ($market.Count -gt 1) { throw 'Ambiguous jlink-mcp-v2 marketplace registration' }
+    $installed = @()
+    $available = @()
+    if ($market.Count -eq 1) {
+        $listing = Invoke-PluginCli @('plugin', 'list', '--marketplace', 'jlink-mcp-v2', '--available', '--json') | ConvertFrom-Json
+        $installed = @($listing.installed | Where-Object { $_.pluginId -eq 'jlink-mcp@jlink-mcp-v2' })
+        $available = @($listing.available | Where-Object { $_.pluginId -eq 'jlink-mcp@jlink-mcp-v2' })
+    }
+    return [pscustomobject]@{ market = $market; installed = $installed; available = $available }
 }
 
-[pscustomobject]@{
-    plugin = 'jlink-mcp@jlink-mcp-v2'
-    version = $stagedManifest.version
-    product_directory = $productDirectory
-    marketplace_root = $marketplaceRoot
-    jlink_mcp_sha256 = (Get-FileHash -LiteralPath (Join-Path $productDirectory 'jlink-mcp.exe') -Algorithm SHA256).Hash
-    jlink_worker_sha256 = (Get-FileHash -LiteralPath (Join-Path $productDirectory 'jlink-worker.exe') -Algorithm SHA256).Hash
-} | ConvertTo-Json -Depth 4
+function Remove-ProductRegistration {
+    $state = Get-PluginState
+    if ($state.installed.Count -gt 0) { $null = Invoke-PluginCli @('plugin', 'remove', 'jlink-mcp@jlink-mcp-v2', '--json') }
+    if ($state.market.Count -gt 0) { $null = Invoke-PluginCli @('plugin', 'marketplace', 'remove', 'jlink-mcp-v2') }
+}
+
+$null = New-Item -ItemType Directory -Force -Path $productRoot
+Assert-NoReparsePoint $productRoot
+$lock = $null
+$transactionPath = $null
+$registrationTouched = $false
+$pointerTouched = $false
+$oldPointerText = $null
+$oldState = $null
+try {
+    try {
+        $lockPath = Get-ContainedPath $productRoot 'install.lock'
+        Assert-NoReparsePoint $lockPath
+        $lock = [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
+    catch { throw 'J-Link MCP is running or another installation is in progress. Close its Codex tasks and retry.' }
+    # Also detect legacy installations, which do not participate in the launcher lock.
+    foreach ($process in @(Get-Process -Name 'jlink-mcp', 'jlink-worker' -ErrorAction SilentlyContinue)) {
+        try { $processPath = $process.Path } catch { throw 'Cannot establish whether a running J-Link MCP process belongs to this installation' }
+        if (-not $processPath) { throw 'Cannot identify a running J-Link MCP process; close it before installation' }
+        if ([IO.Path]::GetFullPath($processPath).StartsWith($productRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Stop the active product MCP/Worker before installing. No process was terminated.'
+        }
+    }
+    $oldState = Get-PluginState
+    if ($oldState.installed.Count -gt 1) { throw 'Ambiguous installed plugin state' }
+    if ($oldState.installed.Count -eq 1 -and -not $oldState.installed[0].enabled) {
+        throw 'The existing plugin is disabled. Enable it or remove it explicitly before replacing it; the installer will not change that preference.'
+    }
+    if ($oldState.market.Count -gt 0) {
+        $sourceEntries = @($oldState.installed) + @($oldState.available)
+        if ($sourceEntries.Count -eq 0) { throw 'Existing marketplace cannot be identified as this product; leaving it unchanged' }
+        foreach ($entry in $sourceEntries) {
+            if ($entry.marketplaceSource.sourceType -ne 'local') { throw 'Only local product marketplaces can be replaced and restored automatically' }
+        }
+        if (-not (Test-Path -LiteralPath $oldState.market[0].root -PathType Container)) { throw 'Previous marketplace root is unavailable; cannot guarantee restoration' }
+    }
+    $pointerPath = Get-ContainedPath $productRoot 'current.json'
+    Assert-NoReparsePoint $pointerPath
+    if (Test-Path -LiteralPath $pointerPath) { $oldPointerText = [IO.File]::ReadAllText($pointerPath) }
+    $transactionId = [Guid]::NewGuid().ToString('N')
+    $transaction = [ordered]@{
+        schema_version = 1; state = 'staging'; version = $manifest.version
+        previous_pointer = $oldPointerText; previous_registration = $oldState
+    }
+    $transactionPath = Get-ContainedPath $productRoot "transactions/$transactionId.json"
+    Assert-NoReparsePoint $transactionPath
+    $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $transactionPath)
+    Write-ReleaseJson $transactionPath $transaction
+
+    # A short directory identity avoids the legacy MAX_PATH limit in PowerShell 5.1.
+    # The full manifest hash is still compared before any deployment can be reused.
+    $deploymentRelative = "deployments/$($manifest.version)-$($manifestHash.Substring(0, 16))"
+    $deployment = Get-ContainedPath $productRoot $deploymentRelative
+    Assert-NoReparsePoint $deployment
+    $reuse = $false
+    if (Test-Path -LiteralPath $deployment) {
+        try {
+            $null = Read-ReleasePackage $deployment
+            $reuse = (Get-FileHash -LiteralPath (Join-Path $deployment 'release-manifest.json')).Hash -eq $manifestHash
+        }
+        catch { $reuse = $false }
+        if (-not $reuse) {
+            # An interrupted/corrupt deployment is retained. Never repair it in place.
+            $deploymentRelative += '-' + $transactionId.Substring(0, 8)
+            $deployment = Get-ContainedPath $productRoot $deploymentRelative
+            Assert-NoReparsePoint $deployment
+        }
+    }
+    foreach ($relative in Get-ReleasePayloadPaths) {
+        if ((Get-ContainedPath $deployment $relative).Length -ge 260) { throw 'Installation path is too long for Windows PowerShell 5.1; use a shorter Windows user profile path' }
+    }
+    if (-not $reuse) {
+        # Populate an unpublished directory. Only the later atomic pointer publishes it.
+        # No directory rename is required, including on systems that lock copied trees.
+        $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $deployment)
+        $null = New-Item -ItemType Directory -Path $deployment
+        foreach ($relative in @('release-manifest.json') + @(Get-ReleasePayloadPaths)) {
+            $destination = Get-ContainedPath $deployment $relative
+            $null = New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination)
+            Copy-Item -LiteralPath (Get-ContainedPath $PackageDirectory $relative) -Destination $destination
+        }
+        $null = Read-ReleasePackage $deployment
+    }
+    $transaction.state = 'registering'
+    Write-ReleaseJson $transactionPath $transaction
+    $registrationTouched = $true
+    Remove-ProductRegistration
+    $null = Invoke-PluginCli @('plugin', 'marketplace', 'add', $deployment)
+    $null = Invoke-PluginCli @('plugin', 'add', 'jlink-mcp@jlink-mcp-v2', '--json')
+    $newState = Get-PluginState
+    $transaction['observed_registration'] = $newState
+    Write-ReleaseJson $transactionPath $transaction
+    # Codex running as an MSIX app can return a physical LocalCache path for the
+    # same logical LOCALAPPDATA directory. Verify the registered payload, not the
+    # spelling of that path. The CLI add operation was given only our deployment.
+    $registeredPackageMatches = $false
+    if ($newState.market.Count -eq 1) {
+        $null = Read-ReleasePackage $newState.market[0].root
+        $registeredPackageMatches = (Get-FileHash -LiteralPath (Join-Path $newState.market[0].root 'release-manifest.json')).Hash -eq $manifestHash
+    }
+    if ($newState.installed.Count -ne 1 -or -not $newState.installed[0].enabled -or
+        $newState.installed[0].version -ne $manifest.version -or $newState.market.Count -ne 1 -or
+        -not $registeredPackageMatches) {
+        throw 'Codex did not confirm the expected plugin version and marketplace root'
+    }
+    $pointerTouched = $true
+    Set-ReleasePointer $pointerPath ([ordered]@{ schema_version = 1; version = $manifest.version; deployment = $deploymentRelative })
+    if ((Get-CurrentDeployment $productRoot) -ne $deployment) { throw 'Deployment pointer verification failed' }
+    $transaction.state = 'installed'
+    Write-ReleaseJson $transactionPath $transaction
+    [pscustomobject]@{
+        plugin = 'jlink-mcp@jlink-mcp-v2'; version = $manifest.version
+        product_directory = $productRoot; deployment = $deployment
+        manifest_sha256 = $manifestHash; segger_managed = $false
+        next_step = 'Open a new Codex task. Prepare SEGGER and project configuration yourself before connecting hardware.'
+    } | ConvertTo-Json -Depth 4
+}
+catch {
+    $originalError = $_.Exception.Message
+    $rollbackErrors = @()
+    if ($pointerTouched) {
+        try {
+            if ($null -ne $oldPointerText) {
+                Set-ReleasePointer $pointerPath ($oldPointerText | ConvertFrom-Json)
+            }
+            elseif (Test-Path -LiteralPath $pointerPath) {
+                $failedPointer = Get-ContainedPath $productRoot "transactions/$transactionId.failed-pointer.json"
+                Assert-NoReparsePoint $failedPointer
+                [IO.File]::Move($pointerPath, $failedPointer)
+            }
+        }
+        catch { $rollbackErrors += $_.Exception.Message }
+    }
+    if ($registrationTouched) {
+        try {
+            Remove-ProductRegistration
+            if ($oldState.market.Count -gt 0) {
+                $null = Invoke-PluginCli @('plugin', 'marketplace', 'add', $oldState.market[0].root)
+                if ($oldState.installed.Count -gt 0) { $null = Invoke-PluginCli @('plugin', 'add', 'jlink-mcp@jlink-mcp-v2', '--json') }
+            }
+            $restored = Get-PluginState
+            if ($restored.installed.Count -ne $oldState.installed.Count -or $restored.market.Count -ne $oldState.market.Count) { throw 'Restored registration has an unexpected shape' }
+            if ($oldState.installed.Count -eq 1 -and $restored.installed[0].version -ne $oldState.installed[0].version) { throw 'Previous plugin version was not restored' }
+            if ($oldState.market.Count -eq 1 -and $restored.market[0].root -ne $oldState.market[0].root) { throw 'Previous marketplace root was not restored' }
+        }
+        catch { $rollbackErrors += $_.Exception.Message }
+    }
+    if ($null -ne $transactionPath) {
+        $transaction.state = 'failed'
+        $transaction['error'] = $originalError
+        $transaction['rollback_errors'] = $rollbackErrors
+        try { Write-ReleaseJson $transactionPath $transaction } catch { $rollbackErrors += $_.Exception.Message }
+    }
+    if ($rollbackErrors.Count -gt 0) { throw "Installation failed: $originalError. Recovery also failed: $($rollbackErrors -join '; '). Retained transaction: $transactionPath" }
+    throw "Installation failed; previous installation preserved/restored: $originalError"
+}
+finally {
+    if ($null -ne $lock) { $lock.Dispose() }
+}

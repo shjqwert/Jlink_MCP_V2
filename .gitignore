@@ -1,22 +1,32 @@
 # Rust build output
 /target/
 
-# Project Agent instructions and durable context are version-controlled.
-# Generated local Agent indexes and caches remain excluded.
-/.agents/
+# Local development context and generated indexes are not release sources.
+/.agent/
+/AGENTS.md
+/.gitmessage
 /.codegraph/
 /.serena/
 
 # Repository Codex marketplace is a version-controlled product surface.
-!/.agents/
 /.agents/*
 !/.agents/plugins/
 /.agents/plugins/*
 !/.agents/plugins/marketplace.json
 /.local-marketplace/
 
-# Architecture and OpenSpec sources are version-controlled project inputs.
-# Keep only generated or machine-specific evidence excluded below.
+# Keep design, experiments, independent tests and evidence on the developer's
+# machine. Back them up separately; ignored files are not saved by future commits.
+/architecture/
+/openspec/
+/experiments/
+/validation/
+/crates/*/tests/
+/crates/*/examples/t_*.rs
+/scripts/test-*.ps1
+/scripts/check-test-fixtures.ps1
+/scripts/t-*.jlink
+/scripts/tests/
 
 # Machine-specific J-Link and MCP configuration
 /jlink-mcp.toml
@@ -25,8 +35,6 @@
 # Local captures, validation evidence, and transient files
 /.jlink-mcp/
 /captures/
-/validation/evidence/
-/openspec/changes/*/evidence/
 *.partial
 *.log
 

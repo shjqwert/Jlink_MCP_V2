@@ -20,6 +20,7 @@ toml.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+gimli = { workspace = true, features = ["write"] }
 tempfile = "=3.27.0"
 
 [lints]

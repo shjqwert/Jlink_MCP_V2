@@ -1,0 +1,63 @@
+name: Windows precompiled release candidate
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $channel --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed' }
+      # Independent integration, installer and hardware tests are retained locally.
+      # Public CI checks the source and unit tests included in this checkout only.
+      - name: Check published source and available unit tests
+        shell: pwsh
+        run: |
+          ./scripts/check-workspace.ps1
+      - name: Check published unit tests with release CRT and path-remapping flags
+        shell: pwsh
+        run: |
+          $env:CARGO_ENCODED_RUSTFLAGS = @(& ./scripts/release-rustflags.ps1) -join [char]31
+          cargo test --locked --release --workspace --target x86_64-pc-windows-msvc --target-dir target/distribution-build
+          if ($LASTEXITCODE -ne 0) { throw 'Static CRT release tests failed' }
+      - name: Build the immutable candidate archive
+        shell: pwsh
+        run: |
+          $result = ./scripts/build-release.ps1
+          $result | ConvertTo-Json -Depth 6 | Set-Content target/candidate-result.json -Encoding utf8
+      - name: Verify package integrity on Windows PowerShell 5.1
+        id: package_checks
+        shell: powershell
+        run: |
+          $result = Get-Content target/candidate-result.json -Raw | ConvertFrom-Json
+          . ./scripts/release-common.ps1
+          $manifest = Read-ReleasePackage $result.package_directory
+          if ($manifest.source_dirty) { throw 'CI candidate must come from committed sources' }
+          if ((Get-FileHash -LiteralPath $result.archive -Algorithm SHA256).Hash -ne $result.sha256) {
+            throw 'Candidate archive SHA-256 mismatch'
+          }
+      - name: Upload candidate and bounded evidence (not a public release)
+        if: always() && steps.package_checks.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: jlink-mcp-V1.0.0-windows-x64-candidate
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            target/distribution/**/*.zip
+            target/distribution/**/*.zip.sha256
+            target/distribution/**/build-result.json
