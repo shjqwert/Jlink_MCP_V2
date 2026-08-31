@@ -259,6 +259,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 dependencies = [
  "fallible-iterator",
+ "indexmap",
  "stable_deref_trait",
 ]
 
@@ -410,7 +411,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jlink-capture"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crc32fast",
  "jlink-domain",
@@ -423,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-domain"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "object",
  "serde",
@@ -433,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-mcp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "data-encoding",
  "gimli",
@@ -451,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-worker"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "jlink-capture",
  "jlink-domain",

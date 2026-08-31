@@ -1,6 +1,6 @@
 {
   "name": "jlink-mcp",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Operate one local SEGGER J-Link target through the fixed six-tool MCP V1 contract.",
   "author": {
     "name": "jlink-mcp-V2 contributors"
