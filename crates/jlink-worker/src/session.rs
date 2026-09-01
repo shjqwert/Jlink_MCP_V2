@@ -1,8 +1,8 @@
 use jlink_domain::{
-    ConnectionState, DebugRequest, ErrorCode, FaultDiagnostics, JlinkError, RecoveryAction,
-    RecoveryNotification, SessionEvent, TargetConnectionSpec, TargetState, ValidationAfter,
-    ValidationCheck, ValidationCheckKind, ValidationInvalidation, ValidationReport, WorkerStatus,
-    ensure_disconnect_allowed, transition_session,
+    ConnectionState, DebugRequest, ErrorCode, FaultDiagnostics, FirmwareIdentityPlan, JlinkError,
+    RecoveryAction, RecoveryNotification, SessionEvent, TargetConnectionSpec, TargetState,
+    ValidationAfter, ValidationCheck, ValidationCheckKind, ValidationInvalidation,
+    ValidationReport, WorkerStatus, ensure_disconnect_allowed, transition_session,
 };
 use serde_json::json;
 
@@ -59,6 +59,14 @@ fn validation_mode(
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FirmwareIdentityCacheKey {
+    connection_generation: u64,
+    target: TargetConnectionSpec,
+    firmware: FirmwareIdentityPlan,
+    dll_sha256: String,
+}
+
 pub(crate) struct TargetSessionManager {
     connection_state: ConnectionState,
     target_state: TargetState,
@@ -68,14 +76,16 @@ pub(crate) struct TargetSessionManager {
     validation_key: Option<TargetConnectionSpec>,
     validation_checks: Vec<ValidationCheck>,
     running_background_access: Option<ValidationCheck>,
-    firmware_identity: Option<String>,
+    firmware_identity: Option<FirmwareIdentityCacheKey>,
+    connection_generation: u64,
+    dll_sha256: String,
     validation_runs: u64,
     recovery_notifications: Vec<RecoveryNotification>,
     last_invalidation: Option<ValidationInvalidation>,
 }
 
 impl TargetSessionManager {
-    pub(crate) const fn new() -> Self {
+    pub(crate) fn new(dll_sha256: impl Into<String>) -> Self {
         Self {
             connection_state: ConnectionState::Disconnected,
             target_state: TargetState::Unknown,
@@ -86,6 +96,8 @@ impl TargetSessionManager {
             validation_checks: Vec::new(),
             running_background_access: None,
             firmware_identity: None,
+            connection_generation: 0,
+            dll_sha256: dll_sha256.into(),
             validation_runs: 0,
             recovery_notifications: Vec::new(),
             last_invalidation: None,
@@ -103,6 +115,7 @@ impl TargetSessionManager {
             parent_pid,
             probe_identity_hash: probe_identity_hash.to_owned(),
             dll_loaded,
+            dll_sha256: self.dll_sha256.clone(),
             connection_state: self.connection_state,
             target_state: self.target_state,
             target_id: self.target_id,
@@ -254,8 +267,17 @@ impl TargetSessionManager {
     }
 
     /// Returns whether this connection already proved one symbol ELF identity.
-    pub(crate) fn firmware_identity_cached(&self, elf_sha256: &str) -> bool {
-        self.firmware_identity.as_deref() == Some(elf_sha256)
+    pub(crate) fn firmware_identity_cached(
+        &self,
+        target: &TargetConnectionSpec,
+        firmware: &FirmwareIdentityPlan,
+    ) -> bool {
+        self.firmware_identity.as_ref().is_some_and(|key| {
+            key.connection_generation == self.connection_generation
+                && &key.target == target
+                && &key.firmware == firmware
+                && key.dll_sha256 == self.dll_sha256
+        })
     }
 
     /// Rejects a first-time symbol identity Flash read while HSS owns the gateway.
@@ -271,8 +293,17 @@ impl TargetSessionManager {
     }
 
     /// Caches a successfully verified symbol ELF for this connection only.
-    pub(crate) fn record_firmware_identity(&mut self, elf_sha256: &str) {
-        self.firmware_identity = Some(elf_sha256.to_owned());
+    pub(crate) fn record_firmware_identity(
+        &mut self,
+        target: &TargetConnectionSpec,
+        firmware: &FirmwareIdentityPlan,
+    ) {
+        self.firmware_identity = Some(FirmwareIdentityCacheKey {
+            connection_generation: self.connection_generation,
+            target: target.clone(),
+            firmware: firmware.clone(),
+            dll_sha256: self.dll_sha256.clone(),
+        });
     }
 
     /// Records a confirmed Flash mutation before any fallible verification or post-action.
@@ -355,6 +386,8 @@ impl TargetSessionManager {
         self.target_state = report.target_state;
         self.target_id = Some(observation.target_id);
         self.active_target = Some(spec.clone());
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.firmware_identity = None;
         self.record_validation_evidence(spec, &report);
         self.last_invalidation = None;
         self.connection_state = transition_session(self.connection_state, SessionEvent::Connected)?;
@@ -594,6 +627,24 @@ mod tests {
 
     use super::*;
 
+    fn manager() -> TargetSessionManager {
+        TargetSessionManager::new("ab".repeat(32))
+    }
+
+    fn firmware() -> FirmwareIdentityPlan {
+        serde_json::from_value(json!({
+            "elf_sha256": "cd".repeat(32),
+            "identity_block": {
+                "address": 0,
+                "bytes": [74, 76, 73, 68, 1, 3, 49, 46, 48],
+                "magic": "JLID",
+                "format_version": 1,
+                "build_id": "1.0"
+            }
+        }))
+        .expect("strong firmware plan")
+    }
+
     #[test]
     fn t_p3_abi_optional_hss_failure_does_not_block_ordinary_debug_validation() {
         let mut report = ValidationReport {
@@ -716,7 +767,7 @@ mod tests {
             None,
         )
         .expect("target spec");
-        let mut manager = TargetSessionManager::new();
+        let mut manager = manager();
         manager.validation_key = Some(spec);
         manager.hss_active = true;
         let before = manager.status(42, "probe-hash", true);
@@ -787,7 +838,7 @@ mod tests {
             None,
         )
         .expect("target spec");
-        let mut manager = TargetSessionManager::new();
+        let mut manager = manager();
         manager.hss_active = true;
         let error = manager
             .ensure_program_allowed(&spec)
@@ -806,7 +857,7 @@ mod tests {
             None,
         )
         .expect("target spec");
-        let mut manager = TargetSessionManager::new();
+        let mut manager = manager();
         manager.connection_state = ConnectionState::Connected;
         manager.active_target = Some(spec.clone());
         manager.hss_active = true;
@@ -861,7 +912,7 @@ mod tests {
             None,
         )
         .expect("target spec");
-        let mut completed = TargetSessionManager::new();
+        let mut completed = manager();
         completed.connection_state = ConnectionState::Connected;
         completed.active_target = Some(spec.clone());
         completed.validation_key = Some(spec.clone());
@@ -879,7 +930,8 @@ mod tests {
             detail: "running ICSR read".to_owned(),
             recommendation: None,
         });
-        completed.record_firmware_identity(&"a".repeat(64));
+        let firmware = firmware();
+        completed.record_firmware_identity(&spec, &firmware);
         completed
             .ensure_program_allowed(&spec)
             .expect("connected validated session");
@@ -887,7 +939,7 @@ mod tests {
         assert_eq!(completed.validation_key.as_ref(), Some(&spec));
         assert_eq!(completed.validation_checks.len(), 1);
         assert!(completed.running_background_access.is_none());
-        assert!(!completed.firmware_identity_cached(&"a".repeat(64)));
+        assert!(!completed.firmware_identity_cached(&spec, &firmware));
         assert_eq!(
             completed.last_invalidation,
             Some(ValidationInvalidation::FlashModified)
@@ -898,7 +950,7 @@ mod tests {
             .ensure_program_allowed(&spec)
             .expect("Flash invalidates cache without losing active target identity");
 
-        let mut uncertain = TargetSessionManager::new();
+        let mut uncertain = manager();
         uncertain.connection_state = ConnectionState::Connected;
         uncertain.active_target = Some(spec.clone());
         uncertain.validation_key = Some(spec);
@@ -915,6 +967,38 @@ mod tests {
     }
 
     #[test]
+    fn firmware_identity_cache_is_bound_to_generation_target_plan_and_dll() {
+        let target = TargetConnectionSpec::new(
+            "S32K144",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("target spec");
+        let firmware = firmware();
+        let mut session = manager();
+        session.connection_generation = 7;
+        session.record_firmware_identity(&target, &firmware);
+        assert!(session.firmware_identity_cached(&target, &firmware));
+
+        session.connection_generation = 8;
+        assert!(!session.firmware_identity_cached(&target, &firmware));
+        session.connection_generation = 7;
+        let other_target = TargetConnectionSpec::new(
+            "S32K146",
+            jlink_domain::TargetInterface::Swd,
+            4_000,
+            Some(260_106_173),
+            None,
+        )
+        .expect("other target spec");
+        assert!(!session.firmware_identity_cached(&other_target, &firmware));
+        session.dll_sha256 = "ef".repeat(32);
+        assert!(!session.firmware_identity_cached(&target, &firmware));
+    }
+
+    #[test]
     fn uncertain_control_invalidates_the_active_session() {
         let spec = TargetConnectionSpec::new(
             "S32K144",
@@ -924,7 +1008,7 @@ mod tests {
             None,
         )
         .expect("target spec");
-        let mut manager = TargetSessionManager::new();
+        let mut manager = manager();
         manager.connection_state = ConnectionState::Connected;
         manager.target_state = TargetState::Halted;
         manager.target_id = Some(1);
@@ -969,7 +1053,7 @@ mod tests {
         )?;
         let probe_identity = probe_serial.to_string();
         let mut gateway = DllGateway::load(&dll_path)?;
-        let mut manager = TargetSessionManager::new();
+        let mut manager = manager();
         manager.connect(&mut gateway, &probe_identity, &spec)?;
 
         let original_demcr = gateway.inject_hardfault_for_test()?;

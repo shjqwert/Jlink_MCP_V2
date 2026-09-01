@@ -1,11 +1,10 @@
 use std::{fs, path::Path};
 
 use jlink_domain::{
-    ErrorCode, FirmwareImage, JlinkError, ProgramAfter, ProgramRequest, TargetConnectionSpec,
-    TargetState, ValidationInvalidation, VerifyMismatchAccumulator, validate_flash_range,
-    validate_image_flash_ranges,
+    ErrorCode, FirmwareImage, FlashModifiedState, JlinkError, ProgramExecutionFacts,
+    ProgramRequest, ProgramStage, TargetConnectionSpec, TargetState, ValidationInvalidation,
+    VerifyMismatchAccumulator, validate_flash_range, validate_image_flash_ranges,
 };
-use serde_json::json;
 
 use crate::{gateway::DllGateway, session::TargetSessionManager};
 
@@ -27,49 +26,71 @@ pub(crate) fn execute_program(
             base_address,
             verify,
             after,
+            loader_ram,
         } => {
+            let loader_ram = loader_ram.ok_or_else(missing_loader_ram_error)?;
             let image = read_image(&image, base_address)?;
             let regions = gateway.device_flash_regions(target.device())?;
             validate_image_flash_ranges(&image, &regions)?;
-            if let Err(error) = gateway.program_image(&image) {
-                gateway.close_target();
-                session.record_execution_uncertain(ValidationInvalidation::FlashModified)?;
-                return Err(error);
+            let mut facts = ProgramExecutionFacts::new();
+            if let Err(error) = gateway.program_image(&image, loader_ram, &mut facts) {
+                return handle_program_failure(session, gateway, facts, error);
             }
             session.record_flash_modified();
-            let verify_result = if verify {
-                gateway
-                    .reset_halt_for_flash()
-                    .and_then(|()| verify_image(gateway, &image))
+            if verify {
+                if let Err(error) = gateway.reset_halt_for_flash() {
+                    return handle_program_failure(session, gateway, facts, error);
+                }
+                facts.last_trusted_target_state = Some(TargetState::Halted);
+                facts.advance(
+                    ProgramStage::VerifyPreparation,
+                    ProgramStage::RangeVerification,
+                );
+                if let Err(error) = verify_image(gateway, &image) {
+                    let state = gateway
+                        .observe_target_state()
+                        .unwrap_or(TargetState::Unknown);
+                    facts.last_trusted_target_state = Some(state);
+                    session.record_program_state(state);
+                    return Err(facts.known_error(error));
+                }
+                facts.advance(ProgramStage::RangeVerification, ProgramStage::FinalState);
             } else {
-                Ok(())
-            };
-            if let Err(error) = verify_result {
-                let state = gateway
-                    .observe_target_state()
-                    .unwrap_or(TargetState::Unknown);
-                session.record_program_state(state);
-                return Err(error);
+                facts.current_stage = ProgramStage::FinalState;
             }
-            let state = apply_program_after(session, gateway, "flash", after)?;
+            let state = match gateway.apply_program_after(after) {
+                Ok(state) => state,
+                Err(error) => return handle_program_failure(session, gateway, facts, error),
+            };
+            facts.last_completed_stage = Some(ProgramStage::FinalState);
+            facts.last_trusted_target_state = Some(state);
             session.record_program_state(state);
             Ok(())
         }
-        ProgramRequest::Erase { range, after } => {
+        ProgramRequest::Erase {
+            range,
+            after,
+            loader_ram,
+        } => {
+            let loader_ram = loader_ram.ok_or_else(missing_loader_ram_error)?;
             let regions = gateway.device_flash_regions(target.device())?;
+            let mut facts = ProgramExecutionFacts::new();
             let result = if let Some(range) = range {
                 validate_flash_range(&regions, range.address(), range.length())?;
-                gateway.erase_range(range.address(), range.length())
+                gateway.erase_range(range.address(), range.length(), loader_ram, &mut facts)
             } else {
-                gateway.erase_chip()
+                gateway.erase_chip(loader_ram, &mut facts)
             };
             if let Err(error) = result {
-                gateway.close_target();
-                session.record_execution_uncertain(ValidationInvalidation::FlashModified)?;
-                return Err(error);
+                return handle_program_failure(session, gateway, facts, error);
             }
             session.record_flash_modified();
-            let state = apply_program_after(session, gateway, "erase", after)?;
+            let state = match gateway.apply_program_after(after) {
+                Ok(state) => state,
+                Err(error) => return handle_program_failure(session, gateway, facts, error),
+            };
+            facts.last_completed_stage = Some(ProgramStage::FinalState);
+            facts.last_trusted_target_state = Some(state);
             session.record_program_state(state);
             Ok(())
         }
@@ -80,46 +101,55 @@ pub(crate) fn execute_program(
             let image = read_image(&image, base_address)?;
             let regions = gateway.device_flash_regions(target.device())?;
             validate_image_flash_ranges(&image, &regions)?;
-            verify_image(gateway, &image)?;
+            let mut facts = ProgramExecutionFacts::new();
+            facts.current_stage = ProgramStage::RangeVerification;
+            if let Err(error) = verify_image(gateway, &image) {
+                let state = gateway
+                    .observe_target_state()
+                    .unwrap_or(TargetState::Unknown);
+                facts.last_trusted_target_state = Some(state);
+                session.record_program_state(state);
+                return Err(facts.known_error(error));
+            }
+            facts.last_completed_stage = Some(ProgramStage::RangeVerification);
             let state = gateway.observe_target_state()?;
+            facts.last_trusted_target_state = Some(state);
             session.record_program_state(state);
             Ok(())
         }
     }
 }
 
-fn apply_program_after(
+fn handle_program_failure(
     session: &mut TargetSessionManager,
     gateway: &mut DllGateway,
-    operation: &'static str,
-    after: ProgramAfter,
-) -> Result<TargetState, JlinkError> {
-    match gateway.apply_program_after(after) {
-        Ok(state) => Ok(state),
-        Err(cause) => {
-            gateway.close_target();
-            session.record_execution_uncertain(ValidationInvalidation::FlashModified)?;
-            Err(post_action_uncertain_error(operation, after, &cause))
-        }
+    mut facts: ProgramExecutionFacts,
+    error: JlinkError,
+) -> Result<(), JlinkError> {
+    if facts.last_trusted_target_state.is_none() {
+        facts.last_trusted_target_state = gateway.observe_target_state().ok();
     }
+    if !facts.side_effect_dispatched {
+        return Err(facts.known_error(error));
+    }
+    gateway.close_target();
+    let invalidation = match facts.flash_modified {
+        FlashModifiedState::True | FlashModifiedState::Unknown => {
+            ValidationInvalidation::FlashModified
+        }
+        FlashModifiedState::False => ValidationInvalidation::TargetConfigurationChanged,
+    };
+    session.record_execution_uncertain(invalidation)?;
+    Err(facts.uncertain_error(&error))
 }
 
-fn post_action_uncertain_error(
-    operation: &'static str,
-    after: ProgramAfter,
-    cause: &JlinkError,
-) -> JlinkError {
+fn missing_loader_ram_error() -> JlinkError {
     JlinkError::new(
-        ErrorCode::ExecutionUncertain,
-        "Flash 主操作已成功，但后置状态处理失败；不得重放该 Flash 操作",
+        ErrorCode::ConfigInvalid,
+        "Flash programming requires profile.loader_ram for the no-Flash preflight",
         false,
     )
-    .with_detail("operation", json!(operation))
-    .with_detail("phase", json!("post_action"))
-    .with_detail("after", json!(after))
-    .with_detail("flash_modified", json!(true))
-    .with_detail("cause_code", json!(cause.code))
-    .with_detail("cause_message", json!(cause.message))
+    .with_detail("field", serde_json::json!("profile.loader_ram"))
 }
 
 fn read_image(path: &Path, base_address: Option<u64>) -> Result<FirmwareImage, JlinkError> {
@@ -151,20 +181,30 @@ mod tests {
 
     #[test]
     fn post_action_failure_is_non_retryable_and_preserves_phase_facts() {
+        let mut facts = ProgramExecutionFacts::new();
+        facts.side_effect_dispatched = true;
+        facts.flash_modified = FlashModifiedState::True;
+        facts.last_completed_stage = Some(ProgramStage::RangeVerification);
+        facts.current_stage = ProgramStage::FinalState;
         let cause = JlinkError::new(
             ErrorCode::TargetConnectFailed,
             "post-action ICSR read failed",
             true,
         );
-        let error = post_action_uncertain_error("erase", ProgramAfter::ResetHalt, &cause);
+        let error = facts.uncertain_error(&cause);
 
         assert_eq!(error.code, ErrorCode::ExecutionUncertain);
         assert!(!error.retryable);
         let details = error.details.expect("phase details");
-        assert_eq!(details["operation"], json!("erase"));
-        assert_eq!(details["phase"], json!("post_action"));
-        assert_eq!(details["after"], json!("reset_halt"));
-        assert_eq!(details["flash_modified"], json!(true));
-        assert_eq!(details["cause_code"], json!("TARGET_CONNECT_FAILED"));
+        assert_eq!(
+            details["last_completed_stage"],
+            serde_json::json!("range_verification")
+        );
+        assert_eq!(details["current_stage"], serde_json::json!("final_state"));
+        assert_eq!(details["flash_modified"], serde_json::json!(true));
+        assert_eq!(
+            details["cause_code"],
+            serde_json::json!("TARGET_CONNECT_FAILED")
+        );
     }
 }

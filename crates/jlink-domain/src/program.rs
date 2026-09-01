@@ -3,7 +3,188 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::{ErrorCode, FirmwareImage, JlinkError};
+use crate::{ErrorCode, FirmwareImage, JlinkError, MemoryRegion, TargetState};
+
+/// Stable stages of a Flash-modifying operation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramStage {
+    /// Reset/halt and target preparation before any download transaction.
+    TargetPreparation,
+    /// Save/write/readback/restore of the selected Loader RAM.
+    LoaderRamPreflight,
+    /// `JLINKARM_BeginDownload` dispatch.
+    BeginDownload,
+    /// One or more image/range chunks submitted to the DLL.
+    SegmentCommit,
+    /// `JLINKARM_EndDownload` completion.
+    EndDownload,
+    /// Reset/halt needed before requested readback verification.
+    VerifyPreparation,
+    /// Exact requested range verification.
+    RangeVerification,
+    /// Explicit final target state policy.
+    FinalState,
+}
+
+/// What can be proven about target Flash after a failure.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlashModifiedState {
+    /// No Flash side effect was dispatched.
+    False,
+    /// The Flash operation completed successfully.
+    True,
+    /// A side effect was dispatched but completion could not be proven.
+    Unknown,
+}
+
+/// One submitted or confirmed half-open Flash range.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramRangeFact {
+    /// First byte address.
+    pub address: u64,
+    /// Non-zero length in bytes.
+    pub length: u64,
+}
+
+/// Auditable execution facts accumulated in actual stage order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProgramExecutionFacts {
+    /// Last stage proven complete, if any.
+    pub last_completed_stage: Option<ProgramStage>,
+    /// Stage being attempted when the facts were emitted.
+    pub current_stage: ProgramStage,
+    /// Whether a target-modifying DLL call was dispatched.
+    pub side_effect_dispatched: bool,
+    /// Ranges accepted by `WriteMem`, without implying `EndDownload` success.
+    pub submitted_ranges: Vec<ProgramRangeFact>,
+    /// Ranges confirmed only after a successful `EndDownload`.
+    pub confirmed_ranges: Vec<ProgramRangeFact>,
+    /// Conservative Flash modification conclusion.
+    pub flash_modified: FlashModifiedState,
+    /// Last target state observed before uncertainty.
+    pub last_trusted_target_state: Option<TargetState>,
+    /// Raw stable error code at the failing boundary.
+    pub raw_error_code: Option<ErrorCode>,
+    /// Side-effect failures are never safe to replay automatically.
+    pub retry_safe: bool,
+}
+
+impl ProgramExecutionFacts {
+    /// Starts a fact record before target preparation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            last_completed_stage: None,
+            current_stage: ProgramStage::TargetPreparation,
+            side_effect_dispatched: false,
+            submitted_ranges: Vec::new(),
+            confirmed_ranges: Vec::new(),
+            flash_modified: FlashModifiedState::False,
+            last_trusted_target_state: None,
+            raw_error_code: None,
+            retry_safe: false,
+        }
+    }
+
+    /// Records one completed stage and advances to the next attempted stage.
+    pub fn advance(&mut self, completed: ProgramStage, next: ProgramStage) {
+        self.last_completed_stage = Some(completed);
+        self.current_stage = next;
+    }
+
+    /// Marks a target-modifying call as dispatched.
+    pub fn dispatch_side_effect(&mut self) {
+        self.side_effect_dispatched = true;
+        self.flash_modified = FlashModifiedState::Unknown;
+    }
+
+    /// Marks a reversible non-Flash Loader RAM write as dispatched.
+    pub fn dispatch_non_flash_side_effect(&mut self) {
+        self.side_effect_dispatched = true;
+    }
+
+    /// Records one range accepted by the DLL without claiming durable modification.
+    pub fn submit(&mut self, address: u64, length: u64) {
+        self.submitted_ranges
+            .push(ProgramRangeFact { address, length });
+    }
+
+    /// Confirms all submitted ranges after `EndDownload` succeeds.
+    pub fn confirm_submitted(&mut self) {
+        self.confirmed_ranges.clone_from(&self.submitted_ranges);
+        self.flash_modified = FlashModifiedState::True;
+    }
+
+    /// Converts a dispatched-side-effect failure to the stable uncertainty contract.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this statically serializable fact structure stops serializing as an object.
+    #[must_use]
+    pub fn uncertain_error(mut self, cause: &JlinkError) -> JlinkError {
+        self.raw_error_code = Some(cause.code);
+        let value = self.detail_value();
+        let object = value
+            .as_object()
+            .expect("program facts serialize as an object");
+        let mut error = JlinkError::new(
+            ErrorCode::ExecutionUncertain,
+            "Flash execution result is uncertain; do not replay the side effect",
+            false,
+        );
+        for (key, value) in object {
+            error = error.with_detail(key, value.clone());
+        }
+        error
+            .with_detail("cause_code", json!(cause.code))
+            .with_detail("cause_message", json!(cause.message))
+            .with_detail("cause_details", json!(cause.details))
+    }
+
+    /// Attaches known stage facts to an error that does not represent unknown execution.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if this statically serializable fact structure stops serializing as an object.
+    #[must_use]
+    pub fn known_error(mut self, mut cause: JlinkError) -> JlinkError {
+        self.raw_error_code = Some(cause.code);
+        let value = self.detail_value();
+        for (key, value) in value
+            .as_object()
+            .expect("program facts serialize as an object")
+        {
+            cause = cause.with_detail(key, value.clone());
+        }
+        cause
+    }
+
+    fn detail_value(&self) -> serde_json::Value {
+        let mut value = serde_json::to_value(self).expect("program facts are serializable");
+        value
+            .as_object_mut()
+            .expect("program facts serialize as an object")
+            .insert(
+                "flash_modified".to_owned(),
+                match self.flash_modified {
+                    FlashModifiedState::False => json!(false),
+                    FlashModifiedState::True => json!(true),
+                    FlashModifiedState::Unknown => json!("unknown"),
+                },
+            );
+        value
+    }
+}
+
+impl Default for ProgramExecutionFacts {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Target state requested after a Flash-modifying operation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +291,9 @@ pub enum ProgramRequest {
         verify: bool,
         /// Explicit final target state policy.
         after: ProgramAfter,
+        /// Final Profile-selected Loader RAM used for the no-Flash preflight.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loader_ram: Option<MemoryRegion>,
     },
     /// Erase the whole device or one explicit checked range.
     Erase {
@@ -118,6 +302,9 @@ pub enum ProgramRequest {
         range: Option<FlashRange>,
         /// Explicit final target state policy.
         after: ProgramAfter,
+        /// Final Profile-selected Loader RAM used for the no-Flash preflight.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        loader_ram: Option<MemoryRegion>,
     },
     /// Compare one image with target Flash without modifying the target.
     Verify {
@@ -312,4 +499,96 @@ fn mismatch_address_error() -> JlinkError {
         "校验不匹配区域的地址或计数溢出",
         false,
     )
+}
+
+#[cfg(test)]
+mod execution_fact_tests {
+    use super::{FlashModifiedState, ProgramExecutionFacts, ProgramStage};
+    use crate::{ErrorCode, JlinkError, TargetState};
+    use serde_json::json;
+
+    #[test]
+    fn end_download_failure_never_promotes_submitted_ranges_to_confirmed() {
+        let mut facts = ProgramExecutionFacts::new();
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
+        facts.submit(0x1000, 16);
+        facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        let error = facts.uncertain_error(&JlinkError::new(
+            ErrorCode::TargetConnectFailed,
+            "EndDownload=-1",
+            false,
+        ));
+        let details = error.details.expect("execution facts");
+        assert_eq!(details["last_completed_stage"], json!("segment_commit"));
+        assert_eq!(details["current_stage"], json!("end_download"));
+        assert_eq!(details["side_effect_dispatched"], json!(true));
+        assert_eq!(details["submitted_ranges"][0]["address"], json!(0x1000));
+        assert_eq!(details["confirmed_ranges"], json!([]));
+        assert_eq!(details["flash_modified"], json!("unknown"));
+        assert_eq!(details["retry_safe"], json!(false));
+    }
+
+    #[test]
+    fn successful_end_download_confirms_exact_submitted_ranges() {
+        let mut facts = ProgramExecutionFacts::new();
+        facts.dispatch_side_effect();
+        facts.submit(0x2000, 32);
+        facts.confirm_submitted();
+        assert_eq!(facts.confirmed_ranges, facts.submitted_ranges);
+        assert_eq!(facts.flash_modified, FlashModifiedState::True);
+    }
+
+    #[test]
+    fn every_failure_stage_preserves_current_and_last_completed_facts() {
+        let stages = [
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+            ProgramStage::SegmentCommit,
+            ProgramStage::EndDownload,
+            ProgramStage::VerifyPreparation,
+            ProgramStage::RangeVerification,
+            ProgramStage::FinalState,
+        ];
+        for (index, current) in stages.into_iter().enumerate() {
+            let mut facts = ProgramExecutionFacts::new();
+            facts.current_stage = current;
+            facts.last_completed_stage = index.checked_sub(1).map(|previous| stages[previous]);
+            if index >= 2 {
+                facts.dispatch_side_effect();
+            }
+            let error = if facts.side_effect_dispatched {
+                facts.uncertain_error(&JlinkError::new(
+                    ErrorCode::TargetConnectFailed,
+                    "injected stage failure",
+                    false,
+                ))
+            } else {
+                facts.known_error(JlinkError::new(
+                    ErrorCode::TargetConnectFailed,
+                    "injected stage failure",
+                    false,
+                ))
+            };
+            let details = error.details.expect("stage facts");
+            assert_eq!(details["current_stage"], json!(current));
+            assert_eq!(
+                details["last_completed_stage"],
+                index
+                    .checked_sub(1)
+                    .map_or(serde_json::Value::Null, |previous| json!(stages[previous]))
+            );
+            assert_eq!(details["retry_safe"], json!(false));
+        }
+    }
 }

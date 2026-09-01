@@ -14,20 +14,24 @@ use jlink_capture::{
     decode_cursor, encode_cursor, event_change_relations, overview, window,
 };
 use jlink_domain::{
-    AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
-    DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
-    MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
-    ValidationAfter, VariableSelector, WriteVerify, probe_identity_hash,
+    AccessLayout, AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister,
+    DebugRequest, DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage,
+    FlashRange, HssEvidenceKind, HssRawEndianness, HssRawSelector, HssRawValueType, HssReturnWhen,
+    HssRunSnapshot, HssRunState, HssSelectorPlan, HssStartPlan, HssThresholdRule, JlinkError,
+    MemoryRange, ProfileConflict, ProfileConflictSeverity, ProfileSource, ProfileSourceKind,
+    ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter,
+    VariableSelector, WriteVerify, canonical_device_name, probe_identity_hash,
 };
 use serde_json::{Map, Value, json};
 
 use crate::{
     config::{
-        CaptureConfig, ConfigFile, ConfigPaths, ConfigScope, ConfigSetState, FirmwareConfig,
-        JlinkConfig, ProbeConfig, ResolvedConfig, SymbolsConfig, TargetConfig, config_set,
-        resolve_config, validate_dll_identity,
+        CaptureConfig, ConfigFile, ConfigPaths, ConfigScope, ConfigSetState, ConfigSource,
+        FirmwareConfig, FlashProfileConfig, JlinkConfig, ProbeConfig, ProfileRegionConfig,
+        ResolvedConfig, SymbolsConfig, TargetConfig, apply_session_patch, config_set,
+        inspect_config, resolve_config_with_session, validate_dll_identity,
     },
+    discovery::{ProjectDiscovery, discover_project},
     mcp::{ToolCall, ToolDispatcher},
     symbols::{SymbolCache, SymbolIndex},
     worker_client::{WorkerAttachment, WorkerLaunchSpec, attach_or_spawn},
@@ -41,6 +45,7 @@ pub struct Runtime {
     capture_root: PathBuf,
     attachment: Option<WorkerAttachment>,
     symbol_cache: SymbolCache,
+    session_config: ConfigFile,
 }
 
 struct CursorPageContext<'a> {
@@ -66,6 +71,7 @@ impl Runtime {
             capture_root,
             attachment: None,
             symbol_cache: SymbolCache::new(),
+            session_config: ConfigFile::default(),
         }
     }
 
@@ -78,8 +84,9 @@ impl Runtime {
     ///
     /// Returns stable configuration, image, DWARF, selector, value, identity, or
     /// HSS capability errors when the request cannot form one fixed sampling frame.
+    #[allow(clippy::too_many_lines)]
     pub fn prepare_hss_start(&mut self, arguments: &Value) -> Result<HssStartPlan, JlinkError> {
-        let (index, firmware) = self.load_symbol_planning_context("HSS")?;
+        let resolved = self.resolve()?;
         let variables = arguments
             .get("variables")
             .and_then(Value::as_array)
@@ -90,27 +97,91 @@ impl Runtime {
                     false,
                 )
             })?;
-        let mut plans = Vec::with_capacity(variables.len());
-        for variable in variables {
-            let path = variable
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    JlinkError::new(ErrorCode::ValueInvalid, "HSS 顶层变量缺少 path", false)
+        let mut symbol_context: Option<(Arc<SymbolIndex>, FirmwareIdentityPlan)> = None;
+        let mut selectors = Vec::with_capacity(variables.len());
+        for (index, variable) in variables.iter().enumerate() {
+            if variable.get("kind").and_then(Value::as_str) == Some("raw_address") {
+                let address = parse_address(
+                    variable
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| hss_field_error(index, "address", "缺少十六进制地址"))?,
+                    "variables[].address",
+                )?;
+                let length = variable
+                    .get("length")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| hss_field_error(index, "length", "必须是 1..40 的整数"))?;
+                let value_type = parse_hss_raw_type(
+                    variable
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| hss_field_error(index, "type", "缺少 raw 类型"))?,
+                    index,
+                )?;
+                let endianness = match variable.get("endianness").and_then(Value::as_str) {
+                    Some("little") => HssRawEndianness::Little,
+                    Some("big") => HssRawEndianness::Big,
+                    _ => {
+                        return Err(hss_field_error(index, "endianness", "必须为 little 或 big"));
+                    }
+                };
+                let range = MemoryRange::new(address, u64::from(length))?;
+                let allowed_region = resolved
+                    .profile
+                    .readable_ram
+                    .iter()
+                    .copied()
+                    .find(|region| {
+                        region.address() <= range.address()
+                            && range.end() <= region.address().saturating_add(region.length())
+                    })
+                    .ok_or_else(|| {
+                        hss_field_error(
+                            index,
+                            "address",
+                            "raw 范围必须完整位于 Profile readable RAM",
+                        )
+                        .with_detail("address", json!(format!("0x{address:X}")))
+                        .with_detail("length", json!(length))
+                    })?;
+                selectors.push(HssSelectorPlan::Raw(HssRawSelector::new(
+                    address,
+                    value_type,
+                    length,
+                    endianness,
+                    allowed_region,
+                )?));
+            } else {
+                if symbol_context.is_none() {
+                    symbol_context = Some(self.load_symbol_planning_context("HSS")?);
+                }
+                let path = variable
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| hss_field_error(index, "path", "DWARF 选择项缺少 path"))?;
+                let selector = VariableSelector::new(path, element_slice(variable)?)?;
+                let (symbol_index, _) = symbol_context.as_ref().ok_or_else(|| {
+                    JlinkError::new(
+                        ErrorCode::InvalidResponse,
+                        "DWARF HSS 规划上下文未建立",
+                        false,
+                    )
                 })?;
-            let selector = VariableSelector::new(path, element_slice(variable)?)?;
-            plans.push(self.symbol_cache.access_plan(&index, &selector)?);
+                selectors.push(HssSelectorPlan::Dwarf(
+                    self.symbol_cache.access_plan(symbol_index, &selector)?,
+                ));
+            }
         }
         let capture_key = arguments
             .get("capture_key")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                JlinkError::new(ErrorCode::ValueInvalid, "HSS 缺少 capture_key", false)
-            })?;
+            .unwrap_or("offline-plan");
         let duration_s = required_u32(arguments, "duration_s")?;
         let rate_hz = required_u32(arguments, "rate_hz")?;
         let return_when = match arguments.get("return_when").and_then(Value::as_str) {
-            Some("started") => HssReturnWhen::Started,
+            Some("started") | None => HssReturnWhen::Started,
             Some("completed") => HssReturnWhen::Completed,
             _ => {
                 return Err(JlinkError::new(
@@ -144,14 +215,14 @@ impl Runtime {
                 ));
             }
         };
-        HssStartPlan::new(
+        HssStartPlan::new_selectors(
             capture_key,
             duration_s,
             rate_hz,
             return_when,
-            plans,
+            selectors,
             rules,
-            firmware,
+            symbol_context.map(|(_, firmware)| firmware),
         )
     }
 
@@ -298,18 +369,67 @@ impl Runtime {
             self.attachment = None;
         }
         let report = result?;
-        Ok(ToolCall::success(
-            serde_json::to_value(report).map_err(serialization_error)?,
-        ))
+        let mut result = serde_json::to_value(report)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("ValidationReport serializes as an object")
+            .clone();
+        result.insert(
+            "profile_validation".to_owned(),
+            json!({
+                "device": resolved.profile.device,
+                "flash_profile": if resolved.profile.flash_regions.is_empty() { "unknown" } else { "available" },
+                "flash_regions": resolved.profile.flash_regions.len(),
+                "readable_ram_regions": resolved.profile.readable_ram.len(),
+                "loader_ram": if resolved.profile.loader_ram.is_some() { "available" } else { "unknown" },
+                "target_identity": resolved.profile.capabilities.target_identity,
+                "protection_state": resolved.profile.capabilities.protection_state,
+                "reset_reason": resolved.profile.capabilities.reset_reason,
+                "uid": resolved.profile.capabilities.uid,
+                "blocking_conflicts": resolved.profile.has_blocking_conflict(),
+            }),
+        );
+        Ok(ToolCall::success(Value::Object(result)))
     }
 
     fn config_get(&self) -> Result<ToolCall, JlinkError> {
-        let resolved = self.resolve()?;
-        Ok(ToolCall::success(resolved_config_result(&resolved)?))
+        let discovery = self.discover();
+        let inspection =
+            inspect_config(&self.session_config, &self.config_paths, &discovery.config)?;
+        let mut result = serde_json::to_value(&inspection)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("ConfigInspection serializes as an object")
+            .clone();
+        result.insert(
+            "provenance".to_owned(),
+            serde_json::to_value(&discovery.provenance).map_err(serialization_error)?,
+        );
+        result.insert(
+            "conflicts".to_owned(),
+            serde_json::to_value(&discovery.conflicts).map_err(serialization_error)?,
+        );
+        result.insert(
+            "diagnostics".to_owned(),
+            serde_json::to_value(&discovery.diagnostics).map_err(serialization_error)?,
+        );
+        if let Some(mut resolved) = inspection.resolved {
+            apply_discovery_profile(&mut resolved, &discovery);
+            result.insert(
+                "conflicts".to_owned(),
+                serde_json::to_value(&resolved.profile.conflicts).map_err(serialization_error)?,
+            );
+            result.insert(
+                "profile".to_owned(),
+                serde_json::to_value(resolved.profile).map_err(serialization_error)?,
+            );
+        }
+        Ok(ToolCall::success(Value::Object(result)))
     }
 
     fn config_set(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let scope = match arguments.get("scope").and_then(Value::as_str) {
+            Some("session") => ConfigScope::Session,
             Some("project") => ConfigScope::Project,
             Some("user") => ConfigScope::User,
             _ => unreachable!("MCP Schema guarantees config_set.scope"),
@@ -321,7 +441,11 @@ impl Runtime {
                 .expect("MCP Schema guarantees config_set.values"),
         )?;
         let state = self.config_set_state()?;
-        config_set(&self.config_paths, scope, &patch, state)?;
+        if scope == ConfigScope::Session {
+            apply_session_patch(&mut self.session_config, &patch, state)?;
+        } else {
+            config_set(&self.config_paths, scope, &patch, state)?;
+        }
         if let Some(attachment) = &self.attachment {
             attachment.client.disconnect()?;
         }
@@ -330,10 +454,24 @@ impl Runtime {
     }
 
     fn resolve(&self) -> Result<ResolvedConfig, JlinkError> {
-        resolve_config(
+        let discovery = self.discover();
+        let mut resolved = resolve_config_with_session(
             &ConfigFile::default(),
+            &self.session_config,
             &self.config_paths,
-            &ConfigFile::default(),
+            &discovery.config,
+        )?;
+        apply_discovery_profile(&mut resolved, &discovery);
+        Ok(resolved)
+    }
+
+    fn discover(&self) -> ProjectDiscovery {
+        discover_project(
+            self.config_paths
+                .project
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
         )
     }
 
@@ -403,6 +541,28 @@ impl Runtime {
             .get("action")
             .and_then(Value::as_str)
             .expect("MCP Schema guarantees program.action");
+        let loader_ram = if matches!(action, "flash" | "erase") {
+            if resolved.profile.has_blocking_conflict() {
+                return Err(JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "Flash Profile contains an unresolved high-risk conflict",
+                    false,
+                )
+                .with_detail("field", json!("profile.conflicts"))
+                .with_detail("conflicts", json!(resolved.profile.conflicts)));
+            }
+            Some(resolved.profile.loader_ram.ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "Flash programming requires profile.loader_ram for the no-Flash preflight",
+                    false,
+                )
+                .with_detail("field", json!("profile.loader_ram"))
+                .with_detail("rule", json!("required for flash and erase"))
+            })?)
+        } else {
+            None
+        };
         let request = match action {
             "flash" => ProgramRequest::Flash {
                 image: program_image_path(arguments, &resolved)?,
@@ -411,6 +571,7 @@ impl Runtime {
                     .get("verify")
                     .is_none_or(|value| value.as_bool().expect("Schema boolean")),
                 after: program_after(arguments)?,
+                loader_ram,
             },
             "erase" => ProgramRequest::Erase {
                 range: arguments
@@ -428,6 +589,7 @@ impl Runtime {
                     })
                     .transpose()?,
                 after: program_after(arguments)?,
+                loader_ram,
             },
             "verify" => ProgramRequest::Verify {
                 image: program_image_path(arguments, &resolved)?,
@@ -457,6 +619,7 @@ impl Runtime {
             .and_then(Value::as_str)
             .expect("MCP Schema guarantees hss.action")
         {
+            "plan" => self.plan_hss(arguments),
             "start" => self.start_hss(arguments),
             "status" => self.status_hss(arguments),
             "query" if arguments.get("cursor").is_some() => self.cursor_hss(arguments),
@@ -476,6 +639,11 @@ impl Runtime {
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
         }
+    }
+
+    fn plan_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let plan = self.prepare_hss_start(arguments)?;
+        Ok(ToolCall::success(hss_plan_result(&plan)?))
     }
 
     fn start_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -1021,8 +1189,26 @@ impl Runtime {
 
     fn inspect_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
+        let identity = match firmware.identity_block() {
+            Some(block) => json!({
+                "strength": "strong",
+                "elf_sha256": firmware.elf_sha256(),
+                "address": format!("0x{:X}", block.address()),
+                "length": block.bytes().len(),
+                "format_version": block.format_version(),
+                "build_id": block.build_id()
+            }),
+            None => json!({
+                "strength": "weak",
+                "elf_sha256": firmware.elf_sha256(),
+                "warning": "符号 ELF 缺少 __jlink_mcp_identity；DWARF 变量只读继续，但未证明目标固件与 ELF 一致"
+            }),
+        };
         match self.execute_debug(&DebugRequest::ReadVariable { plan, firmware })? {
-            DebugResult::Variable { value } => Ok(ToolCall::success(json!({ "value": value }))),
+            DebugResult::Variable { value } => Ok(ToolCall::success(json!({
+                "value": value,
+                "firmware_identity": identity
+            }))),
             DebugResult::Memory { .. } | DebugResult::Register { .. } | DebugResult::Written => {
                 Err(debug_response_error(
                     "Worker 对变量读取返回了错误的结果类型",
@@ -1074,6 +1260,7 @@ impl Runtime {
 
     fn write_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
+        firmware.ensure_strong()?;
         let request = DebugRequest::WriteVariable {
             plan,
             firmware,
@@ -1218,6 +1405,7 @@ impl Runtime {
             capture_root: self.capture_root.clone(),
             probe_identity: probe.value.to_string(),
             dll_path: resolved.jlink.dll_path.value.clone(),
+            dll_sha256: resolved.jlink.sha256.value.clone(),
         };
         self.attachment = Some(attach_or_spawn(&launch)?);
         Ok(())
@@ -1242,6 +1430,137 @@ fn project_capture_root(project_config: &Path) -> PathBuf {
         .unwrap_or_else(|| Path::new("."))
         .join(".jlink-mcp")
         .join("captures")
+}
+
+fn apply_discovery_profile(config: &mut ResolvedConfig, discovery: &ProjectDiscovery) {
+    let selected = canonical_device_name(&config.target.device.value);
+    config.profile.aliases = discovery
+        .provenance
+        .iter()
+        .filter(|value| {
+            value.field == "target.device"
+                && canonical_device_name(&value.value) == selected
+                && value.value != config.target.device.value
+        })
+        .map(|value| value.value.clone())
+        .collect();
+    config.profile.aliases.sort();
+    config.profile.aliases.dedup();
+    config.profile.conflicts.clone_from(&discovery.conflicts);
+    let explicit_device = matches!(
+        config.target.device.source,
+        ConfigSource::Request | ConfigSource::Session | ConfigSource::Project
+    );
+    downgrade_explicit_device_conflicts(&mut config.profile.conflicts, explicit_device);
+
+    let discovered_profile = config.profile.sources.iter().any(|source| {
+        source.kind == ProfileSourceKind::ProjectNative && source.locator == "discovered"
+    });
+    if discovered_profile {
+        let sources = discovered_profile_sources(discovery);
+        if !sources.is_empty() {
+            config.profile.sources = sources;
+        }
+    }
+}
+
+fn discovered_profile_sources(discovery: &ProjectDiscovery) -> Vec<ProfileSource> {
+    let mut sources = Vec::<ProfileSource>::new();
+    for value in discovery
+        .provenance
+        .iter()
+        .filter(|value| value.field.starts_with("profile."))
+    {
+        let kind = if value.adapter.starts_with("segger-") {
+            ProfileSourceKind::Segger
+        } else {
+            ProfileSourceKind::ProjectNative
+        };
+        if !sources
+            .iter()
+            .any(|source| source.kind == kind && source.locator == value.source)
+        {
+            sources.push(ProfileSource {
+                kind,
+                locator: value.source.clone(),
+            });
+        }
+    }
+    sources
+}
+
+fn downgrade_explicit_device_conflicts(conflicts: &mut [ProfileConflict], explicit_device: bool) {
+    if !explicit_device {
+        return;
+    }
+    for conflict in conflicts
+        .iter_mut()
+        .filter(|conflict| conflict.field == "target.device")
+    {
+        conflict.severity = ProfileConflictSeverity::Trace;
+    }
+}
+
+#[cfg(test)]
+mod discovery_profile_tests {
+    use jlink_domain::{ProfileConflict, ProfileConflictSeverity, ProfileSourceKind};
+
+    use super::{discovered_profile_sources, downgrade_explicit_device_conflicts};
+    use crate::discovery::{DiscoveryValue, ProjectDiscovery};
+
+    #[test]
+    fn explicit_device_resolves_only_device_conflicts() {
+        let mut conflicts = vec![
+            ProfileConflict {
+                field: "target.device".to_owned(),
+                severity: ProfileConflictSeverity::Blocking,
+                selected: "Z20K146M".to_owned(),
+                rejected: "Z20K146MC".to_owned(),
+                sources: vec!["app.xcl".to_owned(), "app.jlink".to_owned()],
+            },
+            ProfileConflict {
+                field: "profile.loader_ram".to_owned(),
+                severity: ProfileConflictSeverity::Blocking,
+                selected: "0x20000000:4096".to_owned(),
+                rejected: "0x20001000:4096".to_owned(),
+                sources: vec!["one.board".to_owned(), "two.jflash".to_owned()],
+            },
+        ];
+
+        downgrade_explicit_device_conflicts(&mut conflicts, true);
+
+        assert_eq!(conflicts[0].severity, ProfileConflictSeverity::Trace);
+        assert_eq!(conflicts[1].severity, ProfileConflictSeverity::Blocking);
+    }
+
+    #[test]
+    fn discovered_profile_sources_keep_exact_files_and_adapter_kind() {
+        let discovery = ProjectDiscovery {
+            provenance: vec![
+                DiscoveryValue {
+                    field: "profile.flash_regions".to_owned(),
+                    value: "0x0:65536".to_owned(),
+                    source: "device.board".to_owned(),
+                    adapter: "iar-board".to_owned(),
+                },
+                DiscoveryValue {
+                    field: "profile.loader_ram".to_owned(),
+                    value: "0x20000000:4096".to_owned(),
+                    source: "device.jflash".to_owned(),
+                    adapter: "segger-jflash".to_owned(),
+                },
+            ],
+            ..ProjectDiscovery::default()
+        };
+
+        let sources = discovered_profile_sources(&discovery);
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].kind, ProfileSourceKind::ProjectNative);
+        assert_eq!(sources[0].locator, "device.board");
+        assert_eq!(sources[1].kind, ProfileSourceKind::Segger);
+        assert_eq!(sources[1].locator, "device.jflash");
+    }
 }
 
 fn find_completed_snapshot(
@@ -1317,6 +1636,188 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
         );
     }
     Value::Object(result)
+}
+
+fn hss_plan_result(plan: &HssStartPlan) -> Result<Value, JlinkError> {
+    let variables = plan
+        .variables()
+        .iter()
+        .map(|variable| {
+            let mut value = Map::from_iter([
+                ("evidence".to_owned(), json!(variable.evidence_kind())),
+                ("series".to_owned(), json!(variable.series_label())),
+                (
+                    "address".to_owned(),
+                    json!(format!("0x{:X}", variable.address())),
+                ),
+                ("byte_length".to_owned(), json!(variable.byte_size())),
+                ("sample_offset".to_owned(), json!(variable.sample_offset())),
+            ]);
+            let leaf_fields = if variable.evidence_kind() == HssEvidenceKind::Dwarf {
+                let access = variable
+                    .access_plan()
+                    .expect("validated DWARF selector has an access plan");
+                let mut fields = Vec::new();
+                collect_hss_leaf_fields(
+                    access.layout(),
+                    access.selector().path(),
+                    0,
+                    access
+                        .selector()
+                        .slice()
+                        .map(jlink_domain::ElementSlice::start),
+                    &mut fields,
+                )?;
+                fields
+            } else {
+                let raw = variable
+                    .raw_selector()
+                    .expect("raw evidence has selector metadata");
+                value.insert("type".to_owned(), json!(raw.value_type().as_str()));
+                value.insert("endianness".to_owned(), json!(raw.endianness().as_str()));
+                value.insert(
+                    "allowed_region".to_owned(),
+                    serde_json::to_value(raw.allowed_region()).map_err(serialization_error)?,
+                );
+                vec![json!({
+                    "path": raw.series(),
+                    "byte_offset": 0,
+                    "byte_length": raw.length(),
+                    "type": raw.value_type().as_str()
+                })]
+            };
+            value.insert("leaf_fields".to_owned(), Value::Array(leaf_fields));
+            Ok(Value::Object(value))
+        })
+        .collect::<Result<Vec<_>, JlinkError>>()?;
+    let expected_samples = u64::from(plan.duration_s()) * u64::from(plan.rate_hz());
+    let frame = plan.frame_layout();
+    let estimated_storage_bytes = expected_samples.saturating_mul(u64::from(frame.record_bytes()));
+    Ok(json!({
+        "duration_s": plan.duration_s(),
+        "rate_hz": plan.rate_hz(),
+        "expected_samples": expected_samples,
+        "sample_bytes": frame.sample_bytes(),
+        "record_bytes": frame.record_bytes(),
+        "estimated_storage_bytes": estimated_storage_bytes,
+        "variables": variables,
+        "reduction_suggestions": [
+            "select fewer top-level fields",
+            "slice arrays before capture",
+            "split selectors across separate captures"
+        ]
+    }))
+}
+
+fn collect_hss_leaf_fields(
+    layout: &AccessLayout,
+    path: &str,
+    byte_offset: u64,
+    root_slice_start: Option<u64>,
+    fields: &mut Vec<Value>,
+) -> Result<(), JlinkError> {
+    match layout {
+        AccessLayout::Scalar {
+            name,
+            byte_size,
+            encoding,
+        } => fields.push(json!({
+            "path": path,
+            "byte_offset": byte_offset,
+            "byte_length": byte_size,
+            "type": name,
+            "encoding": encoding
+        })),
+        AccessLayout::Pointer { byte_size } => fields.push(json!({
+            "path": path,
+            "byte_offset": byte_offset,
+            "byte_length": byte_size,
+            "type": "pointer"
+        })),
+        AccessLayout::Structure { members, .. } | AccessLayout::Union { members, .. } => {
+            for member in members {
+                collect_hss_leaf_fields(
+                    member.layout(),
+                    &format!("{path}.{}", member.name()),
+                    byte_offset
+                        .checked_add(member.byte_offset())
+                        .ok_or_else(|| {
+                            JlinkError::new(
+                                ErrorCode::HssUnsupported,
+                                "HSS leaf byte offset 溢出",
+                                false,
+                            )
+                        })?,
+                    None,
+                    fields,
+                )?;
+            }
+        }
+        AccessLayout::Array {
+            element,
+            count: Some(count),
+        } => {
+            let element_bytes = element.byte_size().ok_or_else(|| {
+                JlinkError::new(ErrorCode::HssUnsupported, "HSS array 元素长度未知", false)
+            })?;
+            let start = root_slice_start.unwrap_or(0);
+            for local_index in 0..*count {
+                let actual_index = start.checked_add(local_index).ok_or_else(|| {
+                    JlinkError::new(ErrorCode::HssUnsupported, "HSS slice 数组索引溢出", false)
+                })?;
+                collect_hss_leaf_fields(
+                    element,
+                    &format!("{path}[{actual_index}]"),
+                    byte_offset
+                        .checked_add(local_index.saturating_mul(element_bytes))
+                        .ok_or_else(|| {
+                            JlinkError::new(
+                                ErrorCode::HssUnsupported,
+                                "HSS array leaf byte offset 溢出",
+                                false,
+                            )
+                        })?,
+                    None,
+                    fields,
+                )?;
+            }
+        }
+        AccessLayout::Array { count: None, .. } => {
+            return Err(JlinkError::new(
+                ErrorCode::HssUnsupported,
+                "HSS plan 不能包含未切片的不定长数组",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hss_field_error(index: usize, field: &str, message: &str) -> JlinkError {
+    JlinkError::new(ErrorCode::ValueInvalid, message, false)
+        .with_detail("field", json!(format!("variables[{index}].{field}")))
+        .with_detail("selector_index", json!(index))
+}
+
+fn parse_hss_raw_type(value: &str, index: usize) -> Result<HssRawValueType, JlinkError> {
+    match value {
+        "bytes" => Ok(HssRawValueType::Bytes),
+        "u8" => Ok(HssRawValueType::U8),
+        "u16" => Ok(HssRawValueType::U16),
+        "u32" => Ok(HssRawValueType::U32),
+        "u64" => Ok(HssRawValueType::U64),
+        "i8" => Ok(HssRawValueType::I8),
+        "i16" => Ok(HssRawValueType::I16),
+        "i32" => Ok(HssRawValueType::I32),
+        "i64" => Ok(HssRawValueType::I64),
+        "f32" => Ok(HssRawValueType::F32),
+        "f64" => Ok(HssRawValueType::F64),
+        _ => Err(hss_field_error(
+            index,
+            "type",
+            "必须为 bytes/u8/u16/u32/u64/i8/i16/i32/i64/f32/f64",
+        )),
+    }
 }
 
 fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
@@ -1658,6 +2159,11 @@ fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {
         .then(|| CaptureConfig {
             max_bytes: optional_u64(values, "capture.max_bytes"),
         });
+    let profile = values
+        .keys()
+        .any(|key| key.starts_with("profile."))
+        .then(|| profile_patch(values))
+        .transpose()?;
     Ok(ConfigFile {
         target,
         symbols,
@@ -1665,6 +2171,67 @@ fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {
         jlink,
         probe,
         capture,
+        profile,
+    })
+}
+
+fn profile_patch(values: &Map<String, Value>) -> Result<FlashProfileConfig, JlinkError> {
+    let flash_regions = values
+        .get("profile.flash_regions")
+        .map(profile_regions)
+        .transpose()?
+        .unwrap_or_default();
+    let readable_ram = values
+        .get("profile.readable_ram")
+        .map(profile_regions)
+        .transpose()?
+        .unwrap_or_default();
+    let loader_ram = values
+        .get("profile.loader_ram")
+        .map(profile_region)
+        .transpose()?;
+    let capabilities = values
+        .get("profile.capabilities")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("profile.capabilities 结构无效：{error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(FlashProfileConfig {
+        flash_regions,
+        readable_ram,
+        loader_ram,
+        capabilities,
+    })
+}
+
+fn profile_regions(value: &Value) -> Result<Vec<ProfileRegionConfig>, JlinkError> {
+    value
+        .as_array()
+        .ok_or_else(|| config_value_error("profile regions"))?
+        .iter()
+        .map(profile_region)
+        .collect()
+}
+
+fn profile_region(value: &Value) -> Result<ProfileRegionConfig, JlinkError> {
+    let address = value
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| config_value_error("profile region.address"))?;
+    let length = value
+        .get("length")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| config_value_error("profile region.length"))?;
+    Ok(ProfileRegionConfig {
+        address: parse_address(address, "profile region.address")?,
+        length,
     })
 }
 
@@ -1690,80 +2257,6 @@ fn optional_u32(values: &Map<String, Value>, key: &str) -> Result<Option<u32>, J
 
 fn optional_u64(values: &Map<String, Value>, key: &str) -> Option<u64> {
     values.get(key).and_then(Value::as_u64)
-}
-
-fn resolved_config_result(config: &ResolvedConfig) -> Result<Value, JlinkError> {
-    let mut effective = Map::new();
-    let mut sources = Map::new();
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.device",
-        &config.target.device,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.interface",
-        &config.target.interface,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.speed_khz",
-        &config.target.speed_khz,
-    )?;
-    if let Some(field) = &config.symbols.elf {
-        insert_resolved(&mut effective, &mut sources, "symbols.elf", field)?;
-    }
-    if let Some(field) = &config.firmware.image {
-        insert_resolved(&mut effective, &mut sources, "firmware.image", field)?;
-    }
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_path",
-        &config.jlink.dll_path,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_version",
-        &config.jlink.version,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_sha256",
-        &config.jlink.sha256,
-    )?;
-    if let Some(field) = &config.probe.serial {
-        insert_resolved(&mut effective, &mut sources, "probe.serial", field)?;
-    }
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "capture.max_bytes",
-        &config.capture.max_bytes,
-    )?;
-    Ok(json!({ "effective": effective, "sources": sources }))
-}
-
-fn insert_resolved<T: serde::Serialize>(
-    effective: &mut Map<String, Value>,
-    sources: &mut Map<String, Value>,
-    name: &str,
-    field: &crate::config::ResolvedField<T>,
-) -> Result<(), JlinkError> {
-    effective.insert(
-        name.to_owned(),
-        serde_json::to_value(&field.value).map_err(serialization_error)?,
-    );
-    sources.insert(
-        name.to_owned(),
-        serde_json::to_value(field.source).map_err(serialization_error)?,
-    );
-    Ok(())
 }
 
 fn serialization_error(error: serde_json::Error) -> JlinkError {
@@ -2006,5 +2499,101 @@ mod hss_state_tests {
         assert!(result.get("quality").is_none());
         assert!(result.get("from_us").is_none());
         assert!(result.get("to_us").is_none());
+    }
+}
+
+#[cfg(test)]
+mod hss_plan_tests {
+    use std::fs;
+
+    use jlink_domain::{AccessLayout, ScalarEncoding};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{Runtime, collect_hss_leaf_fields, hss_plan_result};
+    use crate::config::ConfigPaths;
+
+    #[test]
+    fn raw_only_plan_is_offline_and_does_not_require_symbols_elf() {
+        let root = tempdir().expect("runtime fixture root");
+        let project = root.path().join("jlink-mcp.toml");
+        let user = root.path().join("user.toml");
+        fs::write(
+            &project,
+            format!(
+                r#"
+[target]
+device = "FixtureDevice"
+interface = "swd"
+speed_khz = 1000
+
+[jlink]
+dll_path = "C:/missing/JLink_x64.dll"
+version = "9.64"
+sha256 = "{}"
+
+[[profile.flash_regions]]
+address = 0
+length = 1048576
+
+[[profile.readable_ram]]
+address = 536870912
+length = 4096
+"#,
+                "11".repeat(32)
+            ),
+        )
+        .expect("project config");
+        fs::write(&user, "[probe]\nserial = 1\n").expect("user config");
+        let mut runtime = Runtime::new(
+            ConfigPaths::new(&project, &user),
+            root.path().join("jlink-worker.exe"),
+            root.path().join("leases"),
+        );
+        let plan = runtime
+            .prepare_hss_start(&json!({
+                "action": "plan",
+                "duration_s": 2,
+                "rate_hz": 100,
+                "variables": [{
+                    "kind": "raw_address",
+                    "address": "0x20000010",
+                    "type": "u32",
+                    "length": 4,
+                    "endianness": "little"
+                }]
+            }))
+            .expect("raw offline plan");
+        assert!(runtime.attachment.is_none());
+        assert!(plan.firmware().is_none());
+        let result = hss_plan_result(&plan).expect("plan result");
+        assert_eq!(result["expected_samples"], 200);
+        assert_eq!(result["sample_bytes"], 4);
+        assert_eq!(result["variables"][0]["evidence"], "raw_address");
+        assert_eq!(result["variables"][0]["series"], "raw_20000010_u32");
+        assert_eq!(
+            result["variables"][0]["leaf_fields"][0]["path"],
+            "raw_20000010_u32"
+        );
+    }
+
+    #[test]
+    fn sliced_dwarf_plan_reports_actual_array_indices() {
+        let layout = AccessLayout::Array {
+            element: Box::new(AccessLayout::Scalar {
+                name: "uint16_t".to_owned(),
+                byte_size: 2,
+                encoding: ScalarEncoding::Unsigned,
+            }),
+            count: Some(2),
+        };
+        let mut fields = Vec::new();
+        collect_hss_leaf_fields(&layout, "arr", 0, Some(5), &mut fields)
+            .expect("bounded slice leaves");
+
+        assert_eq!(fields[0]["path"], "arr[5]");
+        assert_eq!(fields[0]["byte_offset"], 0);
+        assert_eq!(fields[1]["path"], "arr[6]");
+        assert_eq!(fields[1]["byte_offset"], 2);
     }
 }

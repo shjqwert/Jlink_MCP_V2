@@ -7,6 +7,7 @@ mod hss;
 mod image;
 mod ipc;
 mod memory;
+mod profile;
 mod program;
 mod session;
 mod state;
@@ -23,17 +24,20 @@ pub use hss::{
     HSS_MAX_TOP_LEVEL_SELECTORS, HSS_MIN_DURATION_S, HSS_MIN_RATE_HZ,
     HSS_START_FLAG_TIMESTAMP_US_EXPERIMENTAL, HSS_START_FLAGS_698A_MAINLINE, HssCapabilities,
     HssCaptureReservation, HssCaptureState, HssClockEvidence, HssClockMappingMethod,
-    HssCrossingDirection, HssDataIntegrity, HssDrainTiming, HssFrameBatch, HssFrameLayout,
-    HssIntervalStatistics, HssLossAssessment, HssNormalizedTimeUnit, HssOverflowAssessment,
-    HssQualityBasis, HssQualityEvent, HssQualityEventKind, HssQualityEvidence, HssQualitySummary,
-    HssQualityTracker, HssRawFrame, HssRecoveryNotification, HssReservationOutcome, HssReturnWhen,
-    HssRunSnapshot, HssRunState, HssSourceTimeUnit, HssStartPlan, HssStartRegistry,
-    HssThresholdRule, HssVariablePlan, HssWriteKind, HssWriteResult, HssWriteTiming,
-    compare_numeric_typed_values, normalize_hss_rules, normalize_hss_timestamp_us,
+    HssCrossingDirection, HssDataIntegrity, HssDrainTiming, HssEvidenceKind, HssFrameBatch,
+    HssFrameLayout, HssIntervalStatistics, HssLossAssessment, HssNormalizedTimeUnit,
+    HssOverflowAssessment, HssQualityBasis, HssQualityEvent, HssQualityEventKind,
+    HssQualityEvidence, HssQualityReasonCode, HssQualitySummary, HssQualityTracker,
+    HssRateAssessment, HssRawEndianness, HssRawFrame, HssRawSelector, HssRawValueType,
+    HssRecoveryNotification, HssReservationOutcome, HssReturnWhen, HssRunSnapshot, HssRunState,
+    HssSelectorPlan, HssSourceTimeUnit, HssStartPlan, HssStartRegistry, HssThresholdRule,
+    HssVariablePlan, HssWriteKind, HssWriteResult, HssWriteTiming, compare_numeric_typed_values,
+    normalize_hss_rules, normalize_hss_timestamp_us,
 };
 pub use image::{
-    FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,
-    FirmwareSegmentFingerprint,
+    FIRMWARE_IDENTITY_SYMBOL, FirmwareFormat, FirmwareIdentityBlock, FirmwareIdentityPlan,
+    FirmwareIdentityStrength, FirmwareImage, FirmwareSegment, FirmwareSegmentFingerprint,
+    MAX_FIRMWARE_IDENTITY_BYTES,
 };
 pub use ipc::{
     IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, ProtocolVersion, RequestId, SessionCommand,
@@ -45,9 +49,14 @@ pub use memory::{
     MergedMemoryRead, WriteVerify, merge_safe_memory_reads, validate_write_count,
     verify_memory_readback,
 };
+pub use profile::{
+    CapabilityState, FlashProfile, ProfileConflict, ProfileConflictSeverity, ProfileSource,
+    ProfileSourceKind, TargetCapabilities, canonical_device_name,
+};
 pub use program::{
-    FlashRange, FlashRegion, ProgramAfter, ProgramRequest, VerifyMismatch,
-    VerifyMismatchAccumulator, validate_flash_range, validate_image_flash_ranges,
+    FlashModifiedState, FlashRange, FlashRegion, ProgramAfter, ProgramExecutionFacts,
+    ProgramRangeFact, ProgramRequest, ProgramStage, VerifyMismatch, VerifyMismatchAccumulator,
+    validate_flash_range, validate_image_flash_ranges,
 };
 pub use session::{
     FaultDiagnostics, RecoveryAction, RecoveryNotification, TargetConnectionSpec, ValidationAfter,

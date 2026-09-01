@@ -1,6 +1,8 @@
 use std::{
     collections::BTreeMap,
     ffi::OsString,
+    fmt::Write as _,
+    fs,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::PathBuf,
     sync::mpsc::{self, RecvTimeoutError},
@@ -9,10 +11,12 @@ use std::{
 };
 
 use jlink_domain::{
-    DebugRequest, ErrorCode, HssWriteKind, IpcRequest, IpcResponse, JlinkError, ProtocolVersion,
-    SessionCommand, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+    DebugRequest, ErrorCode, HssWriteKind, IpcRequest, IpcResponse, JlinkError, MemoryRange,
+    MemoryRegionKind, ProtocolVersion, SessionCommand, probe_identity_hash, read_ipc_frame,
+    worker_endpoint_name, write_ipc_frame,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use windows_sys::Win32::{
     Foundation::{GetLastError, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
@@ -40,6 +44,8 @@ pub struct WorkerOptions {
     pub probe_identity: String,
     /// Identity-validated J-Link x64 DLL path.
     pub dll_path: PathBuf,
+    /// Actual validated SHA-256 of the configured J-Link x64 DLL.
+    pub dll_sha256: String,
     /// MCP process whose unexpected exit bounds this Worker's lifetime.
     pub parent_pid: u32,
 }
@@ -76,7 +82,12 @@ impl WorkerOptions {
         for pair in pairs {
             if !matches!(
                 pair[0].as_str(),
-                "--lease-root" | "--capture-root" | "--probe" | "--dll" | "--parent-pid"
+                "--lease-root"
+                    | "--capture-root"
+                    | "--probe"
+                    | "--dll"
+                    | "--dll-sha256"
+                    | "--parent-pid"
             ) {
                 return Err(JlinkError::new(
                     ErrorCode::ConfigInvalid,
@@ -115,11 +126,20 @@ impl WorkerOptions {
                 false,
             ));
         }
+        let dll_sha256 = required("--dll-sha256")?;
+        if dll_sha256.len() != 64 || !dll_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "Worker --dll-sha256 必须是 64 位十六进制摘要",
+                false,
+            ));
+        }
         Ok(Self {
             lease_root: PathBuf::from(required("--lease-root")?),
             capture_root: PathBuf::from(required("--capture-root")?),
             probe_identity: required("--probe")?,
             dll_path: PathBuf::from(required("--dll")?),
+            dll_sha256: dll_sha256.to_ascii_lowercase(),
             parent_pid,
         })
     }
@@ -535,8 +555,37 @@ impl WorkerRuntime {
                     &mut self.gateway,
                     |gateway| {
                         session.ensure_hss_start_allowed(&target)?;
-                        ensure_firmware_identity(session, gateway, plan.firmware())?;
-                        gateway.hss_capabilities()?.validate_start(&plan)
+                        if let Some(firmware) = plan.firmware() {
+                            ensure_firmware_identity(session, gateway, &target, firmware, true)?;
+                        }
+                        let raw_ranges = plan
+                            .variables()
+                            .iter()
+                            .filter_map(|variable| variable.raw_selector())
+                            .map(|selector| {
+                                selector.validate()?;
+                                MemoryRange::new(selector.address(), u64::from(selector.length()))
+                            })
+                            .collect::<Result<Vec<_>, JlinkError>>()?;
+                        if !raw_ranges.is_empty() {
+                            let memory_map = gateway.device_memory_map(target.device())?;
+                            for range in raw_ranges {
+                                if memory_map.classify(range)? != MemoryRegionKind::Ram {
+                                    return Err(JlinkError::new(
+                                        ErrorCode::AddressOutOfRange,
+                                        "raw-address HSS 范围不在 J-Link 设备数据库 RAM 内",
+                                        false,
+                                    )
+                                    .with_detail(
+                                        "address",
+                                        json!(format!("0x{:X}", range.address())),
+                                    )
+                                    .with_detail("length", json!(range.length())));
+                                }
+                            }
+                        }
+                        let capabilities = gateway.hss_capabilities()?;
+                        gateway.assess_hss_rate(&plan, capabilities)
                     },
                 )?;
                 if outcome.started_new {
@@ -791,6 +840,17 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
         options.capture_root.join(&identity_hash),
         &options.probe_identity,
     )?;
+    let actual_dll_sha256 = sha256_file(&options.dll_path)?;
+    if actual_dll_sha256 != options.dll_sha256 {
+        return Err(JlinkError::new(
+            ErrorCode::ConfigInvalid,
+            "Worker 重新计算的 J-Link DLL SHA-256 与启动参数不一致",
+            false,
+        )
+        .with_detail("dll_path", json!(options.dll_path.display().to_string()))
+        .with_detail("expected_sha256", json!(options.dll_sha256))
+        .with_detail("actual_sha256", json!(actual_dll_sha256)));
+    }
     let gateway = DllGateway::load(&options.dll_path)?;
     let mut runtime = WorkerRuntime {
         probe_identity: options.probe_identity.clone(),
@@ -798,7 +858,7 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
         probe_identity_hash: identity_hash,
         _lease: lease,
         gateway,
-        session: TargetSessionManager::new(),
+        session: TargetSessionManager::new(options.dll_sha256.clone()),
         hss,
     };
     let (request_tx, request_rx) = mpsc::channel();
@@ -856,6 +916,22 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
     }
 }
 
+fn sha256_file(path: &std::path::Path) -> Result<String, JlinkError> {
+    let data = fs::read(path).map_err(|error| {
+        JlinkError::new(
+            ErrorCode::ConfigInvalid,
+            format!("Worker 无法读取 J-Link DLL 以验证摘要：{error}"),
+            false,
+        )
+        .with_detail("dll_path", json!(path.display().to_string()))
+    })?;
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(&data) {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    Ok(encoded)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -878,6 +954,8 @@ mod tests {
             OsString::from("260106173"),
             OsString::from("--dll"),
             OsString::from("JLink_x64.dll"),
+            OsString::from("--dll-sha256"),
+            OsString::from("ab".repeat(32)),
             OsString::from("--parent-pid"),
             OsString::from("42"),
         ])
@@ -901,6 +979,7 @@ mod tests {
             base_address: Some(0),
             verify: true,
             after: ProgramAfter::ResetRun,
+            loader_ram: None,
         };
         let valid = IpcRequest::new(
             ProtocolVersion::V1,

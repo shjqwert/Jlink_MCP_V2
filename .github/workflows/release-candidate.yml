@@ -35,10 +35,12 @@ jobs:
           cargo test --locked --release --workspace --target x86_64-pc-windows-msvc --target-dir target/distribution-build
           if ($LASTEXITCODE -ne 0) { throw 'Static CRT release tests failed' }
       - name: Build the immutable candidate archive
+        id: build
         shell: pwsh
         run: |
           $result = ./scripts/build-release.ps1
           $result | ConvertTo-Json -Depth 6 | Set-Content target/candidate-result.json -Encoding utf8
+          "version=$($result.version)" >> $env:GITHUB_OUTPUT
       - name: Verify package integrity on Windows PowerShell 5.1
         id: package_checks
         shell: powershell
@@ -54,7 +56,7 @@ jobs:
         if: always() && steps.package_checks.outcome == 'success'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: jlink-mcp-V1.0.0-windows-x64-candidate
+          name: jlink-mcp-V${{ steps.build.outputs.version }}-windows-x64-candidate
           if-no-files-found: error
           retention-days: 14
           path: |

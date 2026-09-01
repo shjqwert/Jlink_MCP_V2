@@ -1,30 +1,82 @@
 ---
 name: jlink-mcp
-description: Use the jlink_mcp MCP server to configure, connect, program, inspect, write, control, or capture data from one local SEGGER J-Link ARM Cortex-M target. Trigger for explicit J-Link MCP operations and requests that require its fixed-duration HSS capture data; do not trigger for general embedded advice, unrelated probes, GDB, RTT, or arbitrary J-Link Commander work.
+description: Use jlink_mcp with one local SEGGER J-Link ARM Cortex-M target for configuration, programming, inspection, writes, control, and high-speed capture. Applies to J-Link MCP operations and debugging needing repeated/time-series data; not general embedded advice, GDB, RTT, unrelated probes, or J-Link Commander.
 ---
 
 # J-Link MCP
 
-Operate the fixed six-tool V1 contract. Use the current `jlink_mcp` tool definitions as the sole syntax authority; this skill adds routing, state rules, result semantics, and failure handling.
+Operate the fixed six-tool V1 contract. Live tool definitions are the sole syntax
+authority; this self-contained Skill supplies routing, lifecycle state, result
+semantics, and recovery. Do not load runtime references or recreate a Schema here.
 
-## Route the request
+## Route precisely
 
-| Intent | Tool and actions | Read first |
+| Intent | Tool and actions | Boundary |
 |---|---|---|
-| Configure or manage the target session | `jlink_target`: `config_get`, `config_set`, `connect`, `disconnect`, `status`, `validate` | [target-session.md](references/target-session.md) |
-| Program or verify Flash | `jlink_program`: `flash`, `erase`, `verify` | [programming.md](references/programming.md) |
-| Read or discover values | `jlink_inspect`: `variable`, `memory`, `register`, `symbols` | [debug-access.md](references/debug-access.md) |
-| Write values or control execution | `jlink_write`: `variable`, `memory`, `register`; `jlink_control`: `halt`, `resume`, `reset`, `step` | [debug-access.md](references/debug-access.md) |
-| Capture or query high-speed data | `jlink_hss`: `start`, `status`, `query` | [hss.md](references/hss.md) |
+| Configure/connect/target | `jlink_target`: `config_get`, `config_set`, `connect`, `disconnect`, `status`, `validate` | Config is offline; connect can change CPU state. |
+| Flash/erase/compare | `jlink_program`: `flash`, `erase`, `verify` | Flash uses this path; verify does not reset. |
+| Symbols/live reads | `jlink_inspect`: `symbols`, `variable`, `memory`, `register` | Symbols are offline; other reads need a live session. |
+| Write a value | `jlink_write`: `variable`, `memory`, `register` | `variable`/`memory` may request `verify: readback`; never write Flash here. |
+| CPU execution | `jlink_control`: `halt`, `resume`, `reset`, `step` | Use explicit transitions; no implicit halt/reset. |
+| Plan/capture/query high-speed data | `jlink_hss`: `plan`, `start`, `status`, `query` | Plan is offline; start persists a fixed capture. |
 
-Read only the relevant business reference. Read [errors.md](references/errors.md) after a non-success result, a lost response, or an uncertain side effect; do not load it for an ordinary successful call.
+Use `inspect.symbols` when an ELF or DWARF path is unknown, and `hss.query` for
+persisted data. A single live value routes to `inspect`; repeated samples,
+transitions, duration, or high-rate observation routes to `hss.plan` then `start`.
+HSS has no stop action.
 
-## Invariants for every call
+`target.status` reports connection/CPU; `hss.status` reports capture lifecycle and
+quality. Neither replaces the other. `program.verify` compares image to Flash;
+`readback` is a `jlink_write.variable`/`memory` verify mode, not an action or a
+follow-up inspect call. Inspect is current state; HSS query is historical data.
 
-1. Use only the current `jlink_mcp` server. Choose one declared `action` and send the smallest object accepted by its live strict Schema; do not invent wrappers, aliases, defaults, or extra fields.
-2. Reuse trustworthy state established in the current MCP/Worker lifecycle. Do not insert target `status` between consecutive operations; query only when state is unknown, invalidated, or contradicted. Earlier tasks, UI state, and configuration do not prove a live connection.
-3. Successful `structuredContent` is authoritative and `{}` means completed success. On failure, load `errors.md` and use `structuredContent.error`; never replay an uncertain side effect automatically.
-4. Offline operations must not connect. A necessary live connection can resume or reset-plus-resume the CPU, so follow `target-session.md` and report notices; a read request never authorizes programming, writes, or mutating control.
-5. During active HSS, only target `status`, HSS `status/query`, and variable or RAM/MMIO writes are allowed. Other device operations conflict; accepted writes are serialized with capture drain.
+## Call and state invariants
 
-Current release evidence covers Windows x64 and SWD. The Schema can represent JTAG, but JTAG has not passed the hardware release gate; disclose that limitation instead of claiming verified support.
+1. Before every call, use the current live Schema and send the smallest accepted
+   object. Fields, types, defaults, enums, and ranges never come from this Skill.
+   On a parameter error, stop a batch immediately; do not guess, truncate,
+   substitute, or continue. Preserve returned field path, rule/range, and value.
+2. Reuse trustworthy target, CPU, validation, and HSS state from successful calls
+   in the current MCP/Worker lifecycle. Do not add `target.status` between
+   consecutive operations merely to reconfirm state. Query it after reconnect,
+   an uncertain result, invalidation, or contradiction. UI state, another task,
+   and configuration files do not prove a live connection.
+3. Offline configuration, symbol lookup, HSS planning, and persisted-capture
+   queries must not connect. A live read may establish its required session and
+   must report any resume/reset notice; a read never authorizes a write, program,
+   erase, or control action. Keep implicit Skill invocation enabled for routine
+   debugging and apply this routing automatically.
+4. During active HSS, only target status, HSS status/query, and serialized variable
+   or RAM/MMIO writes are allowed. Programming, erase, ordinary reads, register
+   access, control, and disconnect conflict; never queue them or use disconnect
+   to cancel capture.
+
+## Side effects and recovery
+
+- Treat `{}` as successful completion, not missing output and not permission to
+  repeat. Flash, erase, writes, control, and a new connection can change hardware.
+- On failure or a lost response, inspect `structuredContent.error` (code, message,
+  retryability, and details). If execution or side effects are uncertain, never
+  replay program/write/control; reconcile state and obtain safe read-only evidence
+  or ask how to proceed. An HSS `start` may recover only with the same key and an
+  equivalent request in the same lifecycle. A new lifecycle or changed request
+  needs a new key.
+
+## HSS evidence and pagination
+
+`hss.plan` expands selectors without occupying the probe and returns size/reduction
+guidance; `start` uses the same planner. Raw-address selectors are explicit
+address/type/length/endianness evidence restricted to declared readable RAM. They
+are not DWARF variables and must not receive symbol semantics. DWARF selectors
+require strong firmware identity. Requested rate is not achieved rate: report
+actual samples and quality fields. Without independent overflow/sequence evidence,
+never claim that no samples were lost.
+
+For HSS `status`/`query`, provide exactly one capture identity. A continuation uses
+the same identity and cursor with `action: query`, omitting prior view-specific
+fields. `CURSOR_INVALID` and `CURSOR_EXPIRED` end that chain; never silently restart
+page one. Lifecycle and integrity/quality are independent facts, so preserve
+degraded or unknown evidence.
+
+Release evidence covers Windows x64/SWD; JTAG is Schema-supported, not
+hardware-release-verified.

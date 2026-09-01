@@ -39,7 +39,7 @@ pub fn encode_typed_value(
     Ok(encoded)
 }
 
-fn decode_layout(
+pub(crate) fn decode_layout(
     layout: &AccessLayout,
     data: &[u8],
     bit_range: Option<BitRange>,

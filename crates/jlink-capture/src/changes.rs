@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use jlink_domain::{
-    AccessLayout, ErrorCode, HssRunState, HssThresholdRule, HssVariablePlan, JlinkError,
-    ScalarEncoding, VariableSelector, decode_typed_value, normalize_hss_rules,
-    normalize_hss_timestamp_us,
+    AccessLayout, ErrorCode, HssEvidenceKind, HssRunState, HssThresholdRule, HssVariablePlan,
+    JlinkError, ScalarEncoding, VariableSelector, normalize_hss_rules, normalize_hss_timestamp_us,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -177,14 +176,26 @@ pub(crate) fn series_catalog(
 ) -> Result<Vec<SeriesDescriptor>, JlinkError> {
     let mut catalog = Vec::new();
     for (top_level, variable) in snapshot.plan().variables().iter().enumerate() {
-        let base = variable.access_plan().selector().path();
+        if variable.evidence_kind() == HssEvidenceKind::RawAddress {
+            catalog.push(SeriesDescriptor {
+                id: format!("s{top_level}"),
+                path: variable.series_label(),
+                top_level,
+                value_steps: Vec::new(),
+                numeric: variable.is_raw_numeric(),
+            });
+            continue;
+        }
+        let access = variable
+            .access_plan()
+            .expect("validated DWARF selector has an access plan");
+        let base = access.selector().path();
         let mut leaves = Vec::new();
         append_layout_leaves(
-            variable.access_plan().layout(),
+            access.layout(),
             base,
             &mut Vec::new(),
-            variable
-                .access_plan()
+            access
                 .selector()
                 .slice()
                 .map(jlink_domain::ElementSlice::start),
@@ -567,13 +578,12 @@ pub(crate) fn decode_frame(
         .map(|variable| {
             let start = usize::try_from(variable.sample_offset())
                 .map_err(|_| query_frame_invalid("HSS sample_offset 无法表示为 usize"))?;
-            let size = usize::try_from(variable.access_plan().byte_size())
+            let size = usize::try_from(variable.byte_size())
                 .map_err(|_| query_frame_invalid("HSS byte_size 无法表示为 usize"))?;
             let end = start
                 .checked_add(size)
                 .ok_or_else(|| query_frame_invalid("HSS 样本变量范围溢出"))?;
-            decode_typed_value(
-                variable.access_plan(),
+            variable.decode_value(
                 sample
                     .get(start..end)
                     .ok_or_else(|| query_frame_invalid("HSS 样本变量范围越界"))?,

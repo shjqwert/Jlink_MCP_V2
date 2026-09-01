@@ -1,7 +1,7 @@
 use jlink_domain::{
     DebugRequest, DebugResult, DeviceMemoryMap, ErrorCode, FirmwareIdentityPlan,
-    FirmwareSegmentFingerprint, JlinkError, MemoryRange, WriteVerify, decode_typed_value,
-    encode_typed_value, verify_memory_readback,
+    FirmwareIdentityStrength, JlinkError, MemoryRange, MemoryRegionKind, TargetConnectionSpec,
+    WriteVerify, decode_typed_value, encode_typed_value, verify_memory_readback,
 };
 
 use crate::{gateway::DllGateway, session::TargetSessionManager};
@@ -14,8 +14,17 @@ pub(crate) fn execute_debug(
     request: DebugRequest,
 ) -> Result<DebugResult, JlinkError> {
     session.ensure_debug_allowed(target, &request)?;
-    if let Some(firmware) = request.firmware() {
-        ensure_firmware_identity(session, gateway, firmware)?;
+    match &request {
+        DebugRequest::ReadVariable { firmware, .. } => {
+            ensure_firmware_identity(session, gateway, target, firmware, false)?;
+        }
+        DebugRequest::WriteVariable { firmware, .. } => {
+            ensure_firmware_identity(session, gateway, target, firmware, true)?;
+        }
+        DebugRequest::ReadMemory { .. }
+        | DebugRequest::WriteMemory { .. }
+        | DebugRequest::ReadRegister { .. }
+        | DebugRequest::WriteRegister { .. } => {}
     }
     match request {
         DebugRequest::ReadMemory { range } => {
@@ -114,31 +123,40 @@ fn verify_if_requested(
 pub(crate) fn ensure_firmware_identity(
     session: &mut TargetSessionManager,
     gateway: &mut DllGateway,
+    target: &TargetConnectionSpec,
     firmware: &FirmwareIdentityPlan,
-) -> Result<(), JlinkError> {
+    require_strong: bool,
+) -> Result<FirmwareIdentityStrength, JlinkError> {
     firmware.validate()?;
-    if session.firmware_identity_cached(firmware.elf_sha256()) {
-        return Ok(());
+    if firmware.strength() == FirmwareIdentityStrength::Weak {
+        if require_strong {
+            firmware.ensure_strong()?;
+        }
+        return Ok(FirmwareIdentityStrength::Weak);
+    }
+    if session.firmware_identity_cached(target, firmware) {
+        return Ok(FirmwareIdentityStrength::Strong);
     }
     session.ensure_firmware_identity_read_allowed()?;
-    let observed = firmware
-        .segments()
-        .iter()
-        .map(|segment| {
-            let length = usize::try_from(segment.length())
-                .map_err(|_| identity_unknown("固件身份读取长度无法表示", None))?;
-            let data = gateway
-                .read_bytes(segment.address(), length)
-                .map_err(|error| {
-                    identity_unknown("无法完整读取目标 Flash 以验证符号 ELF", Some(&error))
-                })?;
-            FirmwareSegmentFingerprint::from_bytes(segment.address(), &data)
-                .map_err(|error| identity_unknown("固件身份读取证据无效", Some(&error)))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    firmware.verify_target(Some(&observed))?;
-    session.record_firmware_identity(firmware.elf_sha256());
-    Ok(())
+    let expected = firmware.ensure_strong()?;
+    let length = expected.bytes().len();
+    let range = MemoryRange::new(
+        expected.address(),
+        u64::try_from(length).map_err(|_| identity_unknown("固件身份读取长度无法表示", None))?,
+    )?;
+    let memory_map = gateway.device_memory_map(target.device())?;
+    if memory_map.classify(range)? != MemoryRegionKind::Flash {
+        return Err(identity_unknown(
+            "固件身份块必须完整位于器件 Flash 区域",
+            None,
+        ));
+    }
+    let observed = gateway
+        .read_bytes(expected.address(), length)
+        .map_err(|error| identity_unknown("无法读取目标固定固件身份块", Some(&error)))?;
+    firmware.verify_target_bytes(Some(&observed))?;
+    session.record_firmware_identity(target, firmware);
+    Ok(FirmwareIdentityStrength::Strong)
 }
 
 fn identity_unknown(message: &str, cause: Option<&JlinkError>) -> JlinkError {

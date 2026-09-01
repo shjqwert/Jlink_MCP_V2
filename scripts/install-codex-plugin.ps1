@@ -19,7 +19,7 @@ if ($BinaryDirectory) {
 if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSScriptRoot }
 $PackageDirectory = [IO.Path]::GetFullPath($PackageDirectory)
 $manifest = Read-ReleasePackage $PackageDirectory
-$manifestHash = (Get-FileHash -LiteralPath (Join-Path $PackageDirectory 'release-manifest.json') -Algorithm SHA256).Hash.ToLowerInvariant()
+$manifestHash = Get-Sha256Hex (Join-Path $PackageDirectory 'release-manifest.json')
 $codexCommand = Get-Command codex -ErrorAction Stop
 $productRoot = Get-ProductRoot
 
@@ -120,7 +120,7 @@ try {
     if (Test-Path -LiteralPath $deployment) {
         try {
             $null = Read-ReleasePackage $deployment
-            $reuse = (Get-FileHash -LiteralPath (Join-Path $deployment 'release-manifest.json')).Hash -eq $manifestHash
+            $reuse = (Get-Sha256Hex (Join-Path $deployment 'release-manifest.json')) -eq $manifestHash
         }
         catch { $reuse = $false }
         if (-not $reuse) {
@@ -160,7 +160,7 @@ try {
     $registeredPackageMatches = $false
     if ($newState.market.Count -eq 1) {
         $null = Read-ReleasePackage $newState.market[0].root
-        $registeredPackageMatches = (Get-FileHash -LiteralPath (Join-Path $newState.market[0].root 'release-manifest.json')).Hash -eq $manifestHash
+        $registeredPackageMatches = (Get-Sha256Hex (Join-Path $newState.market[0].root 'release-manifest.json')) -eq $manifestHash
     }
     if ($newState.installed.Count -ne 1 -or -not $newState.installed[0].enabled -or
         $newState.installed[0].version -ne $manifest.version -or $newState.market.Count -ne 1 -or

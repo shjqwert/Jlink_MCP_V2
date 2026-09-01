@@ -13,9 +13,10 @@ use std::{
 
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
-    HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
-    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckEvidence,
-    ValidationCheckKind, ValidationReport, validate_write_count,
+    HssCapabilities, HssRateAssessment, HssStartPlan, JlinkError, MemoryRegion, MemoryRegionKind,
+    ProgramAfter, ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface,
+    TargetState, ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
+    validate_write_count,
 };
 use serde_json::json;
 use windows_sys::Win32::{
@@ -29,6 +30,10 @@ use windows_sys::Win32::{
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNNING_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const HSS_RATE_MEASUREMENT_WINDOW: Duration = Duration::from_millis(150);
+const HSS_RATE_MEASUREMENT_POLL: Duration = Duration::from_millis(1);
+const HSS_RATE_SAFETY_MARGIN_PERCENT: u32 = 10;
+const HSS_RATE_MEASUREMENT_BUFFER_BYTES: usize = 64 * 1024;
 const ICSR: u32 = 0xE000_ED04;
 const CFSR: u32 = 0xE000_ED28;
 const HFSR: u32 = 0xE000_ED2C;
@@ -43,6 +48,7 @@ const DEVICE_AREA_COUNT: usize = 32;
 const MAX_REGISTER_COUNT: usize = 256;
 const PROGRAM_CHUNK_BYTES: usize = 64 * 1024;
 const PROGRAM_CHUNK_BYTES_U64: u64 = 64 * 1024;
+const LOADER_RAM_PREFLIGHT_BYTES: usize = 16;
 const DLL_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
 type DllLogFn = unsafe extern "C" fn(*const c_char);
@@ -498,16 +504,15 @@ impl DllGateway {
             .variables()
             .iter()
             .map(|variable| {
-                let access = variable.access_plan();
                 Ok(HssBlock {
-                    address: u32::try_from(access.address()).map_err(|_| {
+                    address: u32::try_from(variable.address()).map_err(|_| {
                         JlinkError::new(
                             ErrorCode::HssUnsupported,
                             "HSS 变量地址超出冻结 32-bit ABI",
                             false,
                         )
                     })?,
-                    byte_count: u32::try_from(access.byte_size()).map_err(|_| {
+                    byte_count: u32::try_from(variable.byte_size()).map_err(|_| {
                         JlinkError::new(
                             ErrorCode::HssUnsupported,
                             "HSS 变量长度超出冻结 32-bit ABI",
@@ -626,6 +631,92 @@ impl DllGateway {
         Ok(())
     }
 
+    /// Measures one short temporary stream and rejects an unsafe requested rate.
+    ///
+    /// The temporary rate is never substituted into the real capture request.
+    /// A matching Stop is dispatched exactly once after every successful Start.
+    pub(crate) fn assess_hss_rate(
+        &mut self,
+        plan: &HssStartPlan,
+        capabilities: HssCapabilities,
+    ) -> Result<HssRateAssessment, JlinkError> {
+        capabilities.validate_start(plan)?;
+        let measurement_rate_hz = capabilities.max_frequency_hz().min(1_000);
+        let measurement_plan = plan.with_rate_for_measurement(measurement_rate_hz)?;
+        let record_bytes = usize::try_from(measurement_plan.frame_layout().record_bytes())
+            .map_err(|_| {
+                JlinkError::new(
+                    ErrorCode::HssUnsupported,
+                    "HSS measurement record length 无法表示",
+                    false,
+                )
+            })?;
+        let mut buffer = vec![0_u8; HSS_RATE_MEASUREMENT_BUFFER_BYTES];
+        self.start_hss(&measurement_plan)?;
+        let started = Instant::now();
+        let measured = (|| {
+            let mut total_bytes = 0_u64;
+            while started.elapsed() < HSS_RATE_MEASUREMENT_WINDOW {
+                let read = self.read_hss(&mut buffer, record_bytes)?;
+                total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                thread::sleep(HSS_RATE_MEASUREMENT_POLL);
+            }
+            Ok::<u64, JlinkError>(total_bytes)
+        })();
+        let stop_result = self.stop_hss();
+        stop_result?;
+        let mut total_bytes = measured?;
+        let mut empty_reads = 0_u32;
+        for _ in 0..20 {
+            let read = self.read_hss(&mut buffer, record_bytes)?;
+            total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if read == 0 {
+                empty_reads += 1;
+                if empty_reads >= 3 {
+                    break;
+                }
+            } else {
+                empty_reads = 0;
+            }
+            thread::sleep(HSS_RATE_MEASUREMENT_POLL);
+        }
+        let measurement_window_us =
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let complete_samples = total_bytes / u64::try_from(record_bytes).unwrap_or(u64::MAX);
+        if complete_samples == 0 {
+            return Err(JlinkError::new(
+                ErrorCode::HssUnsupported,
+                "HSS 短窗口测量没有获得完整样本",
+                true,
+            )
+            .with_detail("measurement_rate_hz", json!(measurement_rate_hz))
+            .with_detail("measurement_window_us", json!(measurement_window_us)));
+        }
+        let measured_rate_hz = u32::try_from(
+            complete_samples
+                .saturating_mul(1_000_000)
+                .checked_div(measurement_window_us)
+                .unwrap_or_default(),
+        )
+        .unwrap_or(u32::MAX)
+        .max(1);
+        let conservative_rate =
+            measured_rate_hz.saturating_mul(100 - HSS_RATE_SAFETY_MARGIN_PERCENT) / 100;
+        let recommended_max_rate_hz = conservative_rate
+            .min(capabilities.max_frequency_hz())
+            .max(1);
+        HssRateAssessment::new(
+            measurement_rate_hz,
+            measurement_window_us,
+            complete_samples,
+            measured_rate_hz,
+            HSS_RATE_SAFETY_MARGIN_PERCENT,
+            recommended_max_rate_hz,
+            plan.rate_hz(),
+        )?
+        .ensure_accepted()
+    }
+
     /// Reads authoritative Flash regions from the loaded J-Link device database.
     ///
     /// This call does not open a probe or access the target. The returned ranges
@@ -738,46 +829,82 @@ impl DllGateway {
     /// The caller must validate all segments against [`Self::device_flash_regions`]
     /// before invoking this method. Any failure after `BeginDownload` is reported
     /// as execution-uncertain because target side effects may already exist.
-    pub(crate) fn program_image(&mut self, image: &FirmwareImage) -> Result<(), JlinkError> {
+    pub(crate) fn program_image(
+        &mut self,
+        image: &FirmwareImage,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
-        let write_result = image
-            .segments()
-            .iter()
-            .try_for_each(|segment| self.write_download_bytes(segment.address(), segment.data()));
-        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
-        let end_result = unsafe { (self.api.end_download)() };
-        match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => {
-                let _ = take_dll_diagnostics();
-                Ok(())
-            }
-            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "Flash 写入未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            )))),
-            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "JLINKARM_EndDownload 返回 {value}"
-            )))),
-        }
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
+        let write_result = image.segments().iter().try_for_each(|segment| {
+            self.write_download_bytes(segment.address(), segment.data(), facts)
+        });
+        let end_download = self.api.end_download;
+        finish_download_after_segments(
+            write_result,
+            facts,
+            ProgramStage::VerifyPreparation,
+            "JLINKARM_EndDownload",
+            || {
+                // SAFETY: all segment writes completed and this transaction owns
+                // the matching BeginDownload call.
+                unsafe { end_download() }
+            },
+        )
     }
 
     /// Erases all always-present device Flash banks through the J-Link algorithm.
-    pub(crate) fn erase_chip(&mut self) -> Result<(), JlinkError> {
+    pub(crate) fn erase_chip(
+        &mut self,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::SegmentCommit,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned by this gateway.
         let result = unsafe { (self.api.erase_chip)() };
         if result < 0 {
-            return Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "JLINK_EraseChip 返回 {result}"
-            ))));
+            return Err(attach_dll_diagnostics(
+                JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("JLINK_EraseChip returned {result}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(result)),
+            ));
         }
         let _ = take_dll_diagnostics();
+        facts.flash_modified = jlink_domain::FlashModifiedState::True;
+        facts.advance(ProgramStage::SegmentCommit, ProgramStage::FinalState);
         Ok(())
     }
 
@@ -787,13 +914,31 @@ impl DllGateway {
     /// and preservation of bytes outside the requested range to the selected
     /// device algorithm. Hardware evidence must confirm this behavior for each
     /// frozen DLL/device fingerprint before release.
-    pub(crate) fn erase_range(&mut self, address: u64, length: u64) -> Result<(), JlinkError> {
+    pub(crate) fn erase_range(
+        &mut self,
+        address: u64,
+        length: u64,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
         let erased = vec![0xff_u8; PROGRAM_CHUNK_BYTES];
         let mut remaining = length;
         let mut current = address;
@@ -801,7 +946,7 @@ impl DllGateway {
             while remaining > 0 {
                 let count = usize::try_from(remaining.min(PROGRAM_CHUNK_BYTES_U64))
                     .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 usize"))?;
-                self.write_download_bytes(current, &erased[..count])?;
+                self.write_download_bytes(current, &erased[..count], facts)?;
                 let count = u64::try_from(count)
                     .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 u64"))?;
                 current = current
@@ -811,20 +956,18 @@ impl DllGateway {
             }
             Ok(())
         })();
-        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
-        let end_result = unsafe { (self.api.end_download)() };
-        match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => {
-                let _ = take_dll_diagnostics();
-                Ok(())
-            }
-            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "范围擦除未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            )))),
-            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "范围擦除的 JLINKARM_EndDownload 返回 {value}"
-            )))),
-        }
+        let end_download = self.api.end_download;
+        finish_download_after_segments(
+            write_result,
+            facts,
+            ProgramStage::FinalState,
+            "range erase JLINKARM_EndDownload",
+            || {
+                // SAFETY: all range chunks completed and this transaction owns
+                // the matching BeginDownload call.
+                unsafe { end_download() }
+            },
+        )
     }
 
     /// Reads one complete target range without truncation.
@@ -915,13 +1058,79 @@ impl DllGateway {
         Ok(actual)
     }
 
-    fn prepare_flash_operation(&mut self) -> Result<(), JlinkError> {
+    fn prepare_flash_operation(
+        &mut self,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         if self.connected_spec.is_none() || !self.is_connected()? {
             return Err(target_connection_error(
                 "Flash 操作要求同一 DLL 会话已确认具体器件选择和目标连接",
             ));
         }
+        facts.dispatch_non_flash_side_effect();
         self.reset_halt_for_flash()
+    }
+
+    fn preflight_loader_ram(
+        &mut self,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
+        if loader_ram.kind() != MemoryRegionKind::Ram || loader_ram.length() == 0 {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "profile.loader_ram must be a non-empty RAM region",
+                false,
+            ));
+        }
+        let length = usize::try_from(loader_ram.length().min(LOADER_RAM_PREFLIGHT_BYTES as u64))
+            .expect("preflight length is bounded");
+        let address = loader_ram.address();
+        let original = self.read_bytes(address, length)?;
+        let pattern = original.iter().map(|byte| byte ^ 0xA5).collect::<Vec<_>>();
+        facts.dispatch_non_flash_side_effect();
+        if let Err(error) = self.write_bytes(address, &pattern) {
+            let restored = self.restore_loader_ram(address, &original);
+            return Err(error
+                .with_detail("loader_ram_restored", json!(restored))
+                .with_detail("flash_modified", json!(false)));
+        }
+        match self.read_bytes(address, length) {
+            Ok(actual) if actual == pattern => {}
+            Ok(_) => {
+                let restored = self.restore_loader_ram(address, &original);
+                return Err(JlinkError::new(
+                    ErrorCode::VerifyFailed,
+                    "Loader RAM preflight pattern readback did not match",
+                    false,
+                )
+                .with_detail("loader_ram_restored", json!(restored))
+                .with_detail("flash_modified", json!(false)));
+            }
+            Err(error) => {
+                let restored = self.restore_loader_ram(address, &original);
+                return Err(error
+                    .with_detail("loader_ram_restored", json!(restored))
+                    .with_detail("flash_modified", json!(false)));
+            }
+        }
+        if !self.restore_loader_ram(address, &original) {
+            return Err(JlinkError::new(
+                ErrorCode::ExecutionUncertain,
+                "Loader RAM preflight could not restore and verify the original bytes",
+                false,
+            )
+            .with_detail("loader_ram_restored", json!(false))
+            .with_detail("flash_modified", json!(false)));
+        }
+        Ok(())
+    }
+
+    fn restore_loader_ram(&mut self, address: u64, original: &[u8]) -> bool {
+        self.write_bytes(address, original).is_ok()
+            && self
+                .read_bytes(address, original.len())
+                .is_ok_and(|actual| actual == original)
     }
 
     /// Establishes the deterministic halted boundary required around Flash work.
@@ -929,7 +1138,12 @@ impl DllGateway {
         require_flash_reset_halted(self.reset_halt_and_observe()?)
     }
 
-    fn write_download_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
+    fn write_download_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         let mut offset = 0_usize;
         while offset < bytes.len() {
             let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
@@ -946,10 +1160,16 @@ impl DllGateway {
             let result =
                 unsafe { (self.api.write_mem)(current, count_u32, bytes[offset..].as_ptr()) };
             if result != i32::try_from(count).expect("fixed write chunk fits i32") {
-                return Err(execution_uncertain_error(format!(
-                    "JLINKARM_WriteMem(0x{current:08X}, {count}) 返回 {result}"
-                )));
+                return Err(JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("JLINKARM_WriteMem(0x{current:08X}, {count}) returned {result}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(result))
+                .with_detail("address", json!(format!("0x{current:08X}")))
+                .with_detail("length", json!(count)));
             }
+            facts.submit(u64::from(current), u64::from(count_u32));
             offset += count;
         }
         Ok(())
@@ -1656,6 +1876,36 @@ impl DllGateway {
     }
 }
 
+fn finish_download_after_segments(
+    write_result: Result<(), JlinkError>,
+    facts: &mut ProgramExecutionFacts,
+    next_stage: ProgramStage,
+    operation: &str,
+    end_download: impl FnOnce() -> i32,
+) -> Result<(), JlinkError> {
+    if let Err(error) = write_result {
+        // A failed segment must short-circuit immediately. Calling EndDownload
+        // here could finalize earlier buffered writes and would be a new side effect.
+        return Err(attach_dll_diagnostics(error));
+    }
+    facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
+    let value = end_download();
+    if value < 0 {
+        return Err(attach_dll_diagnostics(
+            JlinkError::new(
+                ErrorCode::ExecutionUncertain,
+                format!("{operation} returned {value}"),
+                false,
+            )
+            .with_detail("dll_return_code", json!(value)),
+        ));
+    }
+    let _ = take_dll_diagnostics();
+    facts.confirm_submitted();
+    facts.advance(ProgramStage::EndDownload, next_stage);
+    Ok(())
+}
+
 impl Drop for DllGateway {
     fn drop(&mut self) {
         self.close_target();
@@ -1846,15 +2096,15 @@ mod tests {
 
     use jlink_domain::{
         CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
-        TargetConnectionSpec, TargetInterface, TargetState, ValidationCheckEvidence,
-        ValidationCheckKind,
+        ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface, TargetState,
+        ValidationCheckEvidence, ValidationCheckKind,
     };
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
-        HssCaps, classify_observed_target_state, classify_register_read_failure, hss_start_error,
-        passed_check, require_flash_reset_halted, reusable_check, validate_exec_command_result,
-        validate_read_mem_result,
+        HssCaps, classify_observed_target_state, classify_register_read_failure,
+        finish_download_after_segments, hss_start_error, passed_check, require_flash_reset_halted,
+        reusable_check, validate_exec_command_result, validate_read_mem_result,
     };
 
     unsafe extern "C" fn hss_get_caps_stub(_caps: *mut HssCaps) -> i32 {
@@ -2006,6 +2256,42 @@ mod tests {
                 require_flash_reset_halted(state).expect_err("non-halted state is rejected");
             assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
         }
+    }
+
+    #[test]
+    fn segment_failure_never_dispatches_end_download() {
+        let mut facts = ProgramExecutionFacts::new();
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
+        facts.submit(0, 16);
+        let end_called = Cell::new(false);
+        let write_error =
+            JlinkError::new(ErrorCode::ExecutionUncertain, "segment write failed", false);
+
+        let error = finish_download_after_segments(
+            Err(write_error),
+            &mut facts,
+            ProgramStage::VerifyPreparation,
+            "JLINKARM_EndDownload",
+            || {
+                end_called.set(true);
+                0
+            },
+        )
+        .expect_err("segment failure must short-circuit");
+
+        assert_eq!(error.code, ErrorCode::ExecutionUncertain);
+        assert!(!end_called.get());
+        assert_eq!(facts.current_stage, ProgramStage::SegmentCommit);
+        assert!(facts.confirmed_ranges.is_empty());
     }
 
     #[test]

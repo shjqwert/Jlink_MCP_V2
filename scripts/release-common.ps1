@@ -8,11 +8,6 @@ function Get-ReleasePayloadPaths {
         '.agents/plugins/marketplace.json', 'plugins/jlink-mcp/.codex-plugin/plugin.json',
         'plugins/jlink-mcp/.mcp.json', 'plugins/jlink-mcp/skills/jlink-mcp/SKILL.md',
         'plugins/jlink-mcp/skills/jlink-mcp/agents/openai.yaml',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/target-session.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/programming.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/debug-access.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/hss.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/errors.md',
         'jlink-mcp.example.toml', 'INSTALL.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt'
     )
 }
@@ -49,6 +44,19 @@ function Assert-NoReparsePoint {
 function Write-ReleaseJson {
     param([string]$Path, $Value)
     [IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth 20) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+}
+
+function Get-Sha256Hex {
+    param([string]$Path)
+    $stream = [IO.File]::OpenRead([IO.Path]::GetFullPath($Path))
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
 }
 
 function Set-ReleasePointer {
@@ -142,7 +150,7 @@ function Read-ReleasePackage {
         Assert-NoReparsePoint $filePath
         if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { throw "Missing release file: $($entry.path)" }
         if ((Get-Item -LiteralPath $filePath).Length -ne $entry.bytes -or
-            (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash -ne $entry.sha256) {
+            (Get-Sha256Hex $filePath) -ne $entry.sha256) {
             throw "Release file integrity mismatch: $($entry.path)"
         }
     }
