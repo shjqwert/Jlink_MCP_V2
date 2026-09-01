@@ -856,30 +856,18 @@ impl DllGateway {
         let write_result = image.segments().iter().try_for_each(|segment| {
             self.write_download_bytes(segment.address(), segment.data(), facts)
         });
-        if write_result.is_ok() {
-            facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
-        }
-        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
-        let end_result = unsafe { (self.api.end_download)() };
-        match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => {
-                let _ = take_dll_diagnostics();
-                facts.confirm_submitted();
-                facts.advance(ProgramStage::EndDownload, ProgramStage::VerifyPreparation);
-                Ok(())
-            }
-            (Err(error), value) => Err(attach_dll_diagnostics(
-                error.with_detail("end_download_return_code", json!(value)),
-            )),
-            (Ok(()), value) => Err(attach_dll_diagnostics(
-                JlinkError::new(
-                    ErrorCode::ExecutionUncertain,
-                    format!("JLINKARM_EndDownload returned {value}"),
-                    false,
-                )
-                .with_detail("dll_return_code", json!(value)),
-            )),
-        }
+        let end_download = self.api.end_download;
+        finish_download_after_segments(
+            write_result,
+            facts,
+            ProgramStage::VerifyPreparation,
+            "JLINKARM_EndDownload",
+            || {
+                // SAFETY: all segment writes completed and this transaction owns
+                // the matching BeginDownload call.
+                unsafe { end_download() }
+            },
+        )
     }
 
     /// Erases all always-present device Flash banks through the J-Link algorithm.
@@ -968,30 +956,18 @@ impl DllGateway {
             }
             Ok(())
         })();
-        if write_result.is_ok() {
-            facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
-        }
-        // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
-        let end_result = unsafe { (self.api.end_download)() };
-        match (write_result, end_result) {
-            (Ok(()), value) if value >= 0 => {
-                let _ = take_dll_diagnostics();
-                facts.confirm_submitted();
-                facts.advance(ProgramStage::EndDownload, ProgramStage::FinalState);
-                Ok(())
-            }
-            (Err(error), value) => Err(attach_dll_diagnostics(
-                error.with_detail("end_download_return_code", json!(value)),
-            )),
-            (Ok(()), value) => Err(attach_dll_diagnostics(
-                JlinkError::new(
-                    ErrorCode::ExecutionUncertain,
-                    format!("range erase JLINKARM_EndDownload returned {value}"),
-                    false,
-                )
-                .with_detail("dll_return_code", json!(value)),
-            )),
-        }
+        let end_download = self.api.end_download;
+        finish_download_after_segments(
+            write_result,
+            facts,
+            ProgramStage::FinalState,
+            "range erase JLINKARM_EndDownload",
+            || {
+                // SAFETY: all range chunks completed and this transaction owns
+                // the matching BeginDownload call.
+                unsafe { end_download() }
+            },
+        )
     }
 
     /// Reads one complete target range without truncation.
@@ -1900,6 +1876,36 @@ impl DllGateway {
     }
 }
 
+fn finish_download_after_segments(
+    write_result: Result<(), JlinkError>,
+    facts: &mut ProgramExecutionFacts,
+    next_stage: ProgramStage,
+    operation: &str,
+    end_download: impl FnOnce() -> i32,
+) -> Result<(), JlinkError> {
+    if let Err(error) = write_result {
+        // A failed segment must short-circuit immediately. Calling EndDownload
+        // here could finalize earlier buffered writes and would be a new side effect.
+        return Err(attach_dll_diagnostics(error));
+    }
+    facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
+    let value = end_download();
+    if value < 0 {
+        return Err(attach_dll_diagnostics(
+            JlinkError::new(
+                ErrorCode::ExecutionUncertain,
+                format!("{operation} returned {value}"),
+                false,
+            )
+            .with_detail("dll_return_code", json!(value)),
+        ));
+    }
+    let _ = take_dll_diagnostics();
+    facts.confirm_submitted();
+    facts.advance(ProgramStage::EndDownload, next_stage);
+    Ok(())
+}
+
 impl Drop for DllGateway {
     fn drop(&mut self) {
         self.close_target();
@@ -2090,15 +2096,15 @@ mod tests {
 
     use jlink_domain::{
         CoreRegister, ErrorCode, FlashRegion, JlinkError, MemoryRange, MemoryRegionKind,
-        TargetConnectionSpec, TargetInterface, TargetState, ValidationCheckEvidence,
-        ValidationCheckKind,
+        ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface, TargetState,
+        ValidationCheckEvidence, ValidationCheckKind,
     };
 
     use super::{
         DLL_DIAGNOSTIC_BYTES, DeviceInfo, DllDiagnosticBuffer, DllGateway, HssApi, HssBlock,
-        HssCaps, classify_observed_target_state, classify_register_read_failure, hss_start_error,
-        passed_check, require_flash_reset_halted, reusable_check, validate_exec_command_result,
-        validate_read_mem_result,
+        HssCaps, classify_observed_target_state, classify_register_read_failure,
+        finish_download_after_segments, hss_start_error, passed_check, require_flash_reset_halted,
+        reusable_check, validate_exec_command_result, validate_read_mem_result,
     };
 
     unsafe extern "C" fn hss_get_caps_stub(_caps: *mut HssCaps) -> i32 {
@@ -2250,6 +2256,42 @@ mod tests {
                 require_flash_reset_halted(state).expect_err("non-halted state is rejected");
             assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
         }
+    }
+
+    #[test]
+    fn segment_failure_never_dispatches_end_download() {
+        let mut facts = ProgramExecutionFacts::new();
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
+        facts.submit(0, 16);
+        let end_called = Cell::new(false);
+        let write_error =
+            JlinkError::new(ErrorCode::ExecutionUncertain, "segment write failed", false);
+
+        let error = finish_download_after_segments(
+            Err(write_error),
+            &mut facts,
+            ProgramStage::VerifyPreparation,
+            "JLINKARM_EndDownload",
+            || {
+                end_called.set(true);
+                0
+            },
+        )
+        .expect_err("segment failure must short-circuit");
+
+        assert_eq!(error.code, ErrorCode::ExecutionUncertain);
+        assert!(!end_called.get());
+        assert_eq!(facts.current_stage, ProgramStage::SegmentCommit);
+        assert!(facts.confirmed_ranges.is_empty());
     }
 
     #[test]

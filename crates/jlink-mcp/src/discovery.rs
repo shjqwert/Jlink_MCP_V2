@@ -106,12 +106,27 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
                     }
                 }
             }
-            "board" => parse_board_ranges(&contents, &source, &mut flash_regions),
+            "board" => parse_board_ranges(
+                &contents,
+                &source,
+                &mut flash_regions,
+                &mut discovery.provenance,
+            ),
+            "jflash" => parse_jflash(
+                &contents,
+                &source,
+                &mut devices,
+                &mut interfaces,
+                &mut speeds,
+                &mut loader_ram,
+                &mut discovery,
+            ),
             "uvprojx" | "pdsc" => parse_cmsis_metadata(
                 &contents,
                 &source,
                 &mut devices,
                 &mut flash_regions,
+                &mut discovery.provenance,
                 &mut discovery.diagnostics,
             ),
             "flm" => discovery.diagnostics.push(DiscoveryDiagnostic {
@@ -135,21 +150,29 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
         let Some(contents) = read_metadata(&path, &mut discovery.diagnostics) else {
             continue;
         };
-        parse_board_ranges(&contents, &board, &mut flash_regions);
+        parse_board_ranges(
+            &contents,
+            &board,
+            &mut flash_regions,
+            &mut discovery.provenance,
+        );
         for loader in board_loader_paths(&contents, &path) {
             if let Some(candidate) = loader_ram_from_descriptor(&loader, &mut discovery.diagnostics)
             {
-                match loader_ram {
-                    None => loader_ram = Some(candidate),
-                    Some(selected) if selected == candidate => {}
-                    Some(selected) => discovery.conflicts.push(ProfileConflict {
-                        field: "profile.loader_ram".to_owned(),
-                        severity: ProfileConflictSeverity::Blocking,
-                        selected: format!("0x{:X}:{}", selected.address, selected.length),
-                        rejected: format!("0x{:X}:{}", candidate.address, candidate.length),
-                        sources: vec![board.clone(), loader.display().to_string()],
-                    }),
-                }
+                let loader_source = display_path(root, &loader);
+                record_profile_region(
+                    &mut discovery.provenance,
+                    "profile.loader_ram",
+                    candidate,
+                    &loader_source,
+                    "iar-loader",
+                );
+                consider_loader_ram(
+                    &mut loader_ram,
+                    candidate,
+                    loader_source,
+                    &mut discovery.conflicts,
+                );
             }
         }
         discovery.provenance.push(DiscoveryValue {
@@ -179,6 +202,7 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
             speed_khz: selected_speed,
         });
     }
+    let loader_ram = loader_ram.map(|(region, _)| region);
     if !flash_regions.is_empty() || loader_ram.is_some() {
         flash_regions.sort_by_key(|region| (region.address, region.length));
         flash_regions.dedup();
@@ -308,7 +332,198 @@ fn parse_xcl(
     }
 }
 
-fn parse_board_ranges(contents: &str, source: &str, output: &mut Vec<ProfileRegionConfig>) {
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn parse_jflash(
+    contents: &str,
+    source: &str,
+    devices: &mut Vec<DiscoveryValue>,
+    interfaces: &mut Vec<DiscoveryValue>,
+    speeds: &mut Vec<DiscoveryValue>,
+    loader_ram: &mut Option<(ProfileRegionConfig, String)>,
+    discovery: &mut ProjectDiscovery,
+) {
+    let mut parsed = false;
+    if let Some(device) = jflash_assignment(contents, "ChipName") {
+        let device = device.trim_matches(['"', ' ', '\t']);
+        if looks_like_concrete_device(device) {
+            devices.push(candidate("target.device", device, source, "segger-jflash"));
+            parsed = true;
+        }
+    }
+
+    let interface = jflash_assignment(contents, "TargetIF")
+        .and_then(parse_number)
+        .and_then(|value| match value {
+            0 => Some(TargetInterface::Jtag),
+            1 => Some(TargetInterface::Swd),
+            _ => None,
+        });
+    if let Some(interface) = interface {
+        let value = match interface {
+            TargetInterface::Swd => "swd",
+            TargetInterface::Jtag => "jtag",
+        };
+        interfaces.push(candidate(
+            "target.interface",
+            value,
+            source,
+            "segger-jflash",
+        ));
+        let speed_key = match interface {
+            TargetInterface::Swd => "Speed1",
+            TargetInterface::Jtag => "Speed0",
+        };
+        if let Some(speed) = jflash_assignment(contents, speed_key).and_then(parse_number)
+            && speed > 0
+        {
+            speeds.push(candidate(
+                "target.speed_khz",
+                &speed.to_string(),
+                source,
+                "segger-jflash",
+            ));
+        }
+        parsed = true;
+    } else if jflash_assignment(contents, "TargetIF").is_some() {
+        discovery.diagnostics.push(DiscoveryDiagnostic {
+            code: "jflash_interface_unsupported".to_owned(),
+            source: source.to_owned(),
+            detail: "J-Flash TargetIF is outside the supported JTAG=0/SWD=1 values".to_owned(),
+        });
+    }
+
+    let use_ram = jflash_assignment(contents, "UseRAM").and_then(parse_number) == Some(1);
+    if use_ram
+        && let (Some(address), Some(length)) = (
+            jflash_assignment(contents, "RAMAddr").and_then(parse_number),
+            jflash_assignment(contents, "RAMSize").and_then(parse_number),
+        )
+        && length > 0
+    {
+        let region = ProfileRegionConfig { address, length };
+        record_profile_region(
+            &mut discovery.provenance,
+            "profile.loader_ram",
+            region,
+            source,
+            "segger-jflash",
+        );
+        consider_loader_ram(
+            loader_ram,
+            region,
+            source.to_owned(),
+            &mut discovery.conflicts,
+        );
+        parsed = true;
+    }
+
+    if let Some(base) = jflash_assignment(contents, "BaseAddr").and_then(parse_number) {
+        discovery.provenance.push(candidate(
+            "profile.flash_base_metadata",
+            &format!("0x{base:X}"),
+            source,
+            "segger-jflash",
+        ));
+        discovery.diagnostics.push(DiscoveryDiagnostic {
+            code: "jflash_flash_layout_incomplete".to_owned(),
+            source: source.to_owned(),
+            detail: "J-Flash BaseAddr has no trustworthy byte length; no Flash range was inferred"
+                .to_owned(),
+        });
+        parsed = true;
+    }
+    if let Some(algorithm) = jflash_assignment(contents, "DeviceName") {
+        discovery.provenance.push(candidate(
+            "profile.flash_algorithm_metadata",
+            algorithm,
+            source,
+            "segger-jflash",
+        ));
+        parsed = true;
+    }
+
+    let initialization_steps = jflash_assignment(contents, "NumInitSteps")
+        .and_then(parse_number)
+        .unwrap_or(0);
+    let uses_script =
+        jflash_assignment(contents, "UseScriptFile").and_then(parse_number) == Some(1);
+    if initialization_steps > 0 || uses_script {
+        discovery.diagnostics.push(DiscoveryDiagnostic {
+            code: "jflash_initialization_unsupported".to_owned(),
+            source: source.to_owned(),
+            detail:
+                "J-Flash initialization steps and scripts are reported but are not executed by MCP"
+                    .to_owned(),
+        });
+    }
+    if !parsed {
+        discovery.diagnostics.push(DiscoveryDiagnostic {
+            code: "jflash_metadata_unsupported".to_owned(),
+            source: source.to_owned(),
+            detail: "J-Flash file contained no supported target, interface, speed, or Loader RAM metadata"
+                .to_owned(),
+        });
+    }
+}
+
+fn consider_loader_ram(
+    selected: &mut Option<(ProfileRegionConfig, String)>,
+    candidate: ProfileRegionConfig,
+    source: String,
+    conflicts: &mut Vec<ProfileConflict>,
+) {
+    match selected {
+        None => *selected = Some((candidate, source)),
+        Some((region, _)) if *region == candidate => {}
+        Some((region, selected_source)) => conflicts.push(ProfileConflict {
+            field: "profile.loader_ram".to_owned(),
+            severity: ProfileConflictSeverity::Blocking,
+            selected: format!("0x{:X}:{}", region.address, region.length),
+            rejected: format!("0x{:X}:{}", candidate.address, candidate.length),
+            sources: vec![selected_source.clone(), source],
+        }),
+    }
+}
+
+fn record_profile_region(
+    provenance: &mut Vec<DiscoveryValue>,
+    field: &str,
+    region: ProfileRegionConfig,
+    source: &str,
+    adapter: &str,
+) {
+    provenance.push(candidate(
+        field,
+        &format!("0x{:X}:{}", region.address, region.length),
+        source,
+        adapter,
+    ));
+}
+
+fn jflash_assignment<'a>(contents: &'a str, name: &str) -> Option<&'a str> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once('=')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+fn parse_number(value: &str) -> Option<u64> {
+    let value = value.trim().trim_matches('"');
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse().ok(),
+            |hex| u64::from_str_radix(hex, 16).ok(),
+        )
+}
+
+fn parse_board_ranges(
+    contents: &str,
+    source: &str,
+    output: &mut Vec<ProfileRegionConfig>,
+    provenance: &mut Vec<DiscoveryValue>,
+) {
     for line in contents.lines() {
         let Some(value) = between(line, "<range>", "</range>") else {
             continue;
@@ -327,13 +542,20 @@ fn parse_board_ranges(contents: &str, source: &str, output: &mut Vec<ProfileRegi
             .checked_sub(start)
             .and_then(|value| value.checked_add(1))
         {
-            output.push(ProfileRegionConfig {
+            let region = ProfileRegionConfig {
                 address: start,
                 length,
-            });
+            };
+            output.push(region);
+            record_profile_region(
+                provenance,
+                "profile.flash_regions",
+                region,
+                source,
+                "iar-board",
+            );
         }
     }
-    let _ = source;
 }
 
 fn board_loader_paths(contents: &str, board: &Path) -> Vec<PathBuf> {
@@ -389,6 +611,7 @@ fn parse_cmsis_metadata(
     source: &str,
     devices: &mut Vec<DiscoveryValue>,
     flash_regions: &mut Vec<ProfileRegionConfig>,
+    provenance: &mut Vec<DiscoveryValue>,
     diagnostics: &mut Vec<DiscoveryDiagnostic>,
 ) {
     if let Some(device) = between(contents, "<Device>", "</Device>") {
@@ -410,10 +633,18 @@ fn parse_cmsis_metadata(
             .unwrap_or_default()
             .to_ascii_uppercase();
         if id.contains("ROM") || id.contains("FLASH") {
-            flash_regions.push(ProfileRegionConfig {
+            let region = ProfileRegionConfig {
                 address: start,
                 length: size,
-            });
+            };
+            flash_regions.push(region);
+            record_profile_region(
+                provenance,
+                "profile.flash_regions",
+                region,
+                source,
+                "cmsis-keil",
+            );
         }
     }
     if contents.contains("<algorithm") {
@@ -559,5 +790,57 @@ mod tests {
         let region = discovered.config.profile.expect("profile").flash_regions[0];
         assert_eq!(region.address, 0);
         assert_eq!(region.length, 0x1_0000);
+        assert!(discovered.provenance.iter().any(|value| {
+            value.field == "profile.flash_regions" && value.source == "device.board"
+        }));
+    }
+
+    #[test]
+    fn parses_jflash_target_loader_ram_and_reports_unconverted_initialization() {
+        let root = tempfile::tempdir().expect("temp project");
+        fs::write(
+            root.path().join("device.jflash"),
+            r#"
+[GENERAL]
+TargetIF = 1
+[JTAG]
+Speed1 = 1000
+[CPU]
+ChipName = "Z20K146MC"
+RAMAddr = 0x20000000
+RAMSize = 0x00001000
+UseRAM = 1
+NumInitSteps = 1
+[FLASH]
+BaseAddr = 0x00000000
+DeviceName = "Z20K146MC internal"
+"#,
+        )
+        .expect("jflash");
+
+        let discovered = discover_project(root.path());
+        let target = discovered.config.target.expect("J-Flash target");
+        assert_eq!(target.device.as_deref(), Some("Z20K146MC"));
+        assert_eq!(target.interface, Some(jlink_domain::TargetInterface::Swd));
+        assert_eq!(target.speed_khz, Some(1000));
+        let profile = discovered.config.profile.expect("J-Flash profile");
+        assert_eq!(profile.loader_ram.expect("loader").address, 0x2000_0000);
+        assert!(discovered.provenance.iter().any(|value| {
+            value.field == "profile.loader_ram"
+                && value.source == "device.jflash"
+                && value.adapter == "segger-jflash"
+        }));
+        assert!(
+            discovered
+                .diagnostics
+                .iter()
+                .any(|value| { value.code == "jflash_flash_layout_incomplete" })
+        );
+        assert!(
+            discovered
+                .diagnostics
+                .iter()
+                .any(|value| { value.code == "jflash_initialization_unsupported" })
+        );
     }
 }

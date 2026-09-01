@@ -18,9 +18,9 @@ use jlink_domain::{
     DebugRequest, DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage,
     FlashRange, HssEvidenceKind, HssRawEndianness, HssRawSelector, HssRawValueType, HssReturnWhen,
     HssRunSnapshot, HssRunState, HssSelectorPlan, HssStartPlan, HssThresholdRule, JlinkError,
-    MemoryRange, ProfileConflictSeverity, ProgramAfter, ProgramRequest, TargetConnectionSpec,
-    TargetInterface, ValidationAfter, VariableSelector, WriteVerify, canonical_device_name,
-    probe_identity_hash,
+    MemoryRange, ProfileConflict, ProfileConflictSeverity, ProfileSource, ProfileSourceKind,
+    ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter,
+    VariableSelector, WriteVerify, canonical_device_name, probe_identity_hash,
 };
 use serde_json::{Map, Value, json};
 
@@ -1447,13 +1447,119 @@ fn apply_discovery_profile(config: &mut ResolvedConfig, discovery: &ProjectDisco
     config.profile.aliases.sort();
     config.profile.aliases.dedup();
     config.profile.conflicts.clone_from(&discovery.conflicts);
-    if matches!(
+    let explicit_device = matches!(
         config.target.device.source,
         ConfigSource::Request | ConfigSource::Session | ConfigSource::Project
-    ) {
-        for conflict in &mut config.profile.conflicts {
-            conflict.severity = ProfileConflictSeverity::Trace;
+    );
+    downgrade_explicit_device_conflicts(&mut config.profile.conflicts, explicit_device);
+
+    let discovered_profile = config.profile.sources.iter().any(|source| {
+        source.kind == ProfileSourceKind::ProjectNative && source.locator == "discovered"
+    });
+    if discovered_profile {
+        let sources = discovered_profile_sources(discovery);
+        if !sources.is_empty() {
+            config.profile.sources = sources;
         }
+    }
+}
+
+fn discovered_profile_sources(discovery: &ProjectDiscovery) -> Vec<ProfileSource> {
+    let mut sources = Vec::<ProfileSource>::new();
+    for value in discovery
+        .provenance
+        .iter()
+        .filter(|value| value.field.starts_with("profile."))
+    {
+        let kind = if value.adapter.starts_with("segger-") {
+            ProfileSourceKind::Segger
+        } else {
+            ProfileSourceKind::ProjectNative
+        };
+        if !sources
+            .iter()
+            .any(|source| source.kind == kind && source.locator == value.source)
+        {
+            sources.push(ProfileSource {
+                kind,
+                locator: value.source.clone(),
+            });
+        }
+    }
+    sources
+}
+
+fn downgrade_explicit_device_conflicts(conflicts: &mut [ProfileConflict], explicit_device: bool) {
+    if !explicit_device {
+        return;
+    }
+    for conflict in conflicts
+        .iter_mut()
+        .filter(|conflict| conflict.field == "target.device")
+    {
+        conflict.severity = ProfileConflictSeverity::Trace;
+    }
+}
+
+#[cfg(test)]
+mod discovery_profile_tests {
+    use jlink_domain::{ProfileConflict, ProfileConflictSeverity, ProfileSourceKind};
+
+    use super::{discovered_profile_sources, downgrade_explicit_device_conflicts};
+    use crate::discovery::{DiscoveryValue, ProjectDiscovery};
+
+    #[test]
+    fn explicit_device_resolves_only_device_conflicts() {
+        let mut conflicts = vec![
+            ProfileConflict {
+                field: "target.device".to_owned(),
+                severity: ProfileConflictSeverity::Blocking,
+                selected: "Z20K146M".to_owned(),
+                rejected: "Z20K146MC".to_owned(),
+                sources: vec!["app.xcl".to_owned(), "app.jlink".to_owned()],
+            },
+            ProfileConflict {
+                field: "profile.loader_ram".to_owned(),
+                severity: ProfileConflictSeverity::Blocking,
+                selected: "0x20000000:4096".to_owned(),
+                rejected: "0x20001000:4096".to_owned(),
+                sources: vec!["one.board".to_owned(), "two.jflash".to_owned()],
+            },
+        ];
+
+        downgrade_explicit_device_conflicts(&mut conflicts, true);
+
+        assert_eq!(conflicts[0].severity, ProfileConflictSeverity::Trace);
+        assert_eq!(conflicts[1].severity, ProfileConflictSeverity::Blocking);
+    }
+
+    #[test]
+    fn discovered_profile_sources_keep_exact_files_and_adapter_kind() {
+        let discovery = ProjectDiscovery {
+            provenance: vec![
+                DiscoveryValue {
+                    field: "profile.flash_regions".to_owned(),
+                    value: "0x0:65536".to_owned(),
+                    source: "device.board".to_owned(),
+                    adapter: "iar-board".to_owned(),
+                },
+                DiscoveryValue {
+                    field: "profile.loader_ram".to_owned(),
+                    value: "0x20000000:4096".to_owned(),
+                    source: "device.jflash".to_owned(),
+                    adapter: "segger-jflash".to_owned(),
+                },
+            ],
+            ..ProjectDiscovery::default()
+        };
+
+        let sources = discovered_profile_sources(&discovery);
+
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].kind, ProfileSourceKind::ProjectNative);
+        assert_eq!(sources[0].locator, "device.board");
+        assert_eq!(sources[1].kind, ProfileSourceKind::Segger);
+        assert_eq!(sources[1].locator, "device.jflash");
     }
 }
 
