@@ -7,6 +7,7 @@ mod hss;
 mod image;
 mod ipc;
 mod memory;
+mod profile;
 mod program;
 mod session;
 mod state;
@@ -44,6 +45,10 @@ pub use memory::{
     MemoryReadOrigin, MemoryReadPart, MemoryReadPlan, MemoryRegion, MemoryRegionKind,
     MergedMemoryRead, WriteVerify, merge_safe_memory_reads, validate_write_count,
     verify_memory_readback,
+};
+pub use profile::{
+    CapabilityState, FlashProfile, ProfileConflict, ProfileConflictSeverity, ProfileSource,
+    ProfileSourceKind, TargetCapabilities, canonical_device_name,
 };
 pub use program::{
     FlashRange, FlashRegion, ProgramAfter, ProgramRequest, VerifyMismatch,

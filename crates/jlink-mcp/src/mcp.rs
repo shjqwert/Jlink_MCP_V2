@@ -350,7 +350,7 @@ fn target_tool() -> Value {
         action_object(
             "config_set",
             vec![
-                ("scope", json!({ "const": "project" })),
+                ("scope", string_enum(&["project", "session"])),
                 ("values", values_project),
             ],
             &["scope", "values"],
@@ -627,6 +627,7 @@ fn target_output_schema() -> Value {
     let effective = config_map_schema(&Value::Bool(true));
     let sources = config_map_schema(&string_enum(&[
         "request",
+        "session",
         "user",
         "project",
         "discovered",
@@ -661,8 +662,16 @@ fn target_output_schema() -> Value {
                 "recovery_notifications",
                 json!({ "type": "array", "items": string_enum(&["resumed_from_halt", "reset_after_fault"]) }),
             ),
+            ("profile_validation", Value::Bool(true)),
             ("effective", effective),
             ("sources", sources),
+            ("missing", Value::Bool(true)),
+            ("operations", Value::Bool(true)),
+            ("provenance", Value::Bool(true)),
+            ("conflicts", Value::Bool(true)),
+            ("diagnostics", Value::Bool(true)),
+            ("dll_selection", Value::Bool(true)),
+            ("profile", Value::Bool(true)),
             ("error", error_schema()),
         ],
         &[],
@@ -1295,12 +1304,11 @@ fn config_map_schema(value_schema: &Value) -> Value {
         "probe.serial",
         "capture.max_bytes",
     ];
-    closed_object(
-        keys.into_iter()
-            .map(|key| (key, value_schema.clone()))
-            .collect(),
-        &[],
-    )
+    json!({
+        "type": "object",
+        "propertyNames": { "enum": keys },
+        "additionalProperties": value_schema
+    })
 }
 
 fn error_schema() -> Value {

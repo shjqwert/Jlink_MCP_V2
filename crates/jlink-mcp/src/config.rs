@@ -1,6 +1,7 @@
 //! Layered, validated configuration for the local MCP process.
 
 use std::{
+    collections::BTreeMap,
     env,
     ffi::c_void,
     fmt,
@@ -12,8 +13,12 @@ use std::{
 };
 
 pub use jlink_capture::DEFAULT_CAPTURE_MAX_BYTES;
-use jlink_domain::{ErrorCode, JlinkError, TargetInterface};
+use jlink_domain::{
+    ErrorCode, FlashProfile, JlinkError, MemoryRegion, MemoryRegionKind, ProfileSource,
+    ProfileSourceKind, TargetCapabilities, TargetInterface,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 /// The source from which a resolved field was selected.
@@ -22,6 +27,8 @@ use sha2::{Digest, Sha256};
 pub enum ConfigSource {
     /// A value supplied directly by the current request.
     Request,
+    /// A value retained only for the current MCP process lifecycle.
+    Session,
     /// A value supplied by the per-user configuration.
     User,
     /// A value supplied by the project configuration.
@@ -97,6 +104,30 @@ pub struct CaptureConfig {
     pub max_bytes: Option<u64>,
 }
 
+/// One configured target address range.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileRegionConfig {
+    /// First byte address.
+    pub address: u64,
+    /// Non-zero length in bytes.
+    pub length: u64,
+}
+
+/// Optional vendor-neutral Flash/RAM safety metadata.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlashProfileConfig {
+    /// Declared Flash ranges.
+    pub flash_regions: Vec<ProfileRegionConfig>,
+    /// RAM ranges allowed for raw HSS reads.
+    pub readable_ram: Vec<ProfileRegionConfig>,
+    /// Final work RAM selected for the Flash loader.
+    pub loader_ram: Option<ProfileRegionConfig>,
+    /// Explicitly supported target observations.
+    pub capabilities: TargetCapabilities,
+}
+
 /// A partial configuration layer. Missing nested tables and fields are preserved.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -113,6 +144,8 @@ pub struct ConfigFile {
     pub probe: Option<ProbeConfig>,
     /// Capture-store fields.
     pub capture: Option<CaptureConfig>,
+    /// Vendor-neutral Flash/RAM safety metadata.
+    pub profile: Option<FlashProfileConfig>,
 }
 
 /// Paths for the project and user configuration layers.
@@ -149,6 +182,8 @@ impl Default for ConfigPaths {
 /// The configuration scope targeted by a partial update.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigScope {
+    /// The current MCP lifecycle only; never persisted.
+    Session,
     /// The project-local layer.
     Project,
     /// The per-user layer.
@@ -229,11 +264,327 @@ pub struct ResolvedConfig {
     pub probe: ResolvedProbe,
     /// Resolved capture fields.
     pub capture: ResolvedCapture,
+    /// Selected vendor-neutral safety profile.
+    pub profile: FlashProfile,
 }
 
 /// A discovered layer. It is intentionally explicit so discovery cannot silently
 /// override a configured value.
 pub type DiscoveredConfig = ConfigFile;
+
+/// Partial, hardware-free configuration view used by `config_get`.
+#[derive(Clone, Debug, Serialize)]
+pub struct ConfigInspection {
+    /// Every currently selected field, even when other required fields are absent.
+    pub effective: BTreeMap<String, Value>,
+    /// Selected source for each effective field.
+    pub sources: BTreeMap<String, ConfigSource>,
+    /// Required fields still absent.
+    pub missing: Vec<String>,
+    /// Whether each public operation has enough static configuration to proceed.
+    pub operations: BTreeMap<String, bool>,
+    /// Same-directory x64 selection performed from a configured 32-bit candidate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dll_selection: Option<DllSelection>,
+    /// Fully resolved configuration when no required field is missing.
+    #[serde(skip)]
+    pub resolved: Option<ResolvedConfig>,
+}
+
+/// Auditable DLL path normalization from an x86 installation candidate to x64.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct DllSelection {
+    /// Configured candidate path.
+    pub configured_path: PathBuf,
+    /// Selected x64 path.
+    pub selected_path: PathBuf,
+    /// Stable reason code.
+    pub reason: String,
+}
+
+/// Builds a partial configuration view without opening a DLL, Worker, or target.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConfigInvalid`] when a local layer cannot be read or contains
+/// invalid fields. Missing fields are reported in the returned inspection instead.
+#[allow(clippy::too_many_lines)]
+pub fn inspect_config(
+    session: &ConfigFile,
+    paths: &ConfigPaths,
+    discovered: &DiscoveredConfig,
+) -> Result<ConfigInspection, JlinkError> {
+    validate_layer_scope(session, ConfigScope::Session)?;
+    validate_partial(session)?;
+    let user = read_config_file(&paths.user)?;
+    let project = read_config_file(&paths.project)?;
+    if let Some(user) = &user {
+        validate_layer_scope(user, ConfigScope::User)?;
+        validate_partial(user)?;
+    }
+    if let Some(project) = &project {
+        validate_layer_scope(project, ConfigScope::Project)?;
+        validate_partial(project)?;
+    }
+    validate_partial(discovered)?;
+
+    let mut effective = BTreeMap::new();
+    let mut sources = BTreeMap::new();
+    macro_rules! insert_field {
+        ($name:literal, $value:expr) => {
+            if let Some(field) = $value {
+                effective.insert(
+                    $name.to_owned(),
+                    serde_json::to_value(&field.value).map_err(|error| {
+                        config_error(format!("cannot serialize {}: {error}", $name))
+                    })?,
+                );
+                sources.insert($name.to_owned(), field.source);
+            }
+        };
+    }
+    insert_field!(
+        "target.device",
+        pick(
+            None::<&String>,
+            session
+                .target
+                .as_ref()
+                .and_then(|value| value.device.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.target.as_ref())
+                .and_then(|value| value.device.as_ref()),
+            discovered
+                .target
+                .as_ref()
+                .and_then(|value| value.device.as_ref())
+        )
+    );
+    insert_field!(
+        "target.interface",
+        pick_copy(
+            None::<TargetInterface>,
+            session.target.as_ref().and_then(|value| value.interface),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.target.as_ref())
+                .and_then(|value| value.interface),
+            discovered.target.as_ref().and_then(|value| value.interface)
+        )
+    );
+    insert_field!(
+        "target.speed_khz",
+        pick_copy(
+            None::<u32>,
+            session.target.as_ref().and_then(|value| value.speed_khz),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.target.as_ref())
+                .and_then(|value| value.speed_khz),
+            discovered.target.as_ref().and_then(|value| value.speed_khz)
+        )
+    );
+    insert_field!(
+        "symbols.elf",
+        pick(
+            None::<&PathBuf>,
+            session
+                .symbols
+                .as_ref()
+                .and_then(|value| value.elf.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.symbols.as_ref())
+                .and_then(|value| value.elf.as_ref()),
+            discovered
+                .symbols
+                .as_ref()
+                .and_then(|value| value.elf.as_ref())
+        )
+    );
+    insert_field!(
+        "firmware.image",
+        pick(
+            None::<&PathBuf>,
+            session
+                .firmware
+                .as_ref()
+                .and_then(|value| value.image.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.firmware.as_ref())
+                .and_then(|value| value.image.as_ref()),
+            discovered
+                .firmware
+                .as_ref()
+                .and_then(|value| value.image.as_ref())
+        )
+    );
+    insert_field!(
+        "jlink.dll_path",
+        pick(
+            None::<&PathBuf>,
+            session
+                .jlink
+                .as_ref()
+                .and_then(|value| value.dll_path.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.jlink.as_ref())
+                .and_then(|value| value.dll_path.as_ref()),
+            discovered
+                .jlink
+                .as_ref()
+                .and_then(|value| value.dll_path.as_ref())
+        )
+    );
+    insert_field!(
+        "jlink.dll_version",
+        pick(
+            None::<&String>,
+            session
+                .jlink
+                .as_ref()
+                .and_then(|value| value.version.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.jlink.as_ref())
+                .and_then(|value| value.version.as_ref()),
+            discovered
+                .jlink
+                .as_ref()
+                .and_then(|value| value.version.as_ref())
+        )
+    );
+    insert_field!(
+        "jlink.dll_sha256",
+        pick(
+            None::<&String>,
+            session
+                .jlink
+                .as_ref()
+                .and_then(|value| value.sha256.as_ref()),
+            None,
+            project
+                .as_ref()
+                .and_then(|value| value.jlink.as_ref())
+                .and_then(|value| value.sha256.as_ref()),
+            discovered
+                .jlink
+                .as_ref()
+                .and_then(|value| value.sha256.as_ref())
+        )
+    );
+    insert_field!(
+        "probe.serial",
+        pick_copy(
+            None::<u32>,
+            None,
+            user.as_ref()
+                .and_then(|value| value.probe.as_ref())
+                .and_then(|value| value.serial),
+            None,
+            discovered.probe.as_ref().and_then(|value| value.serial)
+        )
+    );
+    let capture = pick_copy(
+        None::<u64>,
+        session.capture.as_ref().and_then(|value| value.max_bytes),
+        None,
+        project
+            .as_ref()
+            .and_then(|value| value.capture.as_ref())
+            .and_then(|value| value.max_bytes),
+        discovered
+            .capture
+            .as_ref()
+            .and_then(|value| value.max_bytes),
+    )
+    .unwrap_or_else(|| resolved(DEFAULT_CAPTURE_MAX_BYTES, ConfigSource::Default));
+    effective.insert("capture.max_bytes".to_owned(), json!(capture.value));
+    sources.insert("capture.max_bytes".to_owned(), capture.source);
+
+    let dll_selection = effective
+        .get("jlink.dll_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .map(|configured| {
+            select_x64_dll_candidate(&configured).map(|selected| {
+                if selected == configured {
+                    None
+                } else {
+                    effective.insert(
+                        "jlink.dll_path".to_owned(),
+                        json!(selected.to_string_lossy()),
+                    );
+                    Some(DllSelection {
+                        configured_path: configured,
+                        selected_path: selected,
+                        reason: "configured_x86_same_install_x64".to_owned(),
+                    })
+                }
+            })
+        })
+        .transpose()?
+        .flatten();
+    let required = [
+        "target.device",
+        "target.interface",
+        "target.speed_khz",
+        "jlink.dll_path",
+        "jlink.dll_version",
+        "jlink.dll_sha256",
+    ];
+    let missing = required
+        .iter()
+        .filter(|name| !effective.contains_key(**name))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let resolved = if missing.is_empty() {
+        Some(resolve_layers_with_session(
+            &ConfigFile::default(),
+            Some(session),
+            user.as_ref(),
+            project.as_ref(),
+            Some(discovered),
+        )?)
+    } else {
+        None
+    };
+    let static_ready = resolved.is_some();
+    let probe_ready = effective.contains_key("probe.serial");
+    let symbols_ready = effective.contains_key("symbols.elf");
+    let mut operations = BTreeMap::new();
+    operations.insert("config_get".to_owned(), true);
+    operations.insert("connect".to_owned(), static_ready && probe_ready);
+    operations.insert("validate".to_owned(), static_ready && probe_ready);
+    operations.insert("program".to_owned(), static_ready && probe_ready);
+    operations.insert("raw_debug".to_owned(), static_ready && probe_ready);
+    operations.insert(
+        "symbol_debug".to_owned(),
+        static_ready && probe_ready && symbols_ready,
+    );
+    operations.insert(
+        "hss".to_owned(),
+        static_ready && probe_ready && symbols_ready,
+    );
+    Ok(ConfigInspection {
+        effective,
+        sources,
+        missing,
+        operations,
+        dll_selection,
+        resolved,
+    })
+}
 
 /// Resolves request, user, project, discovery, and safe-default layers.
 ///
@@ -246,9 +597,30 @@ pub fn resolve_config(
     paths: &ConfigPaths,
     discovered: &DiscoveredConfig,
 ) -> Result<ResolvedConfig, JlinkError> {
+    resolve_config_with_session(request, &ConfigFile::default(), paths, discovered)
+}
+
+/// Resolves a request with one memory-only session layer.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConfigInvalid`] when a layer cannot be read or the
+/// effective configuration is incomplete or invalid.
+pub fn resolve_config_with_session(
+    request: &ConfigFile,
+    session: &ConfigFile,
+    paths: &ConfigPaths,
+    discovered: &DiscoveredConfig,
+) -> Result<ResolvedConfig, JlinkError> {
     let user = read_config_file(&paths.user)?;
     let project = read_config_file(&paths.project)?;
-    resolve_layers(request, user.as_ref(), project.as_ref(), Some(discovered))
+    resolve_layers_with_session(
+        request,
+        Some(session),
+        user.as_ref(),
+        project.as_ref(),
+        Some(discovered),
+    )
 }
 
 /// Resolves already-loaded layers, which is useful for deterministic tests.
@@ -264,6 +636,26 @@ pub fn resolve_layers(
     project: Option<&ConfigFile>,
     discovered: Option<&ConfigFile>,
 ) -> Result<ResolvedConfig, JlinkError> {
+    resolve_layers_with_session(request, None, user, project, discovered)
+}
+
+/// Resolves already-loaded layers including an optional memory-only session layer.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::ConfigInvalid`] when the effective configuration is
+/// incomplete or invalid.
+#[allow(clippy::too_many_lines)]
+pub fn resolve_layers_with_session(
+    request: &ConfigFile,
+    session: Option<&ConfigFile>,
+    user: Option<&ConfigFile>,
+    project: Option<&ConfigFile>,
+    discovered: Option<&ConfigFile>,
+) -> Result<ResolvedConfig, JlinkError> {
+    if let Some(session_layer) = session {
+        validate_layer_scope(session_layer, ConfigScope::Session)?;
+    }
     if let Some(user_layer) = user {
         validate_layer_scope(user_layer, ConfigScope::User)?;
     }
@@ -275,6 +667,9 @@ pub fn resolve_layers(
             "target.device",
             pick(
                 request.target.as_ref().and_then(|v| v.device.as_ref()),
+                session
+                    .and_then(|v| v.target.as_ref())
+                    .and_then(|v| v.device.as_ref()),
                 user.and_then(|v| v.target.as_ref())
                     .and_then(|v| v.device.as_ref()),
                 project
@@ -289,6 +684,9 @@ pub fn resolve_layers(
             "target.interface",
             pick_copy(
                 request.target.as_ref().and_then(|v| v.interface),
+                session
+                    .and_then(|v| v.target.as_ref())
+                    .and_then(|v| v.interface),
                 user.and_then(|v| v.target.as_ref())
                     .and_then(|v| v.interface),
                 project
@@ -303,6 +701,9 @@ pub fn resolve_layers(
             "target.speed_khz",
             pick_copy(
                 request.target.as_ref().and_then(|v| v.speed_khz),
+                session
+                    .and_then(|v| v.target.as_ref())
+                    .and_then(|v| v.speed_khz),
                 user.and_then(|v| v.target.as_ref())
                     .and_then(|v| v.speed_khz),
                 project
@@ -322,6 +723,9 @@ pub fn resolve_layers(
     let symbols = ResolvedSymbols {
         elf: pick(
             request.symbols.as_ref().and_then(|v| v.elf.as_ref()),
+            session
+                .and_then(|v| v.symbols.as_ref())
+                .and_then(|v| v.elf.as_ref()),
             user.and_then(|v| v.symbols.as_ref())
                 .and_then(|v| v.elf.as_ref()),
             project
@@ -335,6 +739,9 @@ pub fn resolve_layers(
     let firmware = ResolvedFirmware {
         image: pick(
             request.firmware.as_ref().and_then(|v| v.image.as_ref()),
+            session
+                .and_then(|v| v.firmware.as_ref())
+                .and_then(|v| v.image.as_ref()),
             user.and_then(|v| v.firmware.as_ref())
                 .and_then(|v| v.image.as_ref()),
             project
@@ -345,11 +752,14 @@ pub fn resolve_layers(
                 .and_then(|v| v.image.as_ref()),
         ),
     };
-    let jlink = ResolvedJlink {
+    let mut jlink = ResolvedJlink {
         dll_path: required(
             "jlink.dll_path",
             pick(
                 request.jlink.as_ref().and_then(|v| v.dll_path.as_ref()),
+                session
+                    .and_then(|v| v.jlink.as_ref())
+                    .and_then(|v| v.dll_path.as_ref()),
                 user.and_then(|v| v.jlink.as_ref())
                     .and_then(|v| v.dll_path.as_ref()),
                 project
@@ -364,6 +774,9 @@ pub fn resolve_layers(
             "jlink.version",
             pick(
                 request.jlink.as_ref().and_then(|v| v.version.as_ref()),
+                session
+                    .and_then(|v| v.jlink.as_ref())
+                    .and_then(|v| v.version.as_ref()),
                 user.and_then(|v| v.jlink.as_ref())
                     .and_then(|v| v.version.as_ref()),
                 project
@@ -378,6 +791,9 @@ pub fn resolve_layers(
             "jlink.sha256",
             pick(
                 request.jlink.as_ref().and_then(|v| v.sha256.as_ref()),
+                session
+                    .and_then(|v| v.jlink.as_ref())
+                    .and_then(|v| v.sha256.as_ref()),
                 user.and_then(|v| v.jlink.as_ref())
                     .and_then(|v| v.sha256.as_ref()),
                 project
@@ -389,11 +805,15 @@ pub fn resolve_layers(
             ),
         )?,
     };
+    jlink.dll_path.value = select_x64_dll_candidate(&jlink.dll_path.value)?;
     validate_jlink_fields(&jlink)?;
 
     let probe = ResolvedProbe {
         serial: pick_copy(
             request.probe.as_ref().and_then(|v| v.serial),
+            session
+                .and_then(|v| v.probe.as_ref())
+                .and_then(|v| v.serial),
             user.and_then(|v| v.probe.as_ref()).and_then(|v| v.serial),
             project
                 .and_then(|v| v.probe.as_ref())
@@ -405,6 +825,9 @@ pub fn resolve_layers(
     };
     let max_bytes = pick_copy(
         request.capture.as_ref().and_then(|v| v.max_bytes),
+        session
+            .and_then(|v| v.capture.as_ref())
+            .and_then(|v| v.max_bytes),
         user.and_then(|v| v.capture.as_ref())
             .and_then(|v| v.max_bytes),
         project
@@ -428,6 +851,15 @@ pub fn resolve_layers(
         return Err(config_error("capture.max_bytes must be positive"));
     }
 
+    let profile_config = pick(
+        request.profile.as_ref(),
+        session.and_then(|value| value.profile.as_ref()),
+        user.and_then(|value| value.profile.as_ref()),
+        project.and_then(|value| value.profile.as_ref()),
+        discovered.and_then(|value| value.profile.as_ref()),
+    );
+    let profile = build_flash_profile(&target.device, profile_config.as_ref())?;
+
     Ok(ResolvedConfig {
         target,
         symbols,
@@ -435,6 +867,7 @@ pub fn resolve_layers(
         jlink,
         probe,
         capture,
+        profile,
     })
 }
 
@@ -460,6 +893,11 @@ pub fn config_set(
     validate_layer_scope(patch, scope)?;
     validate_partial(patch)?;
     let config_path = match scope {
+        ConfigScope::Session => {
+            return Err(config_error(
+                "session scope is memory-only and must be applied by the MCP runtime",
+            ));
+        }
         ConfigScope::Project => &paths.project,
         ConfigScope::User => &paths.user,
     };
@@ -467,36 +905,55 @@ pub fn config_set(
     merge_config(&mut current, patch);
     validate_layer_scope(&current, scope)?;
     validate_partial(&current)?;
-    let user_layer = match scope {
-        ConfigScope::Project => read_config_file(&paths.user)?,
-        ConfigScope::User => Some(current.clone()),
-    };
-    let project_layer = match scope {
-        ConfigScope::Project => Some(current.clone()),
-        ConfigScope::User => read_config_file(&paths.project)?,
-    };
-    resolve_layers(
-        &ConfigFile::default(),
-        user_layer.as_ref(),
-        project_layer.as_ref(),
-        None,
-    )?;
     atomic_write_config(config_path, &current)
 }
 
-fn validate_layer_scope(config: &ConfigFile, scope: ConfigScope) -> Result<(), JlinkError> {
+/// Applies a partial memory-only session update.
+///
+/// # Errors
+///
+/// Returns [`ErrorCode::OperationConflict`] while connected or capturing, or
+/// [`ErrorCode::ConfigInvalid`] when the patch violates session scope.
+pub fn apply_session_patch(
+    current: &mut ConfigFile,
+    patch: &ConfigFile,
+    state: ConfigSetState,
+) -> Result<(), JlinkError> {
+    if state.connected || state.capture_active {
+        return Err(JlinkError::new(
+            ErrorCode::OperationConflict,
+            "configuration cannot change while connected or capturing",
+            true,
+        ));
+    }
+    validate_layer_scope(patch, ConfigScope::Session)?;
+    validate_partial(patch)?;
+    let mut candidate = current.clone();
+    merge_config(&mut candidate, patch);
+    validate_layer_scope(&candidate, ConfigScope::Session)?;
+    validate_partial(&candidate)?;
+    *current = candidate;
+    Ok(())
+}
+
+pub(crate) fn validate_layer_scope(
+    config: &ConfigFile,
+    scope: ConfigScope,
+) -> Result<(), JlinkError> {
     let invalid = match scope {
+        ConfigScope::Session | ConfigScope::Project => config.probe.is_some(),
         ConfigScope::User => {
             config.target.is_some()
                 || config.symbols.is_some()
                 || config.firmware.is_some()
                 || config.jlink.is_some()
                 || config.capture.is_some()
+                || config.profile.is_some()
         }
-        ConfigScope::Project => config.probe.is_some(),
     };
     if invalid {
         let message = match scope {
+            ConfigScope::Session => "session scope does not permit probe.serial configuration",
             ConfigScope::User => "user scope permits only probe.serial configuration",
             ConfigScope::Project => "project scope does not permit probe.serial configuration",
         };
@@ -505,7 +962,7 @@ fn validate_layer_scope(config: &ConfigFile, scope: ConfigScope) -> Result<(), J
     Ok(())
 }
 
-fn validate_partial(config: &ConfigFile) -> Result<(), JlinkError> {
+pub(crate) fn validate_partial(config: &ConfigFile) -> Result<(), JlinkError> {
     if let Some(target) = &config.target {
         if let Some(device) = &target.device {
             validate_device(device)?;
@@ -533,7 +990,87 @@ fn validate_partial(config: &ConfigFile) -> Result<(), JlinkError> {
     {
         return Err(config_error("capture.max_bytes must be positive"));
     }
+    if let Some(profile) = &config.profile {
+        validate_profile_config(profile)?;
+    }
     Ok(())
+}
+
+fn validate_profile_config(profile: &FlashProfileConfig) -> Result<(), JlinkError> {
+    for region in &profile.flash_regions {
+        MemoryRegion::new(region.address, region.length, MemoryRegionKind::Flash)?;
+    }
+    for region in &profile.readable_ram {
+        MemoryRegion::new(region.address, region.length, MemoryRegionKind::Ram)?;
+    }
+    if let Some(region) = profile.loader_ram {
+        MemoryRegion::new(region.address, region.length, MemoryRegionKind::Ram)?;
+    }
+    Ok(())
+}
+
+fn build_flash_profile(
+    device: &ResolvedField<String>,
+    config: Option<&ResolvedField<FlashProfileConfig>>,
+) -> Result<FlashProfile, JlinkError> {
+    let flash_regions = config
+        .map(|field| {
+            field
+                .value
+                .flash_regions
+                .iter()
+                .map(|region| {
+                    MemoryRegion::new(region.address, region.length, MemoryRegionKind::Flash)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let readable_ram = config
+        .map(|field| {
+            field
+                .value
+                .readable_ram
+                .iter()
+                .map(|region| {
+                    MemoryRegion::new(region.address, region.length, MemoryRegionKind::Ram)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let loader_ram = config
+        .and_then(|field| field.value.loader_ram)
+        .map(|region| MemoryRegion::new(region.address, region.length, MemoryRegionKind::Ram))
+        .transpose()?;
+    let capabilities = config.map_or_else(TargetCapabilities::default, |field| {
+        field.value.capabilities.clone()
+    });
+    let source = config.map_or(device.source, |field| field.source);
+    let profile = FlashProfile {
+        device: device.value.clone(),
+        aliases: Vec::new(),
+        flash_regions,
+        readable_ram,
+        loader_ram,
+        capabilities,
+        sources: vec![ProfileSource {
+            kind: profile_source_kind(source),
+            locator: source.to_string(),
+        }],
+        conflicts: Vec::new(),
+    };
+    profile.validate()?;
+    Ok(profile)
+}
+
+const fn profile_source_kind(source: ConfigSource) -> ProfileSourceKind {
+    match source {
+        ConfigSource::Request | ConfigSource::Session => ProfileSourceKind::Session,
+        ConfigSource::Project => ProfileSourceKind::Project,
+        ConfigSource::Discovered => ProfileSourceKind::ProjectNative,
+        ConfigSource::User | ConfigSource::Default => ProfileSourceKind::Environment,
+    }
 }
 
 fn validate_device(device: &str) -> Result<(), JlinkError> {
@@ -583,12 +1120,14 @@ fn required<T>(
 
 fn pick<T: Clone>(
     request: Option<&T>,
+    session: Option<&T>,
     user: Option<&T>,
     project: Option<&T>,
     discovered: Option<&T>,
 ) -> Option<ResolvedField<T>> {
     request
         .map(|value| resolved(value.clone(), ConfigSource::Request))
+        .or_else(|| session.map(|value| resolved(value.clone(), ConfigSource::Session)))
         .or_else(|| user.map(|value| resolved(value.clone(), ConfigSource::User)))
         .or_else(|| project.map(|value| resolved(value.clone(), ConfigSource::Project)))
         .or_else(|| discovered.map(|value| resolved(value.clone(), ConfigSource::Discovered)))
@@ -596,12 +1135,14 @@ fn pick<T: Clone>(
 
 fn pick_copy<T: Copy>(
     request: Option<T>,
+    session: Option<T>,
     user: Option<T>,
     project: Option<T>,
     discovered: Option<T>,
 ) -> Option<ResolvedField<T>> {
     request
         .map(|value| resolved(value, ConfigSource::Request))
+        .or_else(|| session.map(|value| resolved(value, ConfigSource::Session)))
         .or_else(|| user.map(|value| resolved(value, ConfigSource::User)))
         .or_else(|| project.map(|value| resolved(value, ConfigSource::Project)))
         .or_else(|| discovered.map(|value| resolved(value, ConfigSource::Discovered)))
@@ -635,6 +1176,9 @@ fn merge_config(base: &mut ConfigFile, patch: &ConfigFile) {
     merge_jlink(&mut base.jlink, patch.jlink.as_ref());
     merge_probe(&mut base.probe, patch.probe.as_ref());
     merge_capture(&mut base.capture, patch.capture.as_ref());
+    if patch.profile.is_some() {
+        base.profile.clone_from(&patch.profile);
+    }
 }
 
 fn merge_target(base: &mut Option<TargetConfig>, patch: Option<&TargetConfig>) {
@@ -823,7 +1367,52 @@ pub fn validate_dll_identity(config: &ResolvedJlink) -> Result<(), JlinkError> {
     Ok(())
 }
 
+/// Selects an x64 DLL from the same SEGGER installation when the configured file is x86.
+///
+/// # Errors
+///
+/// Returns a stable architecture error when an existing configured PE is x86 and no valid
+/// same-directory x64 candidate exists, or when its PE header cannot be inspected.
+pub fn select_x64_dll_candidate(path: &Path) -> Result<PathBuf, JlinkError> {
+    if !path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    match pe_machine(path)? {
+        0x8664 => Ok(path.to_path_buf()),
+        0x014c => {
+            let parent = path.parent().unwrap_or_else(|| Path::new("."));
+            for name in ["JLink_x64.dll", "JLinkARM_x64.dll"] {
+                let candidate = parent.join(name);
+                if candidate.is_file() && pe_machine(&candidate) == Ok(0x8664) {
+                    return Ok(candidate);
+                }
+            }
+            Err(JlinkError::new(
+                ErrorCode::DllArchitectureMismatch,
+                "configured J-Link DLL is x86 and no same-install x64 DLL was found",
+                false,
+            ))
+        }
+        machine => Err(JlinkError::new(
+            ErrorCode::DllArchitectureMismatch,
+            format!("J-Link DLL has unsupported PE machine 0x{machine:04X}"),
+            false,
+        )),
+    }
+}
+
 fn validate_pe_x64(path: &Path) -> Result<(), JlinkError> {
+    if pe_machine(path)? != 0x8664 {
+        return Err(JlinkError::new(
+            ErrorCode::DllArchitectureMismatch,
+            "J-Link DLL is not a PE x64 image",
+            false,
+        ));
+    }
+    Ok(())
+}
+
+fn pe_machine(path: &Path) -> Result<u16, JlinkError> {
     let mut file = File::open(path)
         .map_err(|error| JlinkError::new(ErrorCode::DllNotFound, error.to_string(), false))?;
     let mut dos = [0_u8; 64];
@@ -848,14 +1437,14 @@ fn validate_pe_x64(path: &Path) -> Result<(), JlinkError> {
     file.read_exact(&mut header).map_err(|error| {
         JlinkError::new(ErrorCode::DllArchitectureMismatch, error.to_string(), false)
     })?;
-    if &header[..4] != b"PE\0\0" || u16::from_le_bytes([header[4], header[5]]) != 0x8664 {
+    if &header[..4] != b"PE\0\0" {
         return Err(JlinkError::new(
             ErrorCode::DllArchitectureMismatch,
-            "J-Link DLL is not a PE x64 image",
+            "J-Link DLL has an invalid PE signature",
             false,
         ));
     }
-    Ok(())
+    Ok(u16::from_le_bytes([header[4], header[5]]))
 }
 
 fn sha256_file(path: &Path) -> Result<String, JlinkError> {
@@ -1007,17 +1596,35 @@ fn parse_translation(bytes: &[u8]) -> Result<(u16, u16), JlinkError> {
 impl fmt::Display for ConfigScope {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Session => "session",
             Self::Project => "project",
             Self::User => "user",
         })
     }
 }
 
+impl fmt::Display for ConfigSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Request => "request",
+            Self::Session => "session",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Discovered => "discovered",
+            Self::Default => "default",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{non_empty_parent, parse_translation};
-    use jlink_domain::ErrorCode;
-    use std::path::Path;
+    use super::{
+        ConfigFile, ConfigPaths, ConfigSetState, ConfigSource, JlinkConfig, TargetConfig,
+        apply_session_patch, inspect_config, non_empty_parent, parse_translation, resolve_layers,
+        resolve_layers_with_session, select_x64_dll_candidate,
+    };
+    use jlink_domain::{ErrorCode, TargetInterface};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn translation_parser_rejects_lengths_zero_through_three() {
@@ -1043,5 +1650,84 @@ mod tests {
             non_empty_parent(Path::new("config/jlink-mcp.toml")),
             Some(Path::new("config"))
         );
+    }
+
+    #[test]
+    fn partial_inspection_and_session_lifecycle_are_explicit() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let project_path = directory.path().join("jlink-mcp.toml");
+        std::fs::write(
+            &project_path,
+            "[target]\ndevice = \"Z20K146MC\"\ninterface = \"swd\"\n",
+        )
+        .expect("partial project");
+        let paths = ConfigPaths::new(project_path, directory.path().join("user.toml"));
+        let inspection = inspect_config(&ConfigFile::default(), &paths, &ConfigFile::default())
+            .expect("partial inspection");
+        assert_eq!(inspection.effective["target.device"], "Z20K146MC");
+        assert!(inspection.missing.contains(&"target.speed_khz".to_owned()));
+        assert!(!inspection.operations["connect"]);
+
+        let project = complete_config();
+        let mut session = ConfigFile::default();
+        apply_session_patch(
+            &mut session,
+            &ConfigFile {
+                target: Some(TargetConfig {
+                    device: Some("Z20K146MC".to_owned()),
+                    ..TargetConfig::default()
+                }),
+                ..ConfigFile::default()
+            },
+            ConfigSetState::default(),
+        )
+        .expect("session patch");
+        let selected = resolve_layers_with_session(
+            &ConfigFile::default(),
+            Some(&session),
+            None,
+            Some(&project),
+            None,
+        )
+        .expect("session resolution");
+        assert_eq!(selected.target.device.source, ConfigSource::Session);
+        let next = resolve_layers(&ConfigFile::default(), None, Some(&project), None)
+            .expect("new lifecycle");
+        assert_eq!(next.target.device.source, ConfigSource::Project);
+    }
+
+    #[test]
+    fn x86_candidate_selects_same_install_x64_pe() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let x86 = directory.path().join("JLinkARM.dll");
+        let x64 = directory.path().join("JLink_x64.dll");
+        std::fs::write(&x86, minimal_pe(0x014c)).expect("x86 PE");
+        std::fs::write(&x64, minimal_pe(0x8664)).expect("x64 PE");
+        assert_eq!(select_x64_dll_candidate(&x86).expect("selection"), x64);
+    }
+
+    fn complete_config() -> ConfigFile {
+        ConfigFile {
+            target: Some(TargetConfig {
+                device: Some("S32K144".to_owned()),
+                interface: Some(TargetInterface::Swd),
+                speed_khz: Some(1_000),
+            }),
+            jlink: Some(JlinkConfig {
+                dll_path: Some(PathBuf::from("missing.dll")),
+                version: Some("1".to_owned()),
+                sha256: Some("0".repeat(64)),
+            }),
+            ..ConfigFile::default()
+        }
+    }
+
+    fn minimal_pe(machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 70];
+        bytes[0..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&64_u32.to_le_bytes());
+        bytes[64..68].copy_from_slice(b"PE\0\0");
+        bytes[68..70].copy_from_slice(&machine.to_le_bytes());
+        bytes
     }
 }

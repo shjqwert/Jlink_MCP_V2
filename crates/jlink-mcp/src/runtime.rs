@@ -17,17 +17,20 @@ use jlink_domain::{
     AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
     DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
     HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
-    MemoryRange, ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface,
-    ValidationAfter, VariableSelector, WriteVerify, probe_identity_hash,
+    MemoryRange, ProfileConflictSeverity, ProgramAfter, ProgramRequest, TargetConnectionSpec,
+    TargetInterface, ValidationAfter, VariableSelector, WriteVerify, canonical_device_name,
+    probe_identity_hash,
 };
 use serde_json::{Map, Value, json};
 
 use crate::{
     config::{
-        CaptureConfig, ConfigFile, ConfigPaths, ConfigScope, ConfigSetState, FirmwareConfig,
-        JlinkConfig, ProbeConfig, ResolvedConfig, SymbolsConfig, TargetConfig, config_set,
-        resolve_config, validate_dll_identity,
+        CaptureConfig, ConfigFile, ConfigPaths, ConfigScope, ConfigSetState, ConfigSource,
+        FirmwareConfig, FlashProfileConfig, JlinkConfig, ProbeConfig, ProfileRegionConfig,
+        ResolvedConfig, SymbolsConfig, TargetConfig, apply_session_patch, config_set,
+        inspect_config, resolve_config_with_session, validate_dll_identity,
     },
+    discovery::{ProjectDiscovery, discover_project},
     mcp::{ToolCall, ToolDispatcher},
     symbols::{SymbolCache, SymbolIndex},
     worker_client::{WorkerAttachment, WorkerLaunchSpec, attach_or_spawn},
@@ -41,6 +44,7 @@ pub struct Runtime {
     capture_root: PathBuf,
     attachment: Option<WorkerAttachment>,
     symbol_cache: SymbolCache,
+    session_config: ConfigFile,
 }
 
 struct CursorPageContext<'a> {
@@ -66,6 +70,7 @@ impl Runtime {
             capture_root,
             attachment: None,
             symbol_cache: SymbolCache::new(),
+            session_config: ConfigFile::default(),
         }
     }
 
@@ -298,18 +303,67 @@ impl Runtime {
             self.attachment = None;
         }
         let report = result?;
-        Ok(ToolCall::success(
-            serde_json::to_value(report).map_err(serialization_error)?,
-        ))
+        let mut result = serde_json::to_value(report)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("ValidationReport serializes as an object")
+            .clone();
+        result.insert(
+            "profile_validation".to_owned(),
+            json!({
+                "device": resolved.profile.device,
+                "flash_profile": if resolved.profile.flash_regions.is_empty() { "unknown" } else { "available" },
+                "flash_regions": resolved.profile.flash_regions.len(),
+                "readable_ram_regions": resolved.profile.readable_ram.len(),
+                "loader_ram": if resolved.profile.loader_ram.is_some() { "available" } else { "unknown" },
+                "target_identity": resolved.profile.capabilities.target_identity,
+                "protection_state": resolved.profile.capabilities.protection_state,
+                "reset_reason": resolved.profile.capabilities.reset_reason,
+                "uid": resolved.profile.capabilities.uid,
+                "blocking_conflicts": resolved.profile.has_blocking_conflict(),
+            }),
+        );
+        Ok(ToolCall::success(Value::Object(result)))
     }
 
     fn config_get(&self) -> Result<ToolCall, JlinkError> {
-        let resolved = self.resolve()?;
-        Ok(ToolCall::success(resolved_config_result(&resolved)?))
+        let discovery = self.discover();
+        let inspection =
+            inspect_config(&self.session_config, &self.config_paths, &discovery.config)?;
+        let mut result = serde_json::to_value(&inspection)
+            .map_err(serialization_error)?
+            .as_object()
+            .expect("ConfigInspection serializes as an object")
+            .clone();
+        result.insert(
+            "provenance".to_owned(),
+            serde_json::to_value(&discovery.provenance).map_err(serialization_error)?,
+        );
+        result.insert(
+            "conflicts".to_owned(),
+            serde_json::to_value(&discovery.conflicts).map_err(serialization_error)?,
+        );
+        result.insert(
+            "diagnostics".to_owned(),
+            serde_json::to_value(&discovery.diagnostics).map_err(serialization_error)?,
+        );
+        if let Some(mut resolved) = inspection.resolved {
+            apply_discovery_profile(&mut resolved, &discovery);
+            result.insert(
+                "conflicts".to_owned(),
+                serde_json::to_value(&resolved.profile.conflicts).map_err(serialization_error)?,
+            );
+            result.insert(
+                "profile".to_owned(),
+                serde_json::to_value(resolved.profile).map_err(serialization_error)?,
+            );
+        }
+        Ok(ToolCall::success(Value::Object(result)))
     }
 
     fn config_set(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let scope = match arguments.get("scope").and_then(Value::as_str) {
+            Some("session") => ConfigScope::Session,
             Some("project") => ConfigScope::Project,
             Some("user") => ConfigScope::User,
             _ => unreachable!("MCP Schema guarantees config_set.scope"),
@@ -321,7 +375,11 @@ impl Runtime {
                 .expect("MCP Schema guarantees config_set.values"),
         )?;
         let state = self.config_set_state()?;
-        config_set(&self.config_paths, scope, &patch, state)?;
+        if scope == ConfigScope::Session {
+            apply_session_patch(&mut self.session_config, &patch, state)?;
+        } else {
+            config_set(&self.config_paths, scope, &patch, state)?;
+        }
         if let Some(attachment) = &self.attachment {
             attachment.client.disconnect()?;
         }
@@ -330,10 +388,24 @@ impl Runtime {
     }
 
     fn resolve(&self) -> Result<ResolvedConfig, JlinkError> {
-        resolve_config(
+        let discovery = self.discover();
+        let mut resolved = resolve_config_with_session(
             &ConfigFile::default(),
+            &self.session_config,
             &self.config_paths,
-            &ConfigFile::default(),
+            &discovery.config,
+        )?;
+        apply_discovery_profile(&mut resolved, &discovery);
+        Ok(resolved)
+    }
+
+    fn discover(&self) -> ProjectDiscovery {
+        discover_project(
+            self.config_paths
+                .project
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
         )
     }
 
@@ -1244,6 +1316,31 @@ fn project_capture_root(project_config: &Path) -> PathBuf {
         .join("captures")
 }
 
+fn apply_discovery_profile(config: &mut ResolvedConfig, discovery: &ProjectDiscovery) {
+    let selected = canonical_device_name(&config.target.device.value);
+    config.profile.aliases = discovery
+        .provenance
+        .iter()
+        .filter(|value| {
+            value.field == "target.device"
+                && canonical_device_name(&value.value) == selected
+                && value.value != config.target.device.value
+        })
+        .map(|value| value.value.clone())
+        .collect();
+    config.profile.aliases.sort();
+    config.profile.aliases.dedup();
+    config.profile.conflicts.clone_from(&discovery.conflicts);
+    if matches!(
+        config.target.device.source,
+        ConfigSource::Request | ConfigSource::Session | ConfigSource::Project
+    ) {
+        for conflict in &mut config.profile.conflicts {
+            conflict.severity = ProfileConflictSeverity::Trace;
+        }
+    }
+}
+
 fn find_completed_snapshot(
     root: &Path,
     identity: (Option<&str>, Option<&str>),
@@ -1658,6 +1755,11 @@ fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {
         .then(|| CaptureConfig {
             max_bytes: optional_u64(values, "capture.max_bytes"),
         });
+    let profile = values
+        .keys()
+        .any(|key| key.starts_with("profile."))
+        .then(|| profile_patch(values))
+        .transpose()?;
     Ok(ConfigFile {
         target,
         symbols,
@@ -1665,6 +1767,67 @@ fn config_patch(values: &Map<String, Value>) -> Result<ConfigFile, JlinkError> {
         jlink,
         probe,
         capture,
+        profile,
+    })
+}
+
+fn profile_patch(values: &Map<String, Value>) -> Result<FlashProfileConfig, JlinkError> {
+    let flash_regions = values
+        .get("profile.flash_regions")
+        .map(profile_regions)
+        .transpose()?
+        .unwrap_or_default();
+    let readable_ram = values
+        .get("profile.readable_ram")
+        .map(profile_regions)
+        .transpose()?
+        .unwrap_or_default();
+    let loader_ram = values
+        .get("profile.loader_ram")
+        .map(profile_region)
+        .transpose()?;
+    let capabilities = values
+        .get("profile.capabilities")
+        .map(|value| {
+            serde_json::from_value(value.clone()).map_err(|error| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("profile.capabilities 结构无效：{error}"),
+                    false,
+                )
+            })
+        })
+        .transpose()?
+        .unwrap_or_default();
+    Ok(FlashProfileConfig {
+        flash_regions,
+        readable_ram,
+        loader_ram,
+        capabilities,
+    })
+}
+
+fn profile_regions(value: &Value) -> Result<Vec<ProfileRegionConfig>, JlinkError> {
+    value
+        .as_array()
+        .ok_or_else(|| config_value_error("profile regions"))?
+        .iter()
+        .map(profile_region)
+        .collect()
+}
+
+fn profile_region(value: &Value) -> Result<ProfileRegionConfig, JlinkError> {
+    let address = value
+        .get("address")
+        .and_then(Value::as_str)
+        .ok_or_else(|| config_value_error("profile region.address"))?;
+    let length = value
+        .get("length")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| config_value_error("profile region.length"))?;
+    Ok(ProfileRegionConfig {
+        address: parse_address(address, "profile region.address")?,
+        length,
     })
 }
 
@@ -1690,80 +1853,6 @@ fn optional_u32(values: &Map<String, Value>, key: &str) -> Result<Option<u32>, J
 
 fn optional_u64(values: &Map<String, Value>, key: &str) -> Option<u64> {
     values.get(key).and_then(Value::as_u64)
-}
-
-fn resolved_config_result(config: &ResolvedConfig) -> Result<Value, JlinkError> {
-    let mut effective = Map::new();
-    let mut sources = Map::new();
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.device",
-        &config.target.device,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.interface",
-        &config.target.interface,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "target.speed_khz",
-        &config.target.speed_khz,
-    )?;
-    if let Some(field) = &config.symbols.elf {
-        insert_resolved(&mut effective, &mut sources, "symbols.elf", field)?;
-    }
-    if let Some(field) = &config.firmware.image {
-        insert_resolved(&mut effective, &mut sources, "firmware.image", field)?;
-    }
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_path",
-        &config.jlink.dll_path,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_version",
-        &config.jlink.version,
-    )?;
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "jlink.dll_sha256",
-        &config.jlink.sha256,
-    )?;
-    if let Some(field) = &config.probe.serial {
-        insert_resolved(&mut effective, &mut sources, "probe.serial", field)?;
-    }
-    insert_resolved(
-        &mut effective,
-        &mut sources,
-        "capture.max_bytes",
-        &config.capture.max_bytes,
-    )?;
-    Ok(json!({ "effective": effective, "sources": sources }))
-}
-
-fn insert_resolved<T: serde::Serialize>(
-    effective: &mut Map<String, Value>,
-    sources: &mut Map<String, Value>,
-    name: &str,
-    field: &crate::config::ResolvedField<T>,
-) -> Result<(), JlinkError> {
-    effective.insert(
-        name.to_owned(),
-        serde_json::to_value(&field.value).map_err(serialization_error)?,
-    );
-    sources.insert(
-        name.to_owned(),
-        serde_json::to_value(field.source).map_err(serialization_error)?,
-    );
-    Ok(())
 }
 
 fn serialization_error(error: serde_json::Error) -> JlinkError {
