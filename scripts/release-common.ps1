@@ -46,6 +46,19 @@ function Write-ReleaseJson {
     [IO.File]::WriteAllText($Path, (($Value | ConvertTo-Json -Depth 20) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
 }
 
+function Get-Sha256Hex {
+    param([string]$Path)
+    $stream = [IO.File]::OpenRead([IO.Path]::GetFullPath($Path))
+    $hasher = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($hasher.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Set-ReleasePointer {
     param([string]$Path, $Value)
     Assert-NoReparsePoint $Path
@@ -137,7 +150,7 @@ function Read-ReleasePackage {
         Assert-NoReparsePoint $filePath
         if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { throw "Missing release file: $($entry.path)" }
         if ((Get-Item -LiteralPath $filePath).Length -ne $entry.bytes -or
-            (Get-FileHash -LiteralPath $filePath -Algorithm SHA256).Hash -ne $entry.sha256) {
+            (Get-Sha256Hex $filePath) -ne $entry.sha256) {
             throw "Release file integrity mismatch: $($entry.path)"
         }
     }
