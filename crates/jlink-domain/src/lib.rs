@@ -33,8 +33,9 @@ pub use hss::{
     compare_numeric_typed_values, normalize_hss_rules, normalize_hss_timestamp_us,
 };
 pub use image::{
-    FirmwareFormat, FirmwareIdentityPlan, FirmwareImage, FirmwareSegment,
-    FirmwareSegmentFingerprint,
+    FIRMWARE_IDENTITY_SYMBOL, FirmwareFormat, FirmwareIdentityBlock, FirmwareIdentityPlan,
+    FirmwareIdentityStrength, FirmwareImage, FirmwareSegment, FirmwareSegmentFingerprint,
+    MAX_FIRMWARE_IDENTITY_BYTES,
 };
 pub use ipc::{
     IpcRequest, IpcResponse, MAX_IPC_FRAME_BYTES, ProtocolVersion, RequestId, SessionCommand,

@@ -457,6 +457,7 @@ dependencies = [
  "jlink-capture",
  "jlink-domain",
  "serde_json",
+ "sha2",
  "tempfile",
  "windows-sys",
 ]

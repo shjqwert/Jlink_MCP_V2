@@ -483,6 +483,9 @@ pub struct WorkerStatus {
     pub probe_identity_hash: String,
     /// Whether the validated DLL is currently held by the unique gateway.
     pub dll_loaded: bool,
+    /// Actual validated SHA-256 of the DLL held by this Worker.
+    #[serde(default)]
+    pub dll_sha256: String,
     /// Last authoritative connection lifecycle state.
     pub connection_state: crate::ConnectionState,
     /// Last target execution state observed by the Worker.

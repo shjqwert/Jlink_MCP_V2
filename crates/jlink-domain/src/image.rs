@@ -1,7 +1,7 @@
 use std::{fmt::Write as _, path::Path};
 
 use object::{
-    Object, ObjectSection,
+    Object, ObjectSection, ObjectSymbol,
     elf::PT_LOAD,
     read::elf::{ElfFile, FileHeader, ProgramHeader},
 };
@@ -53,6 +53,7 @@ pub struct FirmwareImage {
     sha256: String,
     segments: Vec<FirmwareSegment>,
     has_dwarf: bool,
+    identity_block: Option<FirmwareIdentityBlock>,
 }
 
 impl FirmwareImage {
@@ -97,17 +98,17 @@ impl FirmwareImage {
             }
         }
 
-        let (segments, has_dwarf) = match detected {
+        let (segments, has_dwarf, identity_block) = match detected {
             FirmwareFormat::Elf => parse_elf(data)?,
-            FirmwareFormat::IntelHex => (parse_intel_hex(data)?, false),
-            FirmwareFormat::SRecord => (parse_s_record(data)?, false),
+            FirmwareFormat::IntelHex => (parse_intel_hex(data)?, false, None),
+            FirmwareFormat::SRecord => (parse_s_record(data)?, false, None),
             FirmwareFormat::Bin => {
                 let Some(address) = base_address else {
                     return Err(value_invalid(
                         "BIN 镜像必须在每次 flash/verify 请求中显式提供 base_address",
                     ));
                 };
-                (vec![segment(address, data.to_vec())?], false)
+                (vec![segment(address, data.to_vec())?], false, None)
             }
         };
         Ok(Self {
@@ -115,6 +116,7 @@ impl FirmwareImage {
             sha256: sha256(data),
             segments,
             has_dwarf,
+            identity_block,
         })
     }
 
@@ -151,12 +153,122 @@ impl FirmwareImage {
         }
         Ok(FirmwareIdentityPlan {
             elf_sha256: self.sha256.clone(),
-            segments: self
-                .segments
-                .iter()
-                .map(FirmwareSegmentFingerprint::from_segment)
-                .collect(),
+            identity_block: self.identity_block.clone(),
+            legacy_segments: Vec::new(),
         })
+    }
+}
+
+/// The portable ELF symbol used for the bounded target firmware identity block.
+pub const FIRMWARE_IDENTITY_SYMBOL: &str = "__jlink_mcp_identity";
+
+/// Maximum number of target bytes read to prove one symbol ELF identity.
+pub const MAX_FIRMWARE_IDENTITY_BYTES: usize = 64;
+
+const FIRMWARE_IDENTITY_MAGIC: &[u8; 4] = b"JLID";
+const FIRMWARE_IDENTITY_FORMAT_VERSION: u8 = 1;
+
+/// Whether a symbol ELF provides a target-verifiable firmware identity block.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FirmwareIdentityStrength {
+    /// The ELF has no identity symbol; only non-mutating DWARF reads may proceed with a warning.
+    Weak,
+    /// The ELF contains a valid identity block that can be compared with at most 64 target bytes.
+    Strong,
+}
+
+/// One fixed, bounded target identity block extracted from the symbol ELF.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FirmwareIdentityBlock {
+    address: u64,
+    bytes: Vec<u8>,
+    magic: String,
+    format_version: u8,
+    build_id: String,
+}
+
+impl FirmwareIdentityBlock {
+    fn parse(address: u64, bytes: &[u8]) -> Result<Self, JlinkError> {
+        if !(6..=MAX_FIRMWARE_IDENTITY_BYTES).contains(&bytes.len()) {
+            return Err(value_invalid(format!(
+                "{FIRMWARE_IDENTITY_SYMBOL} 大小必须在 6 到 {MAX_FIRMWARE_IDENTITY_BYTES} 字节之间"
+            )));
+        }
+        if &bytes[..4] != FIRMWARE_IDENTITY_MAGIC {
+            return Err(value_invalid(format!(
+                "{FIRMWARE_IDENTITY_SYMBOL} magic 必须为 JLID"
+            )));
+        }
+        if bytes[4] != FIRMWARE_IDENTITY_FORMAT_VERSION {
+            return Err(value_invalid(format!(
+                "{FIRMWARE_IDENTITY_SYMBOL} format_version {} 不受支持",
+                bytes[4]
+            )));
+        }
+        let build_id_length = usize::from(bytes[5]);
+        if build_id_length == 0 || 6 + build_id_length > bytes.len() {
+            return Err(value_invalid(format!(
+                "{FIRMWARE_IDENTITY_SYMBOL} build_id 长度无效"
+            )));
+        }
+        let build_id_bytes = &bytes[6..6 + build_id_length];
+        if !build_id_bytes
+            .iter()
+            .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        {
+            return Err(value_invalid(format!(
+                "{FIRMWARE_IDENTITY_SYMBOL} build_id 必须是可打印 ASCII"
+            )));
+        }
+        let length =
+            u64::try_from(bytes.len()).map_err(|_| value_invalid("固件身份块长度无法表示"))?;
+        address
+            .checked_add(length)
+            .ok_or_else(|| value_invalid("固件身份块地址溢出"))?;
+        Ok(Self {
+            address,
+            bytes: bytes.to_vec(),
+            magic: "JLID".to_owned(),
+            format_version: FIRMWARE_IDENTITY_FORMAT_VERSION,
+            build_id: String::from_utf8(build_id_bytes.to_vec())
+                .expect("printable ASCII is valid UTF-8"),
+        })
+    }
+
+    /// Returns the first target address of the identity block.
+    #[must_use]
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    /// Returns the exact identity block bytes expected on the target.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the parsed identity block format version.
+    #[must_use]
+    pub const fn format_version(&self) -> u8 {
+        self.format_version
+    }
+
+    /// Returns the printable build identifier declared by the firmware.
+    #[must_use]
+    pub fn build_id(&self) -> &str {
+        &self.build_id
+    }
+
+    fn is_valid(&self) -> bool {
+        Self::parse(self.address, &self.bytes).is_ok()
+            && self.magic == "JLID"
+            && self.format_version == FIRMWARE_IDENTITY_FORMAT_VERSION
+            && self
+                .bytes
+                .get(6..6 + usize::from(self.bytes[5]))
+                .is_some_and(|bytes| bytes == self.build_id.as_bytes())
     }
 }
 
@@ -192,15 +304,6 @@ impl FirmwareSegmentFingerprint {
         })
     }
 
-    fn from_segment(segment: &FirmwareSegment) -> Self {
-        Self {
-            address: segment.address,
-            length: u64::try_from(segment.data.len())
-                .expect("firmware segment length was validated"),
-            sha256: sha256(&segment.data),
-        }
-    }
-
     /// Returns the first target address covered by this fingerprint.
     #[must_use]
     pub const fn address(&self) -> u64 {
@@ -231,7 +334,12 @@ impl FirmwareSegmentFingerprint {
 #[serde(deny_unknown_fields)]
 pub struct FirmwareIdentityPlan {
     elf_sha256: String,
-    segments: Vec<FirmwareSegmentFingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    identity_block: Option<FirmwareIdentityBlock>,
+    /// Accepted only to read V1.0 persisted capture requests. It is never used
+    /// for implicit identity reads in V1.1.
+    #[serde(default, rename = "segments", skip_serializing_if = "Vec::is_empty")]
+    legacy_segments: Vec<FirmwareSegmentFingerprint>,
 }
 
 impl FirmwareIdentityPlan {
@@ -244,7 +352,45 @@ impl FirmwareIdentityPlan {
     /// Returns the exact target ranges that must be read without side effects.
     #[must_use]
     pub fn segments(&self) -> &[FirmwareSegmentFingerprint] {
-        &self.segments
+        &self.legacy_segments
+    }
+
+    /// Returns the bounded identity block, when the ELF opted into strong identity.
+    #[must_use]
+    pub const fn identity_block(&self) -> Option<&FirmwareIdentityBlock> {
+        self.identity_block.as_ref()
+    }
+
+    /// Returns whether this ELF has strong or weak firmware identity evidence.
+    #[must_use]
+    pub const fn strength(&self) -> FirmwareIdentityStrength {
+        if self.identity_block.is_some() {
+            FirmwareIdentityStrength::Strong
+        } else {
+            FirmwareIdentityStrength::Weak
+        }
+    }
+
+    /// Rejects a mutating or symbol-capture operation unless strong identity exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::FirmwareIdentityUnknown`] for legacy ELFs without the
+    /// fixed identity symbol.
+    pub fn ensure_strong(&self) -> Result<&FirmwareIdentityBlock, JlinkError> {
+        self.validate()?;
+        self.identity_block.as_ref().ok_or_else(|| {
+            JlinkError::new(
+                ErrorCode::FirmwareIdentityUnknown,
+                format!(
+                    "符号 ELF 缺少 {FIRMWARE_IDENTITY_SYMBOL}，变量写入和符号 HSS 要求强固件身份"
+                ),
+                false,
+            )
+            .with_detail("identity_strength", json!("weak"))
+            .with_detail("required_symbol", json!(FIRMWARE_IDENTITY_SYMBOL))
+            .with_detail("maximum_bytes", json!(MAX_FIRMWARE_IDENTITY_BYTES))
+        })
     }
 
     /// Revalidates the immutable identity plan after local IPC transport.
@@ -283,7 +429,13 @@ impl FirmwareIdentityPlan {
         if observed.iter().any(|fingerprint| !fingerprint.is_valid()) {
             return Err(identity_unknown("目标 Flash 身份读取证据无效", None));
         }
-        for expected in &self.segments {
+        if self.legacy_segments.is_empty() {
+            return Err(identity_unknown(
+                "V1.1 固件身份不再执行完整镜像读取，请验证固定身份块",
+                None,
+            ));
+        }
+        for expected in &self.legacy_segments {
             let mut matches = observed.iter().filter(|candidate| {
                 candidate.address == expected.address && candidate.length == expected.length
             });
@@ -314,12 +466,51 @@ impl FirmwareIdentityPlan {
         Ok(())
     }
 
+    /// Compares the exact bounded target identity block with the symbol ELF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable unknown or mismatch error without requesting additional
+    /// target ranges.
+    pub fn verify_target_bytes(&self, observed: Option<&[u8]>) -> Result<(), JlinkError> {
+        let expected = self.ensure_strong()?;
+        let Some(observed) = observed else {
+            return Err(identity_unknown("目标固件身份块读取未完成", None));
+        };
+        if observed.len() != expected.bytes.len() {
+            return Err(identity_unknown("目标固件身份块读取长度不完整", None)
+                .with_detail("address", json!(format!("0x{:X}", expected.address)))
+                .with_detail("expected_length", json!(expected.bytes.len()))
+                .with_detail("actual_length", json!(observed.len())));
+        }
+        if observed != expected.bytes {
+            return Err(JlinkError::new(
+                ErrorCode::FirmwareElfMismatch,
+                "目标固件身份块与符号 ELF 不匹配",
+                false,
+            )
+            .with_detail("address", json!(format!("0x{:X}", expected.address)))
+            .with_detail("length", json!(expected.bytes.len()))
+            .with_detail("expected_build_id", json!(expected.build_id))
+            .with_detail("expected_sha256", json!(sha256(&expected.bytes)))
+            .with_detail("actual_sha256", json!(sha256(observed))));
+        }
+        Ok(())
+    }
+
     fn is_valid(&self) -> bool {
-        if !is_sha256(&self.elf_sha256) || self.segments.is_empty() {
+        if !is_sha256(&self.elf_sha256) {
+            return false;
+        }
+        if self
+            .identity_block
+            .as_ref()
+            .is_some_and(|block| !block.is_valid())
+        {
             return false;
         }
         let mut previous_end = None;
-        for segment in &self.segments {
+        for segment in &self.legacy_segments {
             if !segment.is_valid() || previous_end.is_some_and(|end| segment.address < end) {
                 return false;
             }
@@ -364,7 +555,9 @@ fn detect_format(extension: Option<&str>, data: &[u8]) -> Result<FirmwareFormat,
     }
 }
 
-fn parse_elf(data: &[u8]) -> Result<(Vec<FirmwareSegment>, bool), JlinkError> {
+fn parse_elf(
+    data: &[u8],
+) -> Result<(Vec<FirmwareSegment>, bool, Option<FirmwareIdentityBlock>), JlinkError> {
     let file = object::File::parse(data)
         .map_err(|error| value_invalid(format!("ELF 结构无效：{error}")))?;
     let has_dwarf = [".debug_info", ".zdebug_info"].iter().any(|name| {
@@ -376,7 +569,44 @@ fn parse_elf(data: &[u8]) -> Result<(Vec<FirmwareSegment>, bool), JlinkError> {
         object::File::Elf64(file) => parse_elf_segments(file)?,
         _ => return Err(value_invalid("镜像魔数不是 ELF")),
     };
-    Ok((normalize_segments(segments)?, has_dwarf))
+    let identity_block = parse_elf_identity_block(&file)?;
+    Ok((normalize_segments(segments)?, has_dwarf, identity_block))
+}
+
+fn parse_elf_identity_block(
+    file: &object::File<'_>,
+) -> Result<Option<FirmwareIdentityBlock>, JlinkError> {
+    let mut matches = file.symbols().filter(|symbol| {
+        symbol.is_definition() && symbol.name().ok() == Some(FIRMWARE_IDENTITY_SYMBOL)
+    });
+    let Some(symbol) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(value_invalid(format!(
+            "ELF 包含重复的 {FIRMWARE_IDENTITY_SYMBOL} 定义"
+        )));
+    }
+    let size = symbol.size();
+    if !(6..=u64::try_from(MAX_FIRMWARE_IDENTITY_BYTES).expect("constant fits u64")).contains(&size)
+    {
+        return Err(value_invalid(format!(
+            "{FIRMWARE_IDENTITY_SYMBOL} 大小必须在 6 到 {MAX_FIRMWARE_IDENTITY_BYTES} 字节之间"
+        )));
+    }
+    let section_index = symbol.section_index().ok_or_else(|| {
+        value_invalid(format!(
+            "{FIRMWARE_IDENTITY_SYMBOL} 必须位于可加载 ELF section"
+        ))
+    })?;
+    let section = file
+        .section_by_index(section_index)
+        .map_err(|error| value_invalid(format!("固件身份 section 无效：{error}")))?;
+    let bytes = section
+        .data_range(symbol.address(), size)
+        .map_err(|error| value_invalid(format!("固件身份块超出 section：{error}")))?
+        .ok_or_else(|| value_invalid("固件身份块没有可加载字节"))?;
+    FirmwareIdentityBlock::parse(symbol.address(), bytes).map(Some)
 }
 
 fn parse_elf_segments<Elf>(file: &ElfFile<'_, Elf>) -> Result<Vec<FirmwareSegment>, JlinkError>
@@ -648,4 +878,78 @@ fn sha256(data: &[u8]) -> String {
 
 fn is_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strong_plan() -> FirmwareIdentityPlan {
+        let bytes = [b'J', b'L', b'I', b'D', 1, 5, b'b', b'u', b'i', b'l', b'd'];
+        FirmwareIdentityPlan {
+            elf_sha256: "ab".repeat(32),
+            identity_block: Some(
+                FirmwareIdentityBlock::parse(0x100, &bytes).expect("valid identity block"),
+            ),
+            legacy_segments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn fixed_identity_block_is_bounded_and_parses_build_id() {
+        let mut bytes = vec![0_u8; MAX_FIRMWARE_IDENTITY_BYTES];
+        bytes[..6].copy_from_slice(&[b'J', b'L', b'I', b'D', 1, 5]);
+        bytes[6..11].copy_from_slice(b"build");
+        let block = FirmwareIdentityBlock::parse(0, &bytes).expect("64-byte block is valid");
+        assert_eq!(block.bytes().len(), MAX_FIRMWARE_IDENTITY_BYTES);
+        assert_eq!(block.build_id(), "build");
+        assert_eq!(block.format_version(), 1);
+    }
+
+    #[test]
+    fn malformed_identity_symbol_is_rejected() {
+        let error =
+            FirmwareIdentityBlock::parse(0, b"BAD!\x01\x01x").expect_err("wrong magic must fail");
+        assert_eq!(error.code, ErrorCode::ValueInvalid);
+        let error = FirmwareIdentityBlock::parse(0, b"JLID\x02\x01x")
+            .expect_err("unknown format must fail");
+        assert_eq!(error.code, ErrorCode::ValueInvalid);
+    }
+
+    #[test]
+    fn weak_identity_allows_validation_but_not_mutating_or_hss_use() {
+        let plan = FirmwareIdentityPlan {
+            elf_sha256: "ab".repeat(32),
+            identity_block: None,
+            legacy_segments: Vec::new(),
+        };
+        plan.validate()
+            .expect("weak ELF identity is structurally valid");
+        assert_eq!(plan.strength(), FirmwareIdentityStrength::Weak);
+        let error = plan
+            .ensure_strong()
+            .expect_err("strong identity is required");
+        assert_eq!(error.code, ErrorCode::FirmwareIdentityUnknown);
+        assert_eq!(
+            error.details.expect("identity details")["required_symbol"],
+            json!(FIRMWARE_IDENTITY_SYMBOL)
+        );
+    }
+
+    #[test]
+    fn strong_identity_compares_only_the_fixed_block() {
+        let plan = strong_plan();
+        let expected = plan.identity_block().expect("strong block").bytes();
+        plan.verify_target_bytes(Some(expected))
+            .expect("exact bounded evidence matches");
+        let mut mismatch = expected.to_vec();
+        mismatch[6] ^= 1;
+        assert_eq!(
+            plan.verify_target_bytes(Some(&mismatch))
+                .expect_err("changed build id fails")
+                .code,
+            ErrorCode::FirmwareElfMismatch
+        );
+        assert!(plan.segments().is_empty());
+    }
 }

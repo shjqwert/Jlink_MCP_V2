@@ -872,11 +872,13 @@ mod tests {
     fn start_plan() -> HssStartPlan {
         let firmware: FirmwareIdentityPlan = serde_json::from_value(json!({
             "elf_sha256": "11".repeat(32),
-            "segments": [{
+            "identity_block": {
                 "address": 0,
-                "length": 4,
-                "sha256": "22".repeat(32)
-            }]
+                "bytes": [74, 76, 73, 68, 1, 3, 49, 46, 48],
+                "magic": "JLID",
+                "format_version": 1,
+                "build_id": "1.0"
+            }
         }))
         .expect("firmware fixture");
         let access = AccessPlan::new(

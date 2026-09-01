@@ -46,6 +46,8 @@ pub struct WorkerLaunchSpec {
     pub probe_identity: String,
     /// Identity-validated J-Link DLL path.
     pub dll_path: PathBuf,
+    /// Actual validated SHA-256 of the selected J-Link x64 DLL.
+    pub dll_sha256: String,
 }
 
 /// Result of attaching to an existing Worker or starting the unique owner.
@@ -416,6 +418,7 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
     match client.status() {
         Ok(status) => {
             ensure_current_parent(&status)?;
+            ensure_current_dll(&status, &spec.dll_sha256)?;
             return Ok(WorkerAttachment {
                 client,
                 status,
@@ -437,6 +440,8 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         .arg(&spec.probe_identity)
         .arg("--dll")
         .arg(&spec.dll_path)
+        .arg("--dll-sha256")
+        .arg(&spec.dll_sha256)
         .arg("--parent-pid")
         .arg(std::process::id().to_string())
         .stdin(Stdio::null())
@@ -455,6 +460,7 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
     loop {
         match client.status() {
             Ok(status) => {
+                ensure_current_dll(&status, &spec.dll_sha256)?;
                 if status.worker_pid != child.id() {
                     stop_non_authoritative_child(&mut child)?;
                     ensure_current_parent(&status)?;
@@ -499,6 +505,19 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         }
         thread::sleep(ATTACH_POLL);
     }
+}
+
+fn ensure_current_dll(status: &WorkerStatus, expected_sha256: &str) -> Result<(), JlinkError> {
+    if status.dll_sha256.eq_ignore_ascii_case(expected_sha256) {
+        return Ok(());
+    }
+    Err(JlinkError::new(
+        ErrorCode::OperationConflict,
+        "活动 Worker 持有的 J-Link DLL 与当前配置不一致，请先关闭旧 Worker",
+        true,
+    )
+    .with_detail("worker_dll_sha256", json!(status.dll_sha256))
+    .with_detail("configured_dll_sha256", json!(expected_sha256)))
 }
 
 fn ensure_current_parent(status: &WorkerStatus) -> Result<(), JlinkError> {

@@ -690,6 +690,7 @@ fn inspect_output_schema() -> Value {
         "type": "object",
         "properties": {
             "value": {},
+            "firmware_identity": {},
             "data": {},
             "symbols": {},
             "error": {}
@@ -718,7 +719,13 @@ fn inspect_success_schema(action: &str) -> Value {
 
 fn inspect_success_schema_body(action: &str) -> Value {
     match action {
-        "variable" => closed_object(vec![("value", typed_value_schema())], &["value"]),
+        "variable" => closed_object(
+            vec![
+                ("value", typed_value_schema()),
+                ("firmware_identity", Value::Bool(true)),
+            ],
+            &["value"],
+        ),
         "memory" => closed_object(vec![("data", byte_string_schema())], &["data"]),
         "register" => closed_object(vec![("value", address_schema())], &["value"]),
         "symbols" => closed_object(vec![("symbols", string_array())], &["symbols"]),

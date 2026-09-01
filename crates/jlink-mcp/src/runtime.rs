@@ -1117,8 +1117,26 @@ impl Runtime {
 
     fn inspect_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
+        let identity = match firmware.identity_block() {
+            Some(block) => json!({
+                "strength": "strong",
+                "elf_sha256": firmware.elf_sha256(),
+                "address": format!("0x{:X}", block.address()),
+                "length": block.bytes().len(),
+                "format_version": block.format_version(),
+                "build_id": block.build_id()
+            }),
+            None => json!({
+                "strength": "weak",
+                "elf_sha256": firmware.elf_sha256(),
+                "warning": "符号 ELF 缺少 __jlink_mcp_identity；DWARF 变量只读继续，但未证明目标固件与 ELF 一致"
+            }),
+        };
         match self.execute_debug(&DebugRequest::ReadVariable { plan, firmware })? {
-            DebugResult::Variable { value } => Ok(ToolCall::success(json!({ "value": value }))),
+            DebugResult::Variable { value } => Ok(ToolCall::success(json!({
+                "value": value,
+                "firmware_identity": identity
+            }))),
             DebugResult::Memory { .. } | DebugResult::Register { .. } | DebugResult::Written => {
                 Err(debug_response_error(
                     "Worker 对变量读取返回了错误的结果类型",
@@ -1170,6 +1188,7 @@ impl Runtime {
 
     fn write_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
+        firmware.ensure_strong()?;
         let request = DebugRequest::WriteVariable {
             plan,
             firmware,
@@ -1314,6 +1333,7 @@ impl Runtime {
             capture_root: self.capture_root.clone(),
             probe_identity: probe.value.to_string(),
             dll_path: resolved.jlink.dll_path.value.clone(),
+            dll_sha256: resolved.jlink.sha256.value.clone(),
         };
         self.attachment = Some(attach_or_spawn(&launch)?);
         Ok(())
