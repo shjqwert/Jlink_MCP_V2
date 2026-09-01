@@ -2,11 +2,11 @@
 
 通过 Codex 使用 SEGGER J-Link 调试 ARM Cortex-M 目标。Windows x64 Rust 实现，以独立 Worker 隔离 J-Link DLL 和目标会话。
 
-当前版本为 **V1.0.0 候选**，发布验收范围为 Windows 11 x64、Codex 和 SWD。干净 Windows、新 Codex 桌面任务及新二进制真机验收尚未完成；不将构建成功等同于正式验收通过。
+当前版本为 **V1.1.0 正式版**，已验证 Windows x64、Codex、SWD、Z20K146MC、J-Link 9.64 和 1 MHz。P1-18 已实现但未完成专项验证；原 S32K118/J-Link 6.98a 的 P0-12 根因仍未由本版关闭，JTAG 尚未通过真机发布门禁。
 
 ## 安装与使用
 
-普通用户使用预编译 ZIP，无需 Rust、MSVC C++、Windows SDK 或源码。下载入口为本仓库 [Releases](https://github.com/shjqwert/Jlink_MCP_V2/releases)；未发布版本请使用明确标注的候选交付包。安装、配置与排障见 [INSTALL.md](INSTALL.md)。
+普通用户使用预编译 ZIP，无需 Rust、MSVC C++、Windows SDK 或源码。下载入口为本仓库 [Releases](https://github.com/shjqwert/Jlink_MCP_V2/releases)；开发版本请使用明确标注的非正式构建。安装、配置与排障见 [INSTALL.md](INSTALL.md)。
 
 Codex、兼容的 SEGGER 软件和探针所需驱动由用户自行准备。本工具不捆绑或代装 SEGGER 组件，不在安装时连接或操作目标。
 
@@ -38,18 +38,18 @@ cargo build --locked --release --target x86_64-pc-windows-msvc -p jlink-mcp -p j
 ./scripts/build-release.ps1
 ```
 
-打包脚本要求已提交且干净的 Git 检出；开发中的候选可显式传入 `-AllowDirty`，清单会记录未提交状态。输出位于 `target/distribution/`；ZIP 和 SHA-256 作为 Release 附件交付，不提交构建产物。
+打包脚本要求已提交且干净的 Git 检出；开发中的构建可显式传入 `-AllowDirty`，清单会记录未提交状态。输出位于 `target/distribution/`；ZIP 和 SHA-256 作为 Release 附件交付，不提交构建产物。
 
 ## 仓库范围
 
 - `crates/`：四个 crate 的生产源码、源码内单元测试和编译必需资源。
 - `plugins/`、`.agents/plugins/`：Codex 插件、使用指引和市场入口。
 - `scripts/`：源码检查、构建、打包、安装和启动脚本。
-- `.github/workflows/`：公开源码检查与候选包构建流程。
+- `.github/workflows/`：公开源码检查与预编译包构建流程。
 
 设计资料、实验、独立集成测试、硬件验证脚本和开发上下文保留在开发者本地，不再纳入后续 Git 提交；旧历史不会改写。这些本地文件需要单独备份。
 
-`check-workspace.ps1` 检查当前检出中存在的全部目标和测试。新克隆及公开 CI 只包含源码内单元测试；开发者保留独立测试时会执行更多用例。公开 CI 不替代完整集成、安装器、客户端或硬件回归，正式发布需要对同一候选包取得相应证据。
+`check-workspace.ps1` 检查当前检出中存在的全部目标和测试。新克隆及公开 CI 只包含源码内单元测试；开发者保留独立测试时会执行更多用例。公开 CI 不替代完整集成、安装器、客户端或硬件回归，正式发布需要对同一发布包取得相应证据。
 
 ## 许可证
 
