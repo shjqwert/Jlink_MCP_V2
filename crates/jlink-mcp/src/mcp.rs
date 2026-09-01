@@ -504,31 +504,46 @@ fn control_tool() -> Value {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn hss_tool() -> Value {
-    let mut variants = vec![action_object(
-        "start",
-        vec![
-            ("capture_key", non_empty_string()),
-            ("duration_s", bounded_integer(1, 300)),
-            ("rate_hz", bounded_integer(1, 1_000)),
-            (
+    let selectors = || {
+        json!({
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": hss_selector_schema()
+        })
+    };
+    let rules = || json!({ "type": "array", "items": threshold_rule_schema() });
+    let mut variants = vec![
+        action_object(
+            "plan",
+            vec![
+                ("duration_s", bounded_integer(1, 300)),
+                ("rate_hz", bounded_integer(1, 1_000)),
+                ("variables", selectors()),
+            ],
+            &["duration_s", "rate_hz", "variables"],
+        ),
+        action_object(
+            "start",
+            vec![
+                ("capture_key", non_empty_string()),
+                ("duration_s", bounded_integer(1, 300)),
+                ("rate_hz", bounded_integer(1, 1_000)),
+                ("variables", selectors()),
+                ("return_when", string_enum(&["started", "completed"])),
+                ("rules", rules()),
+            ],
+            &[
+                "capture_key",
+                "duration_s",
+                "rate_hz",
                 "variables",
-                json!({ "type": "array", "minItems": 1, "maxItems": 10, "items": selector_schema() }),
-            ),
-            ("return_when", string_enum(&["started", "completed"])),
-            (
-                "rules",
-                json!({ "type": "array", "items": threshold_rule_schema() }),
-            ),
-        ],
-        &[
-            "capture_key",
-            "duration_s",
-            "rate_hz",
-            "variables",
-            "return_when",
-        ],
-    )];
+                "return_when",
+            ],
+        ),
+    ];
     variants.extend(capture_identity_variants("status", &[], &[]));
     variants.extend(capture_identity_variants(
         "query",
@@ -594,7 +609,7 @@ fn hss_tool() -> Value {
     ));
     tool_definition(
         "jlink_hss",
-        "Start a fixed-duration capture, read status, or query overview, changes, window, and around_event views. Requests use strict flat JSON and exactly one capture_id or capture_key; cursor continues a page.",
+        "Plan offline or start fixed-duration capture; read status or query overview, changes, window, around_event. Use exactly one capture_id or capture_key; cursor continues pages.",
         with_hss_input_definitions(action_union(variants)),
         hss_output_schema(),
         annotations(false, true, true),
@@ -734,11 +749,49 @@ fn inspect_success_schema_body(action: &str) -> Value {
 }
 
 fn hss_output_schema() -> Value {
-    with_hss_output_definitions(hss_output_schema_body())
+    let body = hss_output_schema_body();
+    let variants = body["oneOf"]
+        .as_array()
+        .expect("HSS output union exposes variants")
+        .iter()
+        .map(|variant| {
+            let is_plan = variant["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("duration_s")));
+            let properties = variant["properties"]
+                .as_object()
+                .expect("HSS output variant exposes properties")
+                .iter()
+                .map(|(name, schema)| {
+                    let schema = if is_plan {
+                        schema.clone()
+                    } else {
+                        Value::Bool(true)
+                    };
+                    (name.clone(), schema)
+                })
+                .collect::<Map<_, _>>();
+            let mut compact = json!({
+                "type": "object",
+                "properties": properties,
+                "required": variant["required"].clone(),
+                "additionalProperties": false
+            });
+            if let Some(all_of) = variant.get("allOf") {
+                compact
+                    .as_object_mut()
+                    .expect("compact HSS output is an object")
+                    .insert("allOf".to_owned(), all_of.clone());
+            }
+            compact
+        })
+        .collect::<Vec<_>>();
+    with_typed_value_definition(closed_schema_union(&variants))
 }
 
 fn hss_output_schema_body() -> Value {
     closed_schema_union(&[
+        hss_plan_output_schema(),
         hss_status_output_schema(),
         hss_overview_output_schema(),
         hss_changes_output_schema(),
@@ -756,6 +809,7 @@ fn hss_action_output_schema(arguments: &Value) -> Value {
         .and_then(Value::as_str)
         .expect("MCP Schema guarantees hss.action")
     {
+        "plan" => hss_plan_output_schema(),
         "start" => closed_schema_union(&[
             hss_status_output_schema(),
             hss_completed_start_output_schema(),
@@ -1128,12 +1182,138 @@ fn hss_overview_variables_schema() -> Value {
         "items": closed_object(
             vec![
                 ("series", non_empty_string()),
+                ("evidence", string_enum(&["dwarf", "raw_address"])),
                 ("samples", non_negative_integer()),
                 ("changes", non_negative_integer()),
             ],
-            &["series", "samples", "changes"],
+            &["series", "evidence", "samples", "changes"],
         )
     })
+}
+
+fn hss_plan_output_schema() -> Value {
+    closed_object(
+        vec![
+            ("duration_s", positive_integer()),
+            ("rate_hz", positive_integer()),
+            ("expected_samples", positive_integer()),
+            ("sample_bytes", positive_integer()),
+            ("record_bytes", positive_integer()),
+            ("estimated_storage_bytes", positive_integer()),
+            (
+                "variables",
+                json!({
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 10,
+                    "items": hss_plan_variable_schema()
+                }),
+            ),
+            ("reduction_suggestions", string_array()),
+        ],
+        &[
+            "duration_s",
+            "rate_hz",
+            "expected_samples",
+            "sample_bytes",
+            "record_bytes",
+            "estimated_storage_bytes",
+            "variables",
+            "reduction_suggestions",
+        ],
+    )
+}
+
+fn hss_plan_variable_schema() -> Value {
+    let leaf_fields = json!({
+        "type": "array",
+        "minItems": 1,
+        "items": closed_object(
+            vec![
+                ("path", non_empty_string()),
+                ("byte_offset", non_negative_integer()),
+                ("byte_length", positive_integer()),
+                ("type", non_empty_string()),
+                (
+                    "encoding",
+                    string_enum(&["signed", "unsigned", "boolean", "float", "other"]),
+                ),
+            ],
+            &["path", "byte_offset", "byte_length", "type"],
+        )
+    });
+    let common = || {
+        vec![
+            ("series", non_empty_string()),
+            ("address", address_schema()),
+            (
+                "byte_length",
+                bounded_integer(1, u64::from(jlink_domain::HSS_MAX_EXPANDED_SAMPLE_BYTES)),
+            ),
+            (
+                "sample_offset",
+                bounded_integer(
+                    0,
+                    u64::from(jlink_domain::HSS_MAX_EXPANDED_SAMPLE_BYTES - 1),
+                ),
+            ),
+            ("leaf_fields", leaf_fields.clone()),
+        ]
+    };
+
+    let mut dwarf = common();
+    dwarf.push(("evidence", json!({ "const": "dwarf" })));
+
+    let mut raw = common();
+    raw.extend([
+        ("evidence", json!({ "const": "raw_address" })),
+        (
+            "type",
+            string_enum(&[
+                "bytes", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64",
+            ]),
+        ),
+        ("endianness", string_enum(&["little", "big"])),
+        (
+            "allowed_region",
+            closed_object(
+                vec![
+                    ("address", non_negative_integer()),
+                    ("length", positive_integer()),
+                    ("kind", json!({ "const": "ram" })),
+                ],
+                &["address", "length", "kind"],
+            ),
+        ),
+    ]);
+
+    closed_schema_union(&[
+        closed_object(
+            dwarf,
+            &[
+                "evidence",
+                "series",
+                "address",
+                "byte_length",
+                "sample_offset",
+                "leaf_fields",
+            ],
+        ),
+        closed_object(
+            raw,
+            &[
+                "evidence",
+                "series",
+                "address",
+                "byte_length",
+                "sample_offset",
+                "type",
+                "endianness",
+                "allowed_region",
+                "leaf_fields",
+            ],
+        ),
+    ])
 }
 
 fn hss_state_schema() -> Value {
@@ -1162,10 +1342,30 @@ fn hss_quality_definition() -> Value {
             ("expected_samples", non_negative_integer()),
             ("actual_samples", non_negative_integer()),
             ("actual_rate_millihz", non_negative_integer()),
+            ("rate_assessment", Value::Bool(true)),
             ("intervals", hss_interval_schema()),
             ("loss", hss_assessment_schema("lost_samples")),
             ("overflow", hss_assessment_schema("events")),
             ("clock", hss_clock_schema()),
+            ("usable_for_period_estimation", boolean()),
+            ("usable_for_runtime_estimation", boolean()),
+            ("proves_no_sample_loss", boolean()),
+            (
+                "reason_codes",
+                json!({
+                    "type": "array",
+                    "items": string_enum(&[
+                        "stable_intervals_available",
+                        "runtime_bounds_available",
+                        "insufficient_samples",
+                        "incomplete_frame",
+                        "clock_regression",
+                        "source_timestamp_gap",
+                        "confirmed_overflow",
+                        "no_independent_loss_evidence",
+                    ])
+                }),
+            ),
             ("events", hss_quality_events_schema()),
         ],
         &[
@@ -1177,6 +1377,10 @@ fn hss_quality_definition() -> Value {
             "loss",
             "overflow",
             "clock",
+            "usable_for_period_estimation",
+            "usable_for_runtime_estimation",
+            "proves_no_sample_loss",
+            "reason_codes",
         ],
     )
 }
@@ -1354,11 +1558,29 @@ fn validation_check_schema() -> Value {
     )
 }
 
-fn selector_schema() -> Value {
-    closed_object(
-        vec![("path", non_empty_string()), ("slice", slice_schema())],
-        &["path"],
-    )
+fn hss_selector_schema() -> Value {
+    closed_schema_union(&[
+        closed_object(
+            vec![("path", non_empty_string()), ("slice", slice_schema())],
+            &["path"],
+        ),
+        tagged_object(
+            "kind",
+            "raw_address",
+            vec![
+                ("address", address_schema()),
+                (
+                    "type",
+                    string_enum(&[
+                        "bytes", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64", "f32", "f64",
+                    ]),
+                ),
+                ("length", bounded_integer(1, 40)),
+                ("endianness", string_enum(&["little", "big"])),
+            ],
+            &["address", "type", "length", "endianness"],
+        ),
+    ])
 }
 
 fn slice_schema() -> Value {
@@ -1720,9 +1942,13 @@ fn typed_value_definition() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use jlink_domain::{ErrorCode, JlinkError};
+    use jlink_domain::{ErrorCode, HssQualitySummary, JlinkError};
+    use serde_json::json;
 
-    use super::public_tool_error;
+    use super::{
+        hss_output_schema, hss_plan_output_schema, hss_quality_definition, public_tool_error,
+        with_hss_output_definitions,
+    };
 
     #[test]
     fn frame_invalid_remains_a_structured_public_error() {
@@ -1761,5 +1987,86 @@ mod tests {
                 .expect("P3 start error is public");
             assert_eq!(result["structuredContent"]["error"]["code"], expected);
         }
+    }
+
+    #[test]
+    fn legacy_quality_defaults_remain_valid_for_overview_results() {
+        let mut legacy =
+            serde_json::to_value(HssQualitySummary::default()).expect("quality fixture serializes");
+        let object = legacy.as_object_mut().expect("quality is an object");
+        object.remove("usable_for_period_estimation");
+        object.remove("usable_for_runtime_estimation");
+        object.remove("proves_no_sample_loss");
+        object.remove("reason_codes");
+
+        let restored: HssQualitySummary =
+            serde_json::from_value(legacy).expect("V1.0 quality defaults");
+        let mut current = serde_json::to_value(restored).expect("restored quality serializes");
+        assert_eq!(current["reason_codes"], json!([]));
+        current
+            .as_object_mut()
+            .expect("quality is an object")
+            .insert("integrity".to_owned(), json!("unknown"));
+        jsonschema::validate(
+            &with_hss_output_definitions(hss_quality_definition()),
+            &current,
+        )
+        .expect("V1.0 quality remains valid under the current output contract");
+    }
+
+    #[test]
+    fn plan_output_schema_closes_raw_routing_metadata() {
+        let raw_plan = json!({
+            "duration_s": 2,
+            "rate_hz": 100,
+            "expected_samples": 200,
+            "sample_bytes": 4,
+            "record_bytes": 8,
+            "estimated_storage_bytes": 1600,
+            "variables": [{
+                "evidence": "raw_address",
+                "series": "raw_20000010_u32",
+                "address": "0x20000010",
+                "byte_length": 4,
+                "sample_offset": 0,
+                "type": "u32",
+                "endianness": "little",
+                "allowed_region": {
+                    "address": 536_870_912,
+                    "length": 4096,
+                    "kind": "ram"
+                },
+                "leaf_fields": [{
+                    "path": "raw_20000010_u32",
+                    "byte_offset": 0,
+                    "byte_length": 4,
+                    "type": "u32"
+                }]
+            }],
+            "reduction_suggestions": ["select fewer top-level fields"]
+        });
+        jsonschema::validate(&hss_plan_output_schema(), &raw_plan)
+            .expect("raw plan output matches the closed action contract");
+
+        let catalog = hss_output_schema();
+        let plan_variant = catalog["oneOf"]
+            .as_array()
+            .and_then(|variants| {
+                variants.iter().find(|variant| {
+                    variant["required"]
+                        .as_array()
+                        .is_some_and(|required| required.contains(&json!("duration_s")))
+                })
+            })
+            .expect("catalog exposes the plan variant");
+        assert!(plan_variant["properties"]["variables"]["items"].is_object());
+        assert_eq!(
+            plan_variant["properties"],
+            hss_plan_output_schema()["properties"]
+        );
+        let mut invalid = raw_plan;
+        invalid["duration_s"] = json!("invalid");
+        assert!(jsonschema::validate(&catalog, &invalid).is_err());
+        assert!(jsonschema::validate(&hss_plan_output_schema(), &invalid).is_err());
     }
 }

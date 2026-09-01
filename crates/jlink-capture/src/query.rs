@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use jlink_domain::{
-    ErrorCode, HssDataIntegrity, HssQualityEvidence, HssQualitySummary, HssRunState, JlinkError,
-    normalize_hss_timestamp_us,
+    ErrorCode, HssDataIntegrity, HssEvidenceKind, HssQualityEvidence, HssQualitySummary,
+    HssRunState, JlinkError, normalize_hss_timestamp_us,
 };
 use serde::Serialize;
 
@@ -14,6 +14,8 @@ use crate::CaptureSnapshot;
 pub struct CaptureVariableOverview {
     /// Stable short identifier used by subsequent query views.
     pub series: String,
+    /// Whether values are typed by DWARF or only by explicit raw-address metadata.
+    pub evidence: HssEvidenceKind,
     /// Number of complete persisted samples.
     pub samples: u64,
     /// Number of adjacent samples whose selected top-level bytes differ.
@@ -96,13 +98,10 @@ pub fn overview(snapshot: &CaptureSnapshot) -> Result<CaptureOverview, JlinkErro
     let mut variables = Vec::with_capacity(snapshot.plan().variables().len());
     for (index, variable) in snapshot.plan().variables().iter().enumerate() {
         let series = format!("s{index}");
-        dictionary.insert(
-            series.clone(),
-            variable.access_plan().selector().path().to_owned(),
-        );
+        dictionary.insert(series.clone(), variable.series_label());
         let offset = usize::try_from(variable.sample_offset())
             .map_err(|_| query_invalid("HSS 变量 sample_offset 无法表示为 usize"))?;
-        let size = usize::try_from(variable.access_plan().byte_size())
+        let size = usize::try_from(variable.byte_size())
             .map_err(|_| query_invalid("HSS 变量 byte_size 无法表示为 usize"))?;
         let end = offset
             .checked_add(size)
@@ -131,6 +130,7 @@ pub fn overview(snapshot: &CaptureSnapshot) -> Result<CaptureOverview, JlinkErro
         }
         variables.push(CaptureVariableOverview {
             series,
+            evidence: variable.evidence_kind(),
             samples,
             changes,
         });

@@ -14,9 +14,10 @@ use jlink_capture::{
     decode_cursor, encode_cursor, event_change_relations, overview, window,
 };
 use jlink_domain::{
-    AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister, DebugRequest,
-    DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashRange,
-    HssReturnWhen, HssRunSnapshot, HssRunState, HssStartPlan, HssThresholdRule, JlinkError,
+    AccessLayout, AccessPlan, ConnectionState, ControlAfter, ControlRequest, CoreRegister,
+    DebugRequest, DebugResult, ElementSlice, ErrorCode, FirmwareIdentityPlan, FirmwareImage,
+    FlashRange, HssEvidenceKind, HssRawEndianness, HssRawSelector, HssRawValueType, HssReturnWhen,
+    HssRunSnapshot, HssRunState, HssSelectorPlan, HssStartPlan, HssThresholdRule, JlinkError,
     MemoryRange, ProfileConflictSeverity, ProgramAfter, ProgramRequest, TargetConnectionSpec,
     TargetInterface, ValidationAfter, VariableSelector, WriteVerify, canonical_device_name,
     probe_identity_hash,
@@ -83,8 +84,9 @@ impl Runtime {
     ///
     /// Returns stable configuration, image, DWARF, selector, value, identity, or
     /// HSS capability errors when the request cannot form one fixed sampling frame.
+    #[allow(clippy::too_many_lines)]
     pub fn prepare_hss_start(&mut self, arguments: &Value) -> Result<HssStartPlan, JlinkError> {
-        let (index, firmware) = self.load_symbol_planning_context("HSS")?;
+        let resolved = self.resolve()?;
         let variables = arguments
             .get("variables")
             .and_then(Value::as_array)
@@ -95,27 +97,91 @@ impl Runtime {
                     false,
                 )
             })?;
-        let mut plans = Vec::with_capacity(variables.len());
-        for variable in variables {
-            let path = variable
-                .get("path")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    JlinkError::new(ErrorCode::ValueInvalid, "HSS 顶层变量缺少 path", false)
+        let mut symbol_context: Option<(Arc<SymbolIndex>, FirmwareIdentityPlan)> = None;
+        let mut selectors = Vec::with_capacity(variables.len());
+        for (index, variable) in variables.iter().enumerate() {
+            if variable.get("kind").and_then(Value::as_str) == Some("raw_address") {
+                let address = parse_address(
+                    variable
+                        .get("address")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| hss_field_error(index, "address", "缺少十六进制地址"))?,
+                    "variables[].address",
+                )?;
+                let length = variable
+                    .get("length")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| hss_field_error(index, "length", "必须是 1..40 的整数"))?;
+                let value_type = parse_hss_raw_type(
+                    variable
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| hss_field_error(index, "type", "缺少 raw 类型"))?,
+                    index,
+                )?;
+                let endianness = match variable.get("endianness").and_then(Value::as_str) {
+                    Some("little") => HssRawEndianness::Little,
+                    Some("big") => HssRawEndianness::Big,
+                    _ => {
+                        return Err(hss_field_error(index, "endianness", "必须为 little 或 big"));
+                    }
+                };
+                let range = MemoryRange::new(address, u64::from(length))?;
+                let allowed_region = resolved
+                    .profile
+                    .readable_ram
+                    .iter()
+                    .copied()
+                    .find(|region| {
+                        region.address() <= range.address()
+                            && range.end() <= region.address().saturating_add(region.length())
+                    })
+                    .ok_or_else(|| {
+                        hss_field_error(
+                            index,
+                            "address",
+                            "raw 范围必须完整位于 Profile readable RAM",
+                        )
+                        .with_detail("address", json!(format!("0x{address:X}")))
+                        .with_detail("length", json!(length))
+                    })?;
+                selectors.push(HssSelectorPlan::Raw(HssRawSelector::new(
+                    address,
+                    value_type,
+                    length,
+                    endianness,
+                    allowed_region,
+                )?));
+            } else {
+                if symbol_context.is_none() {
+                    symbol_context = Some(self.load_symbol_planning_context("HSS")?);
+                }
+                let path = variable
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| hss_field_error(index, "path", "DWARF 选择项缺少 path"))?;
+                let selector = VariableSelector::new(path, element_slice(variable)?)?;
+                let (symbol_index, _) = symbol_context.as_ref().ok_or_else(|| {
+                    JlinkError::new(
+                        ErrorCode::InvalidResponse,
+                        "DWARF HSS 规划上下文未建立",
+                        false,
+                    )
                 })?;
-            let selector = VariableSelector::new(path, element_slice(variable)?)?;
-            plans.push(self.symbol_cache.access_plan(&index, &selector)?);
+                selectors.push(HssSelectorPlan::Dwarf(
+                    self.symbol_cache.access_plan(symbol_index, &selector)?,
+                ));
+            }
         }
         let capture_key = arguments
             .get("capture_key")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                JlinkError::new(ErrorCode::ValueInvalid, "HSS 缺少 capture_key", false)
-            })?;
+            .unwrap_or("offline-plan");
         let duration_s = required_u32(arguments, "duration_s")?;
         let rate_hz = required_u32(arguments, "rate_hz")?;
         let return_when = match arguments.get("return_when").and_then(Value::as_str) {
-            Some("started") => HssReturnWhen::Started,
+            Some("started") | None => HssReturnWhen::Started,
             Some("completed") => HssReturnWhen::Completed,
             _ => {
                 return Err(JlinkError::new(
@@ -149,14 +215,14 @@ impl Runtime {
                 ));
             }
         };
-        HssStartPlan::new(
+        HssStartPlan::new_selectors(
             capture_key,
             duration_s,
             rate_hz,
             return_when,
-            plans,
+            selectors,
             rules,
-            firmware,
+            symbol_context.map(|(_, firmware)| firmware),
         )
     }
 
@@ -553,6 +619,7 @@ impl Runtime {
             .and_then(Value::as_str)
             .expect("MCP Schema guarantees hss.action")
         {
+            "plan" => self.plan_hss(arguments),
             "start" => self.start_hss(arguments),
             "status" => self.status_hss(arguments),
             "query" if arguments.get("cursor").is_some() => self.cursor_hss(arguments),
@@ -572,6 +639,11 @@ impl Runtime {
                 "jlink_hss.{action} 已声明 V1 合同，但将在对应 OpenSpec 阶段接通"
             ))),
         }
+    }
+
+    fn plan_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
+        let plan = self.prepare_hss_start(arguments)?;
+        Ok(ToolCall::success(hss_plan_result(&plan)?))
     }
 
     fn start_hss(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -1460,6 +1532,188 @@ fn hss_start_result(snapshot: &HssRunSnapshot) -> Value {
     Value::Object(result)
 }
 
+fn hss_plan_result(plan: &HssStartPlan) -> Result<Value, JlinkError> {
+    let variables = plan
+        .variables()
+        .iter()
+        .map(|variable| {
+            let mut value = Map::from_iter([
+                ("evidence".to_owned(), json!(variable.evidence_kind())),
+                ("series".to_owned(), json!(variable.series_label())),
+                (
+                    "address".to_owned(),
+                    json!(format!("0x{:X}", variable.address())),
+                ),
+                ("byte_length".to_owned(), json!(variable.byte_size())),
+                ("sample_offset".to_owned(), json!(variable.sample_offset())),
+            ]);
+            let leaf_fields = if variable.evidence_kind() == HssEvidenceKind::Dwarf {
+                let access = variable
+                    .access_plan()
+                    .expect("validated DWARF selector has an access plan");
+                let mut fields = Vec::new();
+                collect_hss_leaf_fields(
+                    access.layout(),
+                    access.selector().path(),
+                    0,
+                    access
+                        .selector()
+                        .slice()
+                        .map(jlink_domain::ElementSlice::start),
+                    &mut fields,
+                )?;
+                fields
+            } else {
+                let raw = variable
+                    .raw_selector()
+                    .expect("raw evidence has selector metadata");
+                value.insert("type".to_owned(), json!(raw.value_type().as_str()));
+                value.insert("endianness".to_owned(), json!(raw.endianness().as_str()));
+                value.insert(
+                    "allowed_region".to_owned(),
+                    serde_json::to_value(raw.allowed_region()).map_err(serialization_error)?,
+                );
+                vec![json!({
+                    "path": raw.series(),
+                    "byte_offset": 0,
+                    "byte_length": raw.length(),
+                    "type": raw.value_type().as_str()
+                })]
+            };
+            value.insert("leaf_fields".to_owned(), Value::Array(leaf_fields));
+            Ok(Value::Object(value))
+        })
+        .collect::<Result<Vec<_>, JlinkError>>()?;
+    let expected_samples = u64::from(plan.duration_s()) * u64::from(plan.rate_hz());
+    let frame = plan.frame_layout();
+    let estimated_storage_bytes = expected_samples.saturating_mul(u64::from(frame.record_bytes()));
+    Ok(json!({
+        "duration_s": plan.duration_s(),
+        "rate_hz": plan.rate_hz(),
+        "expected_samples": expected_samples,
+        "sample_bytes": frame.sample_bytes(),
+        "record_bytes": frame.record_bytes(),
+        "estimated_storage_bytes": estimated_storage_bytes,
+        "variables": variables,
+        "reduction_suggestions": [
+            "select fewer top-level fields",
+            "slice arrays before capture",
+            "split selectors across separate captures"
+        ]
+    }))
+}
+
+fn collect_hss_leaf_fields(
+    layout: &AccessLayout,
+    path: &str,
+    byte_offset: u64,
+    root_slice_start: Option<u64>,
+    fields: &mut Vec<Value>,
+) -> Result<(), JlinkError> {
+    match layout {
+        AccessLayout::Scalar {
+            name,
+            byte_size,
+            encoding,
+        } => fields.push(json!({
+            "path": path,
+            "byte_offset": byte_offset,
+            "byte_length": byte_size,
+            "type": name,
+            "encoding": encoding
+        })),
+        AccessLayout::Pointer { byte_size } => fields.push(json!({
+            "path": path,
+            "byte_offset": byte_offset,
+            "byte_length": byte_size,
+            "type": "pointer"
+        })),
+        AccessLayout::Structure { members, .. } | AccessLayout::Union { members, .. } => {
+            for member in members {
+                collect_hss_leaf_fields(
+                    member.layout(),
+                    &format!("{path}.{}", member.name()),
+                    byte_offset
+                        .checked_add(member.byte_offset())
+                        .ok_or_else(|| {
+                            JlinkError::new(
+                                ErrorCode::HssUnsupported,
+                                "HSS leaf byte offset 溢出",
+                                false,
+                            )
+                        })?,
+                    None,
+                    fields,
+                )?;
+            }
+        }
+        AccessLayout::Array {
+            element,
+            count: Some(count),
+        } => {
+            let element_bytes = element.byte_size().ok_or_else(|| {
+                JlinkError::new(ErrorCode::HssUnsupported, "HSS array 元素长度未知", false)
+            })?;
+            let start = root_slice_start.unwrap_or(0);
+            for local_index in 0..*count {
+                let actual_index = start.checked_add(local_index).ok_or_else(|| {
+                    JlinkError::new(ErrorCode::HssUnsupported, "HSS slice 数组索引溢出", false)
+                })?;
+                collect_hss_leaf_fields(
+                    element,
+                    &format!("{path}[{actual_index}]"),
+                    byte_offset
+                        .checked_add(local_index.saturating_mul(element_bytes))
+                        .ok_or_else(|| {
+                            JlinkError::new(
+                                ErrorCode::HssUnsupported,
+                                "HSS array leaf byte offset 溢出",
+                                false,
+                            )
+                        })?,
+                    None,
+                    fields,
+                )?;
+            }
+        }
+        AccessLayout::Array { count: None, .. } => {
+            return Err(JlinkError::new(
+                ErrorCode::HssUnsupported,
+                "HSS plan 不能包含未切片的不定长数组",
+                false,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn hss_field_error(index: usize, field: &str, message: &str) -> JlinkError {
+    JlinkError::new(ErrorCode::ValueInvalid, message, false)
+        .with_detail("field", json!(format!("variables[{index}].{field}")))
+        .with_detail("selector_index", json!(index))
+}
+
+fn parse_hss_raw_type(value: &str, index: usize) -> Result<HssRawValueType, JlinkError> {
+    match value {
+        "bytes" => Ok(HssRawValueType::Bytes),
+        "u8" => Ok(HssRawValueType::U8),
+        "u16" => Ok(HssRawValueType::U16),
+        "u32" => Ok(HssRawValueType::U32),
+        "u64" => Ok(HssRawValueType::U64),
+        "i8" => Ok(HssRawValueType::I8),
+        "i16" => Ok(HssRawValueType::I16),
+        "i32" => Ok(HssRawValueType::I32),
+        "i64" => Ok(HssRawValueType::I64),
+        "f32" => Ok(HssRawValueType::F32),
+        "f64" => Ok(HssRawValueType::F64),
+        _ => Err(hss_field_error(
+            index,
+            "type",
+            "必须为 bytes/u8/u16/u32/u64/i8/i16/i32/i64/f32/f64",
+        )),
+    }
+}
+
 fn hss_status_result(snapshot: &HssRunSnapshot) -> Result<Value, JlinkError> {
     let mut result = hss_start_result(snapshot)
         .as_object()
@@ -2139,5 +2393,101 @@ mod hss_state_tests {
         assert!(result.get("quality").is_none());
         assert!(result.get("from_us").is_none());
         assert!(result.get("to_us").is_none());
+    }
+}
+
+#[cfg(test)]
+mod hss_plan_tests {
+    use std::fs;
+
+    use jlink_domain::{AccessLayout, ScalarEncoding};
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{Runtime, collect_hss_leaf_fields, hss_plan_result};
+    use crate::config::ConfigPaths;
+
+    #[test]
+    fn raw_only_plan_is_offline_and_does_not_require_symbols_elf() {
+        let root = tempdir().expect("runtime fixture root");
+        let project = root.path().join("jlink-mcp.toml");
+        let user = root.path().join("user.toml");
+        fs::write(
+            &project,
+            format!(
+                r#"
+[target]
+device = "FixtureDevice"
+interface = "swd"
+speed_khz = 1000
+
+[jlink]
+dll_path = "C:/missing/JLink_x64.dll"
+version = "9.64"
+sha256 = "{}"
+
+[[profile.flash_regions]]
+address = 0
+length = 1048576
+
+[[profile.readable_ram]]
+address = 536870912
+length = 4096
+"#,
+                "11".repeat(32)
+            ),
+        )
+        .expect("project config");
+        fs::write(&user, "[probe]\nserial = 1\n").expect("user config");
+        let mut runtime = Runtime::new(
+            ConfigPaths::new(&project, &user),
+            root.path().join("jlink-worker.exe"),
+            root.path().join("leases"),
+        );
+        let plan = runtime
+            .prepare_hss_start(&json!({
+                "action": "plan",
+                "duration_s": 2,
+                "rate_hz": 100,
+                "variables": [{
+                    "kind": "raw_address",
+                    "address": "0x20000010",
+                    "type": "u32",
+                    "length": 4,
+                    "endianness": "little"
+                }]
+            }))
+            .expect("raw offline plan");
+        assert!(runtime.attachment.is_none());
+        assert!(plan.firmware().is_none());
+        let result = hss_plan_result(&plan).expect("plan result");
+        assert_eq!(result["expected_samples"], 200);
+        assert_eq!(result["sample_bytes"], 4);
+        assert_eq!(result["variables"][0]["evidence"], "raw_address");
+        assert_eq!(result["variables"][0]["series"], "raw_20000010_u32");
+        assert_eq!(
+            result["variables"][0]["leaf_fields"][0]["path"],
+            "raw_20000010_u32"
+        );
+    }
+
+    #[test]
+    fn sliced_dwarf_plan_reports_actual_array_indices() {
+        let layout = AccessLayout::Array {
+            element: Box::new(AccessLayout::Scalar {
+                name: "uint16_t".to_owned(),
+                byte_size: 2,
+                encoding: ScalarEncoding::Unsigned,
+            }),
+            count: Some(2),
+        };
+        let mut fields = Vec::new();
+        collect_hss_leaf_fields(&layout, "arr", 0, Some(5), &mut fields)
+            .expect("bounded slice leaves");
+
+        assert_eq!(fields[0]["path"], "arr[5]");
+        assert_eq!(fields[0]["byte_offset"], 0);
+        assert_eq!(fields[1]["path"], "arr[6]");
+        assert_eq!(fields[1]["byte_offset"], 2);
     }
 }

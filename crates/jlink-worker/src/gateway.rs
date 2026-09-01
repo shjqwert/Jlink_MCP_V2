@@ -13,9 +13,9 @@ use std::{
 
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
-    HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
-    ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface, TargetState,
-    ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
+    HssCapabilities, HssRateAssessment, HssStartPlan, JlinkError, MemoryRegion, MemoryRegionKind,
+    ProgramAfter, ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface,
+    TargetState, ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
     validate_write_count,
 };
 use serde_json::json;
@@ -30,6 +30,10 @@ use windows_sys::Win32::{
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNNING_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const HSS_RATE_MEASUREMENT_WINDOW: Duration = Duration::from_millis(150);
+const HSS_RATE_MEASUREMENT_POLL: Duration = Duration::from_millis(1);
+const HSS_RATE_SAFETY_MARGIN_PERCENT: u32 = 10;
+const HSS_RATE_MEASUREMENT_BUFFER_BYTES: usize = 64 * 1024;
 const ICSR: u32 = 0xE000_ED04;
 const CFSR: u32 = 0xE000_ED28;
 const HFSR: u32 = 0xE000_ED2C;
@@ -500,16 +504,15 @@ impl DllGateway {
             .variables()
             .iter()
             .map(|variable| {
-                let access = variable.access_plan();
                 Ok(HssBlock {
-                    address: u32::try_from(access.address()).map_err(|_| {
+                    address: u32::try_from(variable.address()).map_err(|_| {
                         JlinkError::new(
                             ErrorCode::HssUnsupported,
                             "HSS 变量地址超出冻结 32-bit ABI",
                             false,
                         )
                     })?,
-                    byte_count: u32::try_from(access.byte_size()).map_err(|_| {
+                    byte_count: u32::try_from(variable.byte_size()).map_err(|_| {
                         JlinkError::new(
                             ErrorCode::HssUnsupported,
                             "HSS 变量长度超出冻结 32-bit ABI",
@@ -626,6 +629,92 @@ impl DllGateway {
             ));
         }
         Ok(())
+    }
+
+    /// Measures one short temporary stream and rejects an unsafe requested rate.
+    ///
+    /// The temporary rate is never substituted into the real capture request.
+    /// A matching Stop is dispatched exactly once after every successful Start.
+    pub(crate) fn assess_hss_rate(
+        &mut self,
+        plan: &HssStartPlan,
+        capabilities: HssCapabilities,
+    ) -> Result<HssRateAssessment, JlinkError> {
+        capabilities.validate_start(plan)?;
+        let measurement_rate_hz = capabilities.max_frequency_hz().min(1_000);
+        let measurement_plan = plan.with_rate_for_measurement(measurement_rate_hz)?;
+        let record_bytes = usize::try_from(measurement_plan.frame_layout().record_bytes())
+            .map_err(|_| {
+                JlinkError::new(
+                    ErrorCode::HssUnsupported,
+                    "HSS measurement record length 无法表示",
+                    false,
+                )
+            })?;
+        let mut buffer = vec![0_u8; HSS_RATE_MEASUREMENT_BUFFER_BYTES];
+        self.start_hss(&measurement_plan)?;
+        let started = Instant::now();
+        let measured = (|| {
+            let mut total_bytes = 0_u64;
+            while started.elapsed() < HSS_RATE_MEASUREMENT_WINDOW {
+                let read = self.read_hss(&mut buffer, record_bytes)?;
+                total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                thread::sleep(HSS_RATE_MEASUREMENT_POLL);
+            }
+            Ok::<u64, JlinkError>(total_bytes)
+        })();
+        let stop_result = self.stop_hss();
+        stop_result?;
+        let mut total_bytes = measured?;
+        let mut empty_reads = 0_u32;
+        for _ in 0..20 {
+            let read = self.read_hss(&mut buffer, record_bytes)?;
+            total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+            if read == 0 {
+                empty_reads += 1;
+                if empty_reads >= 3 {
+                    break;
+                }
+            } else {
+                empty_reads = 0;
+            }
+            thread::sleep(HSS_RATE_MEASUREMENT_POLL);
+        }
+        let measurement_window_us =
+            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+        let complete_samples = total_bytes / u64::try_from(record_bytes).unwrap_or(u64::MAX);
+        if complete_samples == 0 {
+            return Err(JlinkError::new(
+                ErrorCode::HssUnsupported,
+                "HSS 短窗口测量没有获得完整样本",
+                true,
+            )
+            .with_detail("measurement_rate_hz", json!(measurement_rate_hz))
+            .with_detail("measurement_window_us", json!(measurement_window_us)));
+        }
+        let measured_rate_hz = u32::try_from(
+            complete_samples
+                .saturating_mul(1_000_000)
+                .checked_div(measurement_window_us)
+                .unwrap_or_default(),
+        )
+        .unwrap_or(u32::MAX)
+        .max(1);
+        let conservative_rate =
+            measured_rate_hz.saturating_mul(100 - HSS_RATE_SAFETY_MARGIN_PERCENT) / 100;
+        let recommended_max_rate_hz = conservative_rate
+            .min(capabilities.max_frequency_hz())
+            .max(1);
+        HssRateAssessment::new(
+            measurement_rate_hz,
+            measurement_window_us,
+            complete_samples,
+            measured_rate_hz,
+            HSS_RATE_SAFETY_MARGIN_PERCENT,
+            recommended_max_rate_hz,
+            plan.rate_hz(),
+        )?
+        .ensure_accepted()
     }
 
     /// Reads authoritative Flash regions from the loaded J-Link device database.

@@ -11,8 +11,9 @@ use std::{
 };
 
 use jlink_domain::{
-    DebugRequest, ErrorCode, HssWriteKind, IpcRequest, IpcResponse, JlinkError, ProtocolVersion,
-    SessionCommand, probe_identity_hash, read_ipc_frame, worker_endpoint_name, write_ipc_frame,
+    DebugRequest, ErrorCode, HssWriteKind, IpcRequest, IpcResponse, JlinkError, MemoryRange,
+    MemoryRegionKind, ProtocolVersion, SessionCommand, probe_identity_hash, read_ipc_frame,
+    worker_endpoint_name, write_ipc_frame,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -554,8 +555,37 @@ impl WorkerRuntime {
                     &mut self.gateway,
                     |gateway| {
                         session.ensure_hss_start_allowed(&target)?;
-                        ensure_firmware_identity(session, gateway, &target, plan.firmware(), true)?;
-                        gateway.hss_capabilities()?.validate_start(&plan)
+                        if let Some(firmware) = plan.firmware() {
+                            ensure_firmware_identity(session, gateway, &target, firmware, true)?;
+                        }
+                        let raw_ranges = plan
+                            .variables()
+                            .iter()
+                            .filter_map(|variable| variable.raw_selector())
+                            .map(|selector| {
+                                selector.validate()?;
+                                MemoryRange::new(selector.address(), u64::from(selector.length()))
+                            })
+                            .collect::<Result<Vec<_>, JlinkError>>()?;
+                        if !raw_ranges.is_empty() {
+                            let memory_map = gateway.device_memory_map(target.device())?;
+                            for range in raw_ranges {
+                                if memory_map.classify(range)? != MemoryRegionKind::Ram {
+                                    return Err(JlinkError::new(
+                                        ErrorCode::AddressOutOfRange,
+                                        "raw-address HSS 范围不在 J-Link 设备数据库 RAM 内",
+                                        false,
+                                    )
+                                    .with_detail(
+                                        "address",
+                                        json!(format!("0x{:X}", range.address())),
+                                    )
+                                    .with_detail("length", json!(range.length())));
+                                }
+                            }
+                        }
+                        let capabilities = gateway.hss_capabilities()?;
+                        gateway.assess_hss_rate(&plan, capabilities)
                     },
                 )?;
                 if outcome.started_new {

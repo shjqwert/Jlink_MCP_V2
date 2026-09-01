@@ -5,14 +5,15 @@ use serde_json::{Number, Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError, SelectorStep, TargetConnectionSpec,
-    VariableSelector,
+    AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, JlinkError, MemoryRegion,
+    MemoryRegionKind, ScalarEncoding, SelectorStep, TargetConnectionSpec, VariableSelector,
 };
 
 const HSS_TIMESTAMP_BYTES: u32 = 4;
 const HSS_CAPS_TIMESTAMP_FLAG: u32 = 2;
 const HSS_SOURCE_TIMESTAMP_FREQUENCY_HZ: u32 = 1_000;
 const HSS_SOURCE_TIMESTAMP_RESOLUTION_US: u32 = 1_000;
+const HSS_PLAN_FORMAT_VERSION: u32 = 2;
 
 /// Minimum supported fixed capture duration in seconds.
 pub const HSS_MIN_DURATION_S: u32 = 1;
@@ -546,6 +547,108 @@ pub struct HssQualityEvent {
     pub occurrences: u64,
 }
 
+/// Stable reasons explaining whether a capture is suitable for timing estimates.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssQualityReasonCode {
+    /// At least two stable source timestamps support interval estimates.
+    StableIntervalsAvailable,
+    /// Source-time bounds support a capture runtime estimate.
+    RuntimeBoundsAvailable,
+    /// Fewer than two complete samples were observed.
+    InsufficientSamples,
+    /// A final partial frame prevents timing use.
+    IncompleteFrame,
+    /// At least one source timestamp moved backwards.
+    ClockRegression,
+    /// Source slots contain an unreconciled gap.
+    SourceTimestampGap,
+    /// A direct DLL signal confirmed overflow.
+    ConfirmedOverflow,
+    /// The ABI has no independent overflow or sequence evidence.
+    NoIndependentLossEvidence,
+}
+
+/// One short-window capability measurement and conservative acceptance decision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssRateAssessment {
+    /// Rate used by the temporary measurement stream.
+    pub measurement_rate_hz: u32,
+    /// Host-monotonic measurement window.
+    pub measurement_window_us: u64,
+    /// Complete records observed in the temporary stream.
+    pub complete_samples: u64,
+    /// Conservative integer rate derived from the short window.
+    pub measured_rate_hz: u32,
+    /// Percentage removed from the observed rate as a safety margin.
+    pub safety_margin_percent: u32,
+    /// Highest rate accepted for the real capture.
+    pub recommended_max_rate_hz: u32,
+    /// User-requested real capture rate; never silently changed.
+    pub requested_rate_hz: u32,
+    /// Whether the request is within the conservative recommendation.
+    pub accepted: bool,
+}
+
+impl HssRateAssessment {
+    /// Creates a self-consistent short-window assessment.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::HssUnsupported`] for invalid measurement fields or
+    /// a recommendation greater than the measured rate.
+    pub fn new(
+        measurement_rate_hz: u32,
+        measurement_window_us: u64,
+        complete_samples: u64,
+        measured_rate_hz: u32,
+        safety_margin_percent: u32,
+        recommended_max_rate_hz: u32,
+        requested_rate_hz: u32,
+    ) -> Result<Self, JlinkError> {
+        if measurement_rate_hz == 0
+            || measurement_window_us == 0
+            || complete_samples == 0
+            || measured_rate_hz == 0
+            || safety_margin_percent >= 100
+            || recommended_max_rate_hz == 0
+            || recommended_max_rate_hz > measured_rate_hz
+            || requested_rate_hz == 0
+        {
+            return Err(hss_unsupported("HSS 短窗口频率评估数据无效"));
+        }
+        Ok(Self {
+            measurement_rate_hz,
+            measurement_window_us,
+            complete_samples,
+            measured_rate_hz,
+            safety_margin_percent,
+            recommended_max_rate_hz,
+            requested_rate_hz,
+            accepted: requested_rate_hz <= recommended_max_rate_hz,
+        })
+    }
+
+    /// Rejects an unsafe request without modifying its requested rate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorCode::HssUnsupported`] when the requested rate exceeds the
+    /// conservative recommendation.
+    pub fn ensure_accepted(self) -> Result<Self, JlinkError> {
+        if self.accepted {
+            Ok(self)
+        } else {
+            Err(
+                hss_unsupported("HSS 请求频率超过短窗口测量后的安全建议上限")
+                    .with_detail("rate_assessment", json!(self))
+                    .with_detail("rate_was_modified", json!(false)),
+            )
+        }
+    }
+}
+
 /// Persisted acquisition quality facts used by overview and timeline queries.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -559,6 +662,9 @@ pub struct HssQualitySummary {
     /// Rate derived from source timestamp span, in milli-hertz.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_rate_millihz: Option<u64>,
+    /// Short-window acceptance evidence captured before the real stream.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_assessment: Option<HssRateAssessment>,
     /// Source interval statistics.
     pub intervals: HssIntervalStatistics,
     /// Loss conclusion with no synthetic zero.
@@ -567,6 +673,18 @@ pub struct HssQualitySummary {
     pub overflow: HssOverflowAssessment,
     /// Explicit source/host clock contract.
     pub clock: HssClockEvidence,
+    /// Whether stable intervals support period estimation.
+    #[serde(default)]
+    pub usable_for_period_estimation: bool,
+    /// Whether source-time bounds support runtime estimation.
+    #[serde(default)]
+    pub usable_for_runtime_estimation: bool,
+    /// True only with independent loss/sequence evidence; frozen ABI remains false.
+    #[serde(default)]
+    pub proves_no_sample_loss: bool,
+    /// Stable explanations for the three purpose conclusions.
+    #[serde(default)]
+    pub reason_codes: Vec<HssQualityReasonCode>,
     /// Aggregated quality occurrences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<HssQualityEvent>,
@@ -579,6 +697,7 @@ impl Default for HssQualitySummary {
             expected_samples: 0,
             actual_samples: 0,
             actual_rate_millihz: None,
+            rate_assessment: None,
             intervals: HssIntervalStatistics::default(),
             loss: HssLossAssessment {
                 evidence: HssQualityEvidence::Unknown,
@@ -601,6 +720,10 @@ impl Default for HssQualitySummary {
                 first_timestamp_us: None,
                 last_timestamp_us: None,
             },
+            usable_for_period_estimation: false,
+            usable_for_runtime_estimation: false,
+            proves_no_sample_loss: false,
+            reason_codes: vec![HssQualityReasonCode::NoIndependentLossEvidence],
             events: Vec::new(),
         }
     }
@@ -619,9 +742,20 @@ impl HssQualityTracker {
     /// Creates quality state for one validated fixed-duration plan.
     #[must_use]
     pub fn new(plan: &HssStartPlan, start_call_elapsed_us: u64) -> Self {
+        Self::new_with_rate_assessment(plan, start_call_elapsed_us, None)
+    }
+
+    /// Creates quality state and retains the pre-capture frequency assessment.
+    #[must_use]
+    pub fn new_with_rate_assessment(
+        plan: &HssStartPlan,
+        start_call_elapsed_us: u64,
+        rate_assessment: Option<HssRateAssessment>,
+    ) -> Self {
         let mut summary = HssQualitySummary {
             requested_rate_hz: plan.rate_hz(),
             expected_samples: u64::from(plan.duration_s()) * u64::from(plan.rate_hz()),
+            rate_assessment,
             ..HssQualitySummary::default()
         };
         summary.clock.mapping_error_us = Some(
@@ -762,6 +896,43 @@ impl HssQualityTracker {
             );
         }
         summary.loss = loss_assessment(&summary, final_tail_bytes);
+        let unmatched_gaps = summary
+            .intervals
+            .gap_slots
+            .saturating_sub(summary.intervals.collisions);
+        summary.usable_for_period_estimation = summary.actual_samples >= 2
+            && final_tail_bytes == 0
+            && summary.intervals.regressions == 0
+            && unmatched_gaps == 0
+            && summary.overflow.evidence != HssQualityEvidence::Confirmed;
+        summary.usable_for_runtime_estimation = summary.usable_for_period_estimation
+            && summary.clock.first_timestamp_us.is_some()
+            && summary.clock.last_timestamp_us.is_some();
+        summary.proves_no_sample_loss = false;
+        let mut reasons = Vec::new();
+        if summary.usable_for_period_estimation {
+            reasons.push(HssQualityReasonCode::StableIntervalsAvailable);
+        }
+        if summary.usable_for_runtime_estimation {
+            reasons.push(HssQualityReasonCode::RuntimeBoundsAvailable);
+        }
+        if summary.actual_samples < 2 {
+            reasons.push(HssQualityReasonCode::InsufficientSamples);
+        }
+        if final_tail_bytes > 0 {
+            reasons.push(HssQualityReasonCode::IncompleteFrame);
+        }
+        if summary.intervals.regressions > 0 {
+            reasons.push(HssQualityReasonCode::ClockRegression);
+        }
+        if unmatched_gaps > 0 {
+            reasons.push(HssQualityReasonCode::SourceTimestampGap);
+        }
+        if summary.overflow.evidence == HssQualityEvidence::Confirmed {
+            reasons.push(HssQualityReasonCode::ConfirmedOverflow);
+        }
+        reasons.push(HssQualityReasonCode::NoIndependentLossEvidence);
+        summary.reason_codes = reasons;
         summary
     }
 
@@ -1551,19 +1722,292 @@ fn rule_value_invalid(rule_id: &str, message: impl Into<String>) -> JlinkError {
     hss_value_invalid(message).with_detail("rule_id", json!(rule_id))
 }
 
-/// One top-level DWARF selector placed at a fixed offset in every HSS sample.
+/// Explicit byte order for one raw-address HSS selector.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssRawEndianness {
+    /// Least-significant byte is stored at the lowest address.
+    Little,
+    /// Most-significant byte is stored at the lowest address.
+    Big,
+}
+
+impl HssRawEndianness {
+    /// Returns the stable Schema spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Little => "little",
+            Self::Big => "big",
+        }
+    }
+}
+
+/// Closed raw value types that can be decoded without DWARF semantics.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssRawValueType {
+    /// Uninterpreted bytes; `length` may be 1..40.
+    Bytes,
+    /// Unsigned integer types.
+    U8,
+    /// Unsigned 16-bit integer.
+    U16,
+    /// Unsigned 32-bit integer.
+    U32,
+    /// Unsigned 64-bit integer.
+    U64,
+    /// Signed integer types.
+    I8,
+    /// Signed 16-bit integer.
+    I16,
+    /// Signed 32-bit integer.
+    I32,
+    /// Signed 64-bit integer.
+    I64,
+    /// IEEE-754 floating-point types.
+    F32,
+    /// IEEE-754 64-bit floating-point value.
+    F64,
+}
+
+impl HssRawValueType {
+    const fn fixed_length(self) -> Option<u32> {
+        match self {
+            Self::Bytes => None,
+            Self::U8 | Self::I8 => Some(1),
+            Self::U16 | Self::I16 => Some(2),
+            Self::U32 | Self::I32 | Self::F32 => Some(4),
+            Self::U64 | Self::I64 | Self::F64 => Some(8),
+        }
+    }
+
+    /// Returns the stable Schema spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bytes => "bytes",
+            Self::U8 => "u8",
+            Self::U16 => "u16",
+            Self::U32 => "u32",
+            Self::U64 => "u64",
+            Self::I8 => "i8",
+            Self::I16 => "i16",
+            Self::I32 => "i32",
+            Self::I64 => "i64",
+            Self::F32 => "f32",
+            Self::F64 => "f64",
+        }
+    }
+
+    const fn is_numeric(self) -> bool {
+        !matches!(self, Self::Bytes)
+    }
+
+    fn layout(self, length: u32) -> AccessLayout {
+        match self {
+            Self::Bytes => AccessLayout::Array {
+                element: Box::new(AccessLayout::Scalar {
+                    name: "uint8_t".to_owned(),
+                    byte_size: 1,
+                    encoding: ScalarEncoding::Unsigned,
+                }),
+                count: Some(u64::from(length)),
+            },
+            value_type => AccessLayout::Scalar {
+                name: value_type.as_str().to_owned(),
+                byte_size: u64::from(length),
+                encoding: match value_type {
+                    Self::U8 | Self::U16 | Self::U32 | Self::U64 => ScalarEncoding::Unsigned,
+                    Self::I8 | Self::I16 | Self::I32 | Self::I64 => ScalarEncoding::Signed,
+                    Self::F32 | Self::F64 => ScalarEncoding::Float,
+                    Self::Bytes => unreachable!("bytes uses array layout"),
+                },
+            },
+        }
+    }
+}
+
+/// One raw target range whose safety is bounded by a selected Profile RAM region.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HssRawSelector {
+    address: u64,
+    #[serde(rename = "type")]
+    value_type: HssRawValueType,
+    length: u32,
+    endianness: HssRawEndianness,
+    allowed_region: MemoryRegion,
+    series: String,
+}
+
+impl HssRawSelector {
+    /// Creates a raw selector already tied to one Profile-declared readable RAM region.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable address or type error for an empty, oversized, mismatched,
+    /// or out-of-Profile range.
+    pub fn new(
+        address: u64,
+        value_type: HssRawValueType,
+        length: u32,
+        endianness: HssRawEndianness,
+        allowed_region: MemoryRegion,
+    ) -> Result<Self, JlinkError> {
+        let series = format!("raw_{address:08X}_{}", value_type.as_str());
+        let selector = Self {
+            address,
+            value_type,
+            length,
+            endianness,
+            allowed_region,
+            series,
+        };
+        selector.validate()?;
+        Ok(selector)
+    }
+
+    /// Revalidates the frozen Profile boundary after IPC transport.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable value or range error when metadata was altered or no
+    /// longer fits the frozen Profile RAM boundary.
+    pub fn validate(&self) -> Result<(), JlinkError> {
+        if !(1..=HSS_MAX_EXPANDED_SAMPLE_BYTES).contains(&self.length) {
+            return Err(hss_unsupported(format!(
+                "raw HSS length 必须为 1..{HSS_MAX_EXPANDED_SAMPLE_BYTES}"
+            )));
+        }
+        if let Some(expected) = self.value_type.fixed_length()
+            && self.length != expected
+        {
+            return Err(hss_value_invalid("raw HSS type 与 length 不匹配")
+                .with_detail("type", json!(self.value_type))
+                .with_detail("expected_length", json!(expected))
+                .with_detail("actual_length", json!(self.length)));
+        }
+        if self.allowed_region.kind() != MemoryRegionKind::Ram {
+            return Err(hss_value_invalid(
+                "raw HSS allowed_region 必须是 Profile 声明的 RAM",
+            ));
+        }
+        let range_end = self
+            .address
+            .checked_add(u64::from(self.length))
+            .ok_or_else(|| hss_value_invalid("raw HSS 地址范围溢出"))?;
+        let allowed_end = self
+            .allowed_region
+            .address()
+            .checked_add(self.allowed_region.length())
+            .ok_or_else(|| hss_value_invalid("raw HSS Profile RAM 范围溢出"))?;
+        if self.address < self.allowed_region.address() || range_end > allowed_end {
+            return Err(
+                hss_value_invalid("raw HSS 范围必须完整位于 Profile 声明的 readable RAM")
+                    .with_detail("address", json!(format!("0x{:X}", self.address)))
+                    .with_detail("length", json!(self.length))
+                    .with_detail(
+                        "allowed_address",
+                        json!(format!("0x{:X}", self.allowed_region.address())),
+                    )
+                    .with_detail("allowed_length", json!(self.allowed_region.length())),
+            );
+        }
+        let expected_series = format!("raw_{:08X}_{}", self.address, self.value_type.as_str());
+        if self.series != expected_series {
+            return Err(hss_value_invalid("raw HSS series 派生字段不一致"));
+        }
+        Ok(())
+    }
+
+    /// Returns the first target byte.
+    #[must_use]
+    pub const fn address(&self) -> u64 {
+        self.address
+    }
+
+    /// Returns the exact number of bytes read per sample.
+    #[must_use]
+    pub const fn length(&self) -> u32 {
+        self.length
+    }
+
+    /// Returns the explicit raw type.
+    #[must_use]
+    pub const fn value_type(&self) -> HssRawValueType {
+        self.value_type
+    }
+
+    /// Returns the explicit byte order.
+    #[must_use]
+    pub const fn endianness(&self) -> HssRawEndianness {
+        self.endianness
+    }
+
+    /// Returns the frozen Profile RAM boundary used for offline authorization.
+    #[must_use]
+    pub const fn allowed_region(&self) -> &MemoryRegion {
+        &self.allowed_region
+    }
+
+    /// Returns the canonical series label without DWARF semantics.
+    #[must_use]
+    pub fn series(&self) -> &str {
+        &self.series
+    }
+
+    fn layout(&self) -> AccessLayout {
+        self.value_type.layout(self.length)
+    }
+}
+
+/// Public evidence classification for one HSS top-level selector.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HssEvidenceKind {
+    /// Type and field meaning come from the configured DWARF ELF.
+    #[default]
+    Dwarf,
+    /// Only address, explicit type, length, endianness and Profile RAM are proven.
+    RawAddress,
+}
+
+/// One already-resolved selector consumed by the common HSS planner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HssSelectorPlan {
+    /// Statically resolved DWARF selector.
+    Dwarf(AccessPlan),
+    /// Explicit Profile-bounded raw address selector.
+    Raw(HssRawSelector),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum HssVariableEvidence {
+    #[default]
+    Dwarf,
+    RawAddress {
+        selector: HssRawSelector,
+    },
+}
+
+/// One top-level selector placed at a fixed offset in every HSS sample.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HssVariablePlan {
-    plan: AccessPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    plan: Option<AccessPlan>,
+    #[serde(default)]
+    evidence: HssVariableEvidence,
     sample_offset: u32,
 }
 
 impl HssVariablePlan {
     /// Returns the immutable DWARF access plan.
     #[must_use]
-    pub const fn access_plan(&self) -> &AccessPlan {
-        &self.plan
+    pub const fn access_plan(&self) -> Option<&AccessPlan> {
+        self.plan.as_ref()
     }
 
     /// Returns the byte offset after the source timestamp in each sample.
@@ -1571,19 +2015,133 @@ impl HssVariablePlan {
     pub const fn sample_offset(&self) -> u32 {
         self.sample_offset
     }
+
+    /// Returns the public evidence classification.
+    #[must_use]
+    pub const fn evidence_kind(&self) -> HssEvidenceKind {
+        match self.evidence {
+            HssVariableEvidence::Dwarf => HssEvidenceKind::Dwarf,
+            HssVariableEvidence::RawAddress { .. } => HssEvidenceKind::RawAddress,
+        }
+    }
+
+    /// Returns raw selector metadata without presenting it as DWARF evidence.
+    #[must_use]
+    pub const fn raw_selector(&self) -> Option<&HssRawSelector> {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => None,
+            HssVariableEvidence::RawAddress { selector } => Some(selector),
+        }
+    }
+
+    /// Returns a human-readable dictionary label for query results.
+    #[must_use]
+    pub fn series_label(&self) -> String {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => self
+                .plan
+                .as_ref()
+                .map(|plan| plan.selector().path().to_owned())
+                .unwrap_or_default(),
+            HssVariableEvidence::RawAddress { selector } => selector.series().to_owned(),
+        }
+    }
+
+    /// Returns whether the top-level value is directly numeric.
+    #[must_use]
+    pub const fn is_raw_numeric(&self) -> bool {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => false,
+            HssVariableEvidence::RawAddress { selector } => selector.value_type.is_numeric(),
+        }
+    }
+
+    /// Returns the first byte sampled by the DLL.
+    #[must_use]
+    pub fn address(&self) -> u64 {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => self.plan.as_ref().map_or(0, AccessPlan::address),
+            HssVariableEvidence::RawAddress { selector } => selector.address(),
+        }
+    }
+
+    /// Returns the exact block byte count sampled by the DLL.
+    #[must_use]
+    pub fn byte_size(&self) -> u64 {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => self.plan.as_ref().map_or(0, AccessPlan::byte_size),
+            HssVariableEvidence::RawAddress { selector } => u64::from(selector.length()),
+        }
+    }
+
+    /// Returns the recursive layout for DWARF or the explicit raw type layout.
+    #[must_use]
+    pub fn layout(&self) -> AccessLayout {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => self.plan.as_ref().map_or_else(
+                || AccessLayout::Array {
+                    element: Box::new(AccessLayout::Scalar {
+                        name: "invalid".to_owned(),
+                        byte_size: 1,
+                        encoding: ScalarEncoding::Other,
+                    }),
+                    count: Some(0),
+                },
+                |plan| plan.layout().clone(),
+            ),
+            HssVariableEvidence::RawAddress { selector } => selector.layout(),
+        }
+    }
+
+    /// Decodes one exact top-level sample according to its evidence kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable frame or typed-value error for missing plan metadata,
+    /// an incorrect byte count, or an unsupported encoded value.
+    pub fn decode_value(&self, data: &[u8]) -> Result<Value, JlinkError> {
+        match &self.evidence {
+            HssVariableEvidence::Dwarf => {
+                let plan = self
+                    .plan
+                    .as_ref()
+                    .ok_or_else(|| hss_value_invalid("DWARF HSS 变量缺少 access plan"))?;
+                crate::typed_value::decode_layout(plan.layout(), data, plan.bit_range(), "$")
+            }
+            HssVariableEvidence::RawAddress { selector } => {
+                if selector.endianness == HssRawEndianness::Big
+                    && selector.value_type != HssRawValueType::Bytes
+                {
+                    let mut little_endian = data.to_vec();
+                    little_endian.reverse();
+                    crate::typed_value::decode_layout(
+                        &selector.layout(),
+                        &little_endian,
+                        None,
+                        "$raw",
+                    )
+                } else {
+                    crate::typed_value::decode_layout(&selector.layout(), data, None, "$raw")
+                }
+            }
+        }
+    }
 }
 
 /// Immutable, normalized HSS request built before any DLL or target action.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HssStartPlan {
+    #[serde(default)]
+    plan_format_version: u32,
     capture_key: String,
     duration_s: u32,
     rate_hz: u32,
     return_when: HssReturnWhen,
     variables: Vec<HssVariablePlan>,
     rules: Vec<HssThresholdRule>,
-    firmware: FirmwareIdentityPlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    firmware: Option<FirmwareIdentityPlan>,
     frame_layout: HssFrameLayout,
     request_fingerprint: String,
 }
@@ -1604,6 +2162,36 @@ impl HssStartPlan {
         rules: Vec<HssThresholdRule>,
         firmware: FirmwareIdentityPlan,
     ) -> Result<Self, JlinkError> {
+        Self::new_selectors(
+            capture_key,
+            duration_s,
+            rate_hz,
+            return_when,
+            plans.into_iter().map(HssSelectorPlan::Dwarf).collect(),
+            rules,
+            Some(firmware),
+        )
+    }
+
+    /// Validates and normalizes a mixed DWARF/raw selector request.
+    ///
+    /// Raw selectors remain explicitly classified and do not require an ELF;
+    /// every DWARF selector requires the same strong firmware identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns stable value, address, identity, layout, rule, or HSS capability
+    /// errors when the request is unsafe or cannot fit the frozen ABI.
+    #[allow(clippy::too_many_lines)]
+    pub fn new_selectors(
+        capture_key: impl Into<String>,
+        duration_s: u32,
+        rate_hz: u32,
+        return_when: HssReturnWhen,
+        selectors: Vec<HssSelectorPlan>,
+        rules: Vec<HssThresholdRule>,
+        firmware: Option<FirmwareIdentityPlan>,
+    ) -> Result<Self, JlinkError> {
         let capture_key = capture_key.into();
         if capture_key.trim().is_empty() {
             return Err(hss_value_invalid("capture_key 不能为空或仅包含空白"));
@@ -1614,25 +2202,57 @@ impl HssStartPlan {
         if !(HSS_MIN_RATE_HZ..=HSS_MAX_RATE_HZ).contains(&rate_hz) {
             return Err(hss_value_invalid("rate_hz 必须为 1..1000"));
         }
-        if plans.is_empty() || plans.len() > HSS_MAX_TOP_LEVEL_SELECTORS {
-            return Err(hss_value_invalid("HSS 顶层变量选择项必须为 1..10 个"));
+        if selectors.is_empty() || selectors.len() > HSS_MAX_TOP_LEVEL_SELECTORS {
+            return Err(hss_value_invalid("HSS 顶层选择项必须为 1..10 个"));
         }
-        firmware.validate()?;
+        if let Some(firmware) = &firmware {
+            firmware.validate()?;
+        }
+        let requires_firmware = selectors
+            .iter()
+            .any(|selector| matches!(selector, HssSelectorPlan::Dwarf(_)));
+        if requires_firmware {
+            firmware
+                .as_ref()
+                .ok_or_else(|| hss_value_invalid("DWARF HSS selector 缺少符号 ELF 身份计划"))?
+                .ensure_strong()?;
+        }
 
         let mut sample_offset = 0_u32;
-        let mut variables = Vec::with_capacity(plans.len());
-        let mut byte_counts = Vec::with_capacity(plans.len());
-        for (index, plan) in plans.into_iter().enumerate() {
-            plan.validate_for_execution()?;
-            if plan.elf_sha256() != firmware.elf_sha256() {
-                return Err(hss_value_invalid("HSS 变量计划与固件身份不是同一 ELF")
-                    .with_detail("selector_index", json!(index)));
-            }
-            let byte_count = u32::try_from(plan.byte_size()).map_err(|_| {
+        let mut variables = Vec::with_capacity(selectors.len());
+        let mut byte_counts = Vec::with_capacity(selectors.len());
+        for (index, selector) in selectors.into_iter().enumerate() {
+            let (plan, evidence, address_value, byte_size) = match selector {
+                HssSelectorPlan::Dwarf(plan) => {
+                    let firmware = firmware.as_ref().ok_or_else(|| {
+                        hss_value_invalid("DWARF HSS selector 缺少符号 ELF 身份计划")
+                    })?;
+                    if plan.elf_sha256() != firmware.elf_sha256() {
+                        return Err(hss_value_invalid("HSS 变量计划与固件身份不是同一 ELF")
+                            .with_detail("selector_index", json!(index)));
+                    }
+                    plan.validate_for_execution()?;
+                    let address = plan.address();
+                    let byte_size = plan.byte_size();
+                    (Some(plan), HssVariableEvidence::Dwarf, address, byte_size)
+                }
+                HssSelectorPlan::Raw(selector) => {
+                    selector.validate()?;
+                    let address = selector.address();
+                    let byte_size = u64::from(selector.length());
+                    (
+                        None,
+                        HssVariableEvidence::RawAddress { selector },
+                        address,
+                        byte_size,
+                    )
+                }
+            };
+            let byte_count = u32::try_from(byte_size).map_err(|_| {
                 hss_unsupported("HSS 变量长度超出冻结 DLL 的 32-bit block ABI")
                     .with_detail("selector_index", json!(index))
             })?;
-            let address = u32::try_from(plan.address()).map_err(|_| {
+            let address = u32::try_from(address_value).map_err(|_| {
                 hss_unsupported("HSS 变量地址超出 Cortex-M 32-bit 地址空间")
                     .with_detail("selector_index", json!(index))
             })?;
@@ -1648,16 +2268,36 @@ impl HssStartPlan {
                 return Err(hss_unsupported(format!(
                     "HSS 展开采样载荷 {next_offset} 字节超过已验证上限 {HSS_MAX_EXPANDED_SAMPLE_BYTES} 字节"
                 ))
-                .with_detail("selector_index", json!(index)));
+                .with_detail("selector_index", json!(index))
+                .with_detail("expanded_sample_bytes", json!(next_offset))
+                .with_detail("maximum_sample_bytes", json!(HSS_MAX_EXPANDED_SAMPLE_BYTES))
+                .with_detail(
+                    "reduction_suggestions",
+                    json!([
+                        "select fewer top-level fields",
+                        "slice arrays before capture",
+                        "split selectors across separate captures"
+                    ]),
+                ));
             }
             variables.push(HssVariablePlan {
                 plan,
+                evidence,
                 sample_offset,
             });
             byte_counts.push(byte_count);
             sample_offset = next_offset;
         }
         let frame_layout = HssFrameLayout::new(&byte_counts)?;
+        if !rules.is_empty()
+            && variables
+                .iter()
+                .any(|variable| variable.evidence_kind() == HssEvidenceKind::RawAddress)
+        {
+            return Err(hss_unsupported(
+                "raw-address HSS 不支持 DWARF 字段语义的 threshold rules",
+            ));
+        }
         let rules = normalize_hss_rules(rules)?;
         let request_fingerprint = request_fingerprint(
             duration_s,
@@ -1665,9 +2305,10 @@ impl HssStartPlan {
             return_when,
             &variables,
             &rules,
-            &firmware,
+            firmware.as_ref(),
         )?;
         Ok(Self {
+            plan_format_version: HSS_PLAN_FORMAT_VERSION,
             capture_key,
             duration_s,
             rate_hz,
@@ -1687,15 +2328,15 @@ impl HssStartPlan {
     /// Returns the same errors as [`Self::new`] or a value error if serialized
     /// derived fields do not match the normalized request.
     pub fn validate(&self) -> Result<(), JlinkError> {
-        let rebuilt = Self::new(
+        if self.plan_format_version == 0 {
+            return self.validate_legacy_persisted();
+        }
+        let rebuilt = Self::new_selectors(
             self.capture_key.clone(),
             self.duration_s,
             self.rate_hz,
             self.return_when,
-            self.variables
-                .iter()
-                .map(|variable| variable.plan.clone())
-                .collect(),
+            self.resolved_selectors()?,
             self.rules.clone(),
             self.firmware.clone(),
         )?;
@@ -1704,6 +2345,70 @@ impl HssStartPlan {
         } else {
             Err(hss_value_invalid("HSS 启动计划的派生字段不一致"))
         }
+    }
+
+    fn validate_legacy_persisted(&self) -> Result<(), JlinkError> {
+        if self.capture_key.trim().is_empty()
+            || !(HSS_MIN_DURATION_S..=HSS_MAX_DURATION_S).contains(&self.duration_s)
+            || !(HSS_MIN_RATE_HZ..=HSS_MAX_RATE_HZ).contains(&self.rate_hz)
+            || self.variables.is_empty()
+            || self.variables.len() > HSS_MAX_TOP_LEVEL_SELECTORS
+        {
+            return Err(hss_value_invalid("V1.0 HSS 持久化计划的基础字段无效"));
+        }
+        let firmware = self
+            .firmware
+            .as_ref()
+            .ok_or_else(|| hss_value_invalid("V1.0 HSS 持久化计划缺少 firmware"))?;
+        firmware.validate()?;
+        let mut sample_offset = 0_u32;
+        let mut byte_counts = Vec::with_capacity(self.variables.len());
+        for (index, variable) in self.variables.iter().enumerate() {
+            if variable.evidence_kind() != HssEvidenceKind::Dwarf {
+                return Err(hss_value_invalid(
+                    "V1.0 HSS 持久化计划不能包含 raw-address evidence",
+                ));
+            }
+            let plan = variable
+                .access_plan()
+                .ok_or_else(|| hss_value_invalid("V1.0 HSS 变量缺少 access plan"))?;
+            plan.validate_for_execution()?;
+            if plan.elf_sha256() != firmware.elf_sha256() {
+                return Err(hss_value_invalid("V1.0 HSS 变量与 firmware ELF 不一致")
+                    .with_detail("selector_index", json!(index)));
+            }
+            if variable.sample_offset != sample_offset {
+                return Err(hss_value_invalid("V1.0 HSS sample_offset 派生字段不一致")
+                    .with_detail("selector_index", json!(index)));
+            }
+            let byte_count = u32::try_from(plan.byte_size())
+                .map_err(|_| hss_unsupported("V1.0 HSS 变量长度超出 32-bit block ABI"))?;
+            sample_offset = sample_offset
+                .checked_add(byte_count)
+                .filter(|value| *value <= HSS_MAX_EXPANDED_SAMPLE_BYTES)
+                .ok_or_else(|| hss_unsupported("V1.0 HSS 展开采样载荷超过 40 字节"))?;
+            byte_counts.push(byte_count);
+        }
+        if HssFrameLayout::new(&byte_counts)? != self.frame_layout {
+            return Err(hss_value_invalid("V1.0 HSS frame_layout 派生字段不一致"));
+        }
+        if normalize_hss_rules(self.rules.clone())? != self.rules {
+            return Err(hss_value_invalid("V1.0 HSS rules 规范化字段不一致"));
+        }
+        let request_fingerprint = legacy_request_fingerprint(
+            self.duration_s,
+            self.rate_hz,
+            self.return_when,
+            &self.variables,
+            &self.rules,
+            firmware,
+        )?;
+        if request_fingerprint != self.request_fingerprint {
+            return Err(hss_value_invalid(
+                "V1.0 HSS request_fingerprint 派生字段不一致",
+            ));
+        }
+        Ok(())
     }
 
     /// Returns the Agent-provided idempotency key.
@@ -1750,8 +2455,50 @@ impl HssStartPlan {
 
     /// Returns the symbol ELF identity that must be verified before HSS starts.
     #[must_use]
-    pub const fn firmware(&self) -> &FirmwareIdentityPlan {
-        &self.firmware
+    pub const fn firmware(&self) -> Option<&FirmwareIdentityPlan> {
+        self.firmware.as_ref()
+    }
+
+    /// Returns whether at least one selector depends on DWARF firmware identity.
+    #[must_use]
+    pub fn requires_firmware_identity(&self) -> bool {
+        self.variables
+            .iter()
+            .any(|variable| variable.evidence_kind() == HssEvidenceKind::Dwarf)
+    }
+
+    /// Rebuilds the same selector set for a bounded short-window rate measurement.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Self::new_selectors`] if the
+    /// replacement rate or persisted selector metadata is invalid.
+    pub fn with_rate_for_measurement(&self, rate_hz: u32) -> Result<Self, JlinkError> {
+        Self::new_selectors(
+            format!("{}-rate-measurement", self.capture_key),
+            HSS_MIN_DURATION_S,
+            rate_hz,
+            HssReturnWhen::Started,
+            self.resolved_selectors()?,
+            Vec::new(),
+            self.firmware.clone(),
+        )
+    }
+
+    fn resolved_selectors(&self) -> Result<Vec<HssSelectorPlan>, JlinkError> {
+        self.variables
+            .iter()
+            .map(|variable| match &variable.evidence {
+                HssVariableEvidence::Dwarf => variable
+                    .plan
+                    .clone()
+                    .map(HssSelectorPlan::Dwarf)
+                    .ok_or_else(|| hss_value_invalid("DWARF HSS 变量缺少 access plan")),
+                HssVariableEvidence::RawAddress { selector } => {
+                    Ok(HssSelectorPlan::Raw(selector.clone()))
+                }
+            })
+            .collect()
     }
 
     /// Returns the frozen raw-frame layout.
@@ -1998,6 +2745,22 @@ struct FingerprintInput<'a> {
     return_when: HssReturnWhen,
     variables: &'a [HssVariablePlan],
     rules: &'a [HssThresholdRule],
+    firmware: Option<&'a FirmwareIdentityPlan>,
+}
+
+#[derive(Serialize)]
+struct LegacyVariableFingerprint<'a> {
+    plan: &'a AccessPlan,
+    sample_offset: u32,
+}
+
+#[derive(Serialize)]
+struct LegacyFingerprintInput<'a> {
+    duration_s: u32,
+    rate_hz: u32,
+    return_when: HssReturnWhen,
+    variables: Vec<LegacyVariableFingerprint<'a>>,
+    rules: &'a [HssThresholdRule],
     firmware: &'a FirmwareIdentityPlan,
 }
 
@@ -2007,7 +2770,7 @@ fn request_fingerprint(
     return_when: HssReturnWhen,
     variables: &[HssVariablePlan],
     rules: &[HssThresholdRule],
-    firmware: &FirmwareIdentityPlan,
+    firmware: Option<&FirmwareIdentityPlan>,
 ) -> Result<String, JlinkError> {
     let bytes = serde_json::to_vec(&FingerprintInput {
         duration_s,
@@ -2018,6 +2781,37 @@ fn request_fingerprint(
         firmware,
     })
     .map_err(|error| hss_value_invalid(format!("HSS 请求无法规范化：{error}")))?;
+    Ok(sha256(&bytes))
+}
+
+fn legacy_request_fingerprint(
+    duration_s: u32,
+    rate_hz: u32,
+    return_when: HssReturnWhen,
+    variables: &[HssVariablePlan],
+    rules: &[HssThresholdRule],
+    firmware: &FirmwareIdentityPlan,
+) -> Result<String, JlinkError> {
+    let variables = variables
+        .iter()
+        .map(|variable| {
+            Ok(LegacyVariableFingerprint {
+                plan: variable
+                    .access_plan()
+                    .ok_or_else(|| hss_value_invalid("V1.0 HSS 变量缺少 access plan"))?,
+                sample_offset: variable.sample_offset(),
+            })
+        })
+        .collect::<Result<Vec<_>, JlinkError>>()?;
+    let bytes = serde_json::to_vec(&LegacyFingerprintInput {
+        duration_s,
+        rate_hz,
+        return_when,
+        variables,
+        rules,
+        firmware,
+    })
+    .map_err(|error| hss_value_invalid(format!("V1.0 HSS 请求无法规范化：{error}")))?;
     Ok(sha256(&bytes))
 }
 
@@ -2087,4 +2881,191 @@ fn hss_unsupported(message: impl Into<String>) -> JlinkError {
 
 fn invalid_hss_transition(message: impl Into<String>) -> JlinkError {
     JlinkError::new(ErrorCode::InvalidStateTransition, message, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{
+        HssEvidenceKind, HssFrameLayout, HssQualityReasonCode, HssQualityTracker, HssRawEndianness,
+        HssRawSelector, HssRawValueType, HssReturnWhen, HssSelectorPlan, HssStartPlan,
+        LegacyFingerprintInput, LegacyVariableFingerprint, sha256,
+    };
+    use crate::{
+        AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, MemoryRegion, MemoryRegionKind,
+        ScalarEncoding, VariableSelector,
+    };
+
+    fn ram() -> MemoryRegion {
+        MemoryRegion::new(0x2000_0000, 0x1000, MemoryRegionKind::Ram).expect("RAM fixture")
+    }
+
+    fn raw_plan(rate_hz: u32) -> HssStartPlan {
+        HssStartPlan::new_selectors(
+            "raw-fixture",
+            1,
+            rate_hz,
+            HssReturnWhen::Started,
+            vec![HssSelectorPlan::Raw(
+                HssRawSelector::new(
+                    0x2000_0010,
+                    HssRawValueType::U32,
+                    4,
+                    HssRawEndianness::Big,
+                    ram(),
+                )
+                .expect("raw selector"),
+            )],
+            Vec::new(),
+            None,
+        )
+        .expect("raw plan")
+    }
+
+    #[test]
+    fn raw_selector_is_profile_bounded_and_never_claims_dwarf_evidence() {
+        let plan = raw_plan(100);
+        let variable = &plan.variables()[0];
+        assert_eq!(variable.evidence_kind(), HssEvidenceKind::RawAddress);
+        assert_eq!(variable.series_label(), "raw_20000010_u32");
+        assert!(!plan.requires_firmware_identity());
+        assert!(plan.firmware().is_none());
+        assert_eq!(
+            variable.decode_value(&[0x12, 0x34, 0x56, 0x78]).unwrap(),
+            json!(305_419_896)
+        );
+
+        let error = HssRawSelector::new(
+            0x1fff_ffff,
+            HssRawValueType::Bytes,
+            4,
+            HssRawEndianness::Little,
+            ram(),
+        )
+        .expect_err("cross-boundary raw selector must fail");
+        assert_eq!(error.code, ErrorCode::ValueInvalid);
+    }
+
+    #[test]
+    fn common_planner_rejects_expansion_above_forty_bytes() {
+        let selectors = vec![
+            HssSelectorPlan::Raw(
+                HssRawSelector::new(
+                    0x2000_0000,
+                    HssRawValueType::Bytes,
+                    32,
+                    HssRawEndianness::Little,
+                    ram(),
+                )
+                .unwrap(),
+            ),
+            HssSelectorPlan::Raw(
+                HssRawSelector::new(
+                    0x2000_0040,
+                    HssRawValueType::Bytes,
+                    9,
+                    HssRawEndianness::Little,
+                    ram(),
+                )
+                .unwrap(),
+            ),
+        ];
+        let error = HssStartPlan::new_selectors(
+            "too-wide",
+            1,
+            100,
+            HssReturnWhen::Started,
+            selectors,
+            Vec::new(),
+            None,
+        )
+        .expect_err("41-byte payload must fail");
+        assert_eq!(error.code, ErrorCode::HssUnsupported);
+        assert_eq!(
+            error
+                .details
+                .as_ref()
+                .and_then(|details| details.get("expanded_sample_bytes")),
+            Some(&json!(41))
+        );
+    }
+
+    #[test]
+    fn quality_states_timing_uses_without_claiming_no_loss() {
+        let plan = raw_plan(1_000);
+        let mut tracker = HssQualityTracker::new(&plan, 10);
+        let records = [
+            0_u32.to_le_bytes().as_slice(),
+            [0_u8; 4].as_slice(),
+            1_u32.to_le_bytes().as_slice(),
+            [1_u8; 4].as_slice(),
+        ]
+        .concat();
+        tracker
+            .observe_complete_records(plan.frame_layout(), &records, 2_000)
+            .expect("quality records");
+        let summary = tracker.summary(0);
+        assert!(summary.usable_for_period_estimation);
+        assert!(summary.usable_for_runtime_estimation);
+        assert!(!summary.proves_no_sample_loss);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&HssQualityReasonCode::NoIndependentLossEvidence)
+        );
+    }
+
+    #[test]
+    fn v1_persisted_dwarf_plan_remains_queryable_without_new_strong_identity() {
+        let firmware: FirmwareIdentityPlan = serde_json::from_value(json!({
+            "elf_sha256": "11".repeat(32),
+            "segments": [{
+                "address": 0,
+                "length": 4,
+                "sha256": "22".repeat(32)
+            }]
+        }))
+        .expect("legacy firmware fixture");
+        let access = AccessPlan::new(
+            "11".repeat(32),
+            VariableSelector::new("legacy", None).unwrap(),
+            0x2000_0000,
+            4,
+            None,
+            false,
+            AccessLayout::Scalar {
+                name: "uint32_t".to_owned(),
+                byte_size: 4,
+                encoding: ScalarEncoding::Unsigned,
+            },
+        );
+        let fingerprint = sha256(
+            &serde_json::to_vec(&LegacyFingerprintInput {
+                duration_s: 1,
+                rate_hz: 100,
+                return_when: HssReturnWhen::Started,
+                variables: vec![LegacyVariableFingerprint {
+                    plan: &access,
+                    sample_offset: 0,
+                }],
+                rules: &[],
+                firmware: &firmware,
+            })
+            .unwrap(),
+        );
+        let plan: HssStartPlan = serde_json::from_value(json!({
+            "capture_key": "legacy-capture",
+            "duration_s": 1,
+            "rate_hz": 100,
+            "return_when": "started",
+            "variables": [{ "plan": access, "sample_offset": 0 }],
+            "rules": [],
+            "firmware": firmware,
+            "frame_layout": HssFrameLayout::new(&[4]).unwrap(),
+            "request_fingerprint": fingerprint
+        }))
+        .expect("V1 JSON shape deserializes");
+        plan.validate().expect("V1 persisted plan stays readable");
+    }
 }

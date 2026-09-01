@@ -7,9 +7,9 @@ use std::{
 use jlink_capture::{CapturePhase, CaptureRecovery, CaptureSnapshot, CaptureStore, CaptureWriter};
 use jlink_domain::{
     ErrorCode, HssCaptureReservation, HssCaptureState, HssDrainTiming, HssQualitySummary,
-    HssQualityTracker, HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState,
-    HssStartPlan, HssStartRegistry, HssWriteKind, HssWriteResult, HssWriteTiming, JlinkError,
-    TargetConnectionSpec,
+    HssQualityTracker, HssRateAssessment, HssRecoveryNotification, HssReservationOutcome,
+    HssRunSnapshot, HssRunState, HssStartPlan, HssStartRegistry, HssWriteKind, HssWriteResult,
+    HssWriteTiming, JlinkError, TargetConnectionSpec,
 };
 use serde_json::json;
 
@@ -202,7 +202,7 @@ impl HssCoordinator {
     ) -> Result<HssStartOutcome, JlinkError>
     where
         I: HssIo,
-        F: FnOnce(&mut I) -> Result<(), JlinkError>,
+        F: FnOnce(&mut I) -> Result<HssRateAssessment, JlinkError>,
     {
         if let Some(capture_id) = self.retired_keys.get(plan.capture_key()) {
             return Err(JlinkError::new(
@@ -230,10 +230,13 @@ impl HssCoordinator {
                 true,
             ));
         }
-        if let Err(error) = preflight(io) {
-            self.registry.rollback_created(&plan, &reservation);
-            return Err(error);
-        }
+        let rate_assessment = match preflight(io) {
+            Ok(assessment) => assessment.ensure_accepted()?,
+            Err(error) => {
+                self.registry.rollback_created(&plan, &reservation);
+                return Err(error);
+            }
+        };
         let capture_id = reservation.capture_id().to_owned();
         let writer = match self
             .store
@@ -256,9 +259,10 @@ impl HssCoordinator {
         status
             .mark_running()
             .expect("a successful Start transitions starting to running");
-        let quality = HssQualityTracker::new(
+        let quality = HssQualityTracker::new_with_rate_assessment(
             &plan,
             duration_us(started.saturating_duration_since(start_called)),
+            Some(rate_assessment),
         );
         self.active = Some(ActiveCapture {
             reservation,
@@ -805,9 +809,9 @@ mod tests {
     use jlink_domain::{
         AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssClockMappingMethod,
         HssDataIntegrity, HssNormalizedTimeUnit, HssQualityBasis, HssQualityEventKind,
-        HssQualityEvidence, HssRecoveryNotification, HssReturnWhen, HssRunSnapshot, HssRunState,
-        HssSourceTimeUnit, HssStartPlan, HssWriteKind, HssWriteResult, ScalarEncoding,
-        TargetConnectionSpec, VariableSelector,
+        HssQualityEvidence, HssRateAssessment, HssRecoveryNotification, HssReturnWhen,
+        HssRunSnapshot, HssRunState, HssSourceTimeUnit, HssStartPlan, HssWriteKind, HssWriteResult,
+        ScalarEncoding, TargetConnectionSpec, VariableSelector,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -906,6 +910,11 @@ mod tests {
         .expect("start plan")
     }
 
+    fn rate_assessment() -> HssRateAssessment {
+        HssRateAssessment::new(1_000, 150_000, 167, 1_112, 10, 1_000, 1_000)
+            .expect("rate assessment fixture is self-consistent")
+    }
+
     fn target() -> TargetConnectionSpec {
         TargetConnectionSpec::new(
             "S32K144",
@@ -968,7 +977,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("quality capture starts");
         complete_capture(&mut coordinator, &mut io, &capture.snapshot.capture_id)
@@ -1069,7 +1078,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1152,7 +1161,7 @@ mod tests {
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let capture_id = started.snapshot.capture_id;
@@ -1203,7 +1212,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1240,7 +1249,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1290,7 +1299,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         coordinator.advance(&mut io).expect("first record retained");
@@ -1340,7 +1349,7 @@ mod tests {
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect_err("DLL Start failure remains a tool error");
         let capture_id = error
@@ -1369,7 +1378,7 @@ mod tests {
                 plan,
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("same key and request recover the failed identity");
         assert!(!recovered.started_new);
@@ -1397,7 +1406,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
@@ -1435,7 +1444,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(()),
+                |_| Ok(rate_assessment()),
             )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
