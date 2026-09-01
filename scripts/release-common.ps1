@@ -8,11 +8,6 @@ function Get-ReleasePayloadPaths {
         '.agents/plugins/marketplace.json', 'plugins/jlink-mcp/.codex-plugin/plugin.json',
         'plugins/jlink-mcp/.mcp.json', 'plugins/jlink-mcp/skills/jlink-mcp/SKILL.md',
         'plugins/jlink-mcp/skills/jlink-mcp/agents/openai.yaml',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/target-session.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/programming.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/debug-access.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/hss.md',
-        'plugins/jlink-mcp/skills/jlink-mcp/references/errors.md',
         'jlink-mcp.example.toml', 'INSTALL.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt'
     )
 }

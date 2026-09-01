@@ -196,7 +196,7 @@ fn call_tool<D: ToolDispatcher>(
         .get("inputSchema")
         .expect("catalog tools always contain inputSchema");
     if let Err(error) = jsonschema::validate(input_schema, &arguments) {
-        return Err((-32_602, format!("Invalid arguments for {name}: {error}")));
+        return Err((-32_602, schema_argument_error(name, input_schema, &error)));
     }
 
     match dispatcher.call(name, &arguments) {
@@ -220,6 +220,195 @@ fn call_tool<D: ToolDispatcher>(
         ToolCall::Error(error) => public_tool_error(error).map_err(|message| (-32_603, message)),
         ToolCall::Unavailable(message) => Err((-32_603, message)),
     }
+}
+
+fn schema_argument_error(
+    name: &str,
+    schema: &Value,
+    error: &jsonschema::ValidationError<'_>,
+) -> String {
+    use jsonschema::error::ValidationErrorKind;
+
+    if let Some(message) = discriminator_argument_error(name, schema, error.instance()) {
+        return message;
+    }
+    let error = most_specific_schema_error(error);
+    let mut field = error.instance_path().to_string();
+    if let ValidationErrorKind::Required { property } = error.kind()
+        && let Some(property) = property.as_str()
+    {
+        field.push('/');
+        field.push_str(&escape_json_pointer(property));
+    }
+    if field.is_empty() {
+        field.push('$');
+    } else {
+        field.insert(0, '$');
+    }
+    let rule = error.kind().keyword();
+    let allowed = schema_allowed_value(schema, error);
+    let actual = if matches!(error.kind(), ValidationErrorKind::Required { .. }) {
+        "<missing>".to_owned()
+    } else {
+        bounded_json(error.instance())
+    };
+
+    format!(
+        "Invalid arguments for {name}: field={field}; rule={rule}; allowed={allowed}; actual={actual}"
+    )
+}
+
+fn discriminator_argument_error(name: &str, schema: &Value, instance: &Value) -> Option<String> {
+    let object = instance.as_object()?;
+    let mut candidates = schema.get("oneOf")?.as_array()?.iter().collect::<Vec<_>>();
+    for field in ["action", "scope", "view", "mode"] {
+        let Some(actual) = object.get(field) else {
+            continue;
+        };
+        let mut allowed = Vec::new();
+        for candidate in &candidates {
+            let Some(field_schema) = candidate.pointer(&format!("/properties/{field}")) else {
+                continue;
+            };
+            if let Some(value) = field_schema.get("const")
+                && !allowed.contains(value)
+            {
+                allowed.push(value.clone());
+            }
+            if let Some(values) = field_schema.get("enum").and_then(Value::as_array) {
+                for value in values {
+                    if !allowed.contains(value) {
+                        allowed.push(value.clone());
+                    }
+                }
+            }
+        }
+        if !allowed.is_empty() && !allowed.contains(actual) {
+            return Some(format!(
+                "Invalid arguments for {name}: field=$/{field}; rule=enum; allowed={}; actual={}",
+                bounded_json(&Value::Array(allowed)),
+                bounded_json(actual)
+            ));
+        }
+        candidates.retain(|candidate| {
+            candidate
+                .pointer(&format!("/properties/{field}"))
+                .is_some_and(|field_schema| {
+                    field_schema
+                        .get("const")
+                        .is_none_or(|expected| expected == actual)
+                        && field_schema
+                            .get("enum")
+                            .and_then(Value::as_array)
+                            .is_none_or(|values| values.contains(actual))
+                })
+        });
+    }
+    None
+}
+
+fn most_specific_schema_error<'error, 'instance>(
+    error: &'error jsonschema::ValidationError<'instance>,
+) -> &'error jsonschema::ValidationError<'instance> {
+    use jsonschema::error::ValidationErrorKind;
+
+    let ValidationErrorKind::OneOfNotValid { context } = error.kind() else {
+        return error;
+    };
+    let matching_groups = context
+        .iter()
+        .filter(|group| !group.iter().any(is_discriminator_mismatch))
+        .collect::<Vec<_>>();
+    let groups = if matching_groups.is_empty() {
+        context.iter().collect::<Vec<_>>()
+    } else {
+        matching_groups
+    };
+    groups
+        .into_iter()
+        .flat_map(|group| group.iter())
+        .map(most_specific_schema_error)
+        .max_by_key(|candidate| schema_error_score(candidate))
+        .unwrap_or(error)
+}
+
+fn is_discriminator_mismatch(error: &jsonschema::ValidationError<'_>) -> bool {
+    use jsonschema::error::ValidationErrorKind;
+
+    let path = error.instance_path().to_string();
+    matches!(
+        error.kind(),
+        ValidationErrorKind::Constant { .. } | ValidationErrorKind::Enum { .. }
+    ) && ["/action", "/scope", "/view", "/mode", "/kind"]
+        .iter()
+        .any(|suffix| path.ends_with(suffix))
+}
+
+fn schema_error_score(error: &jsonschema::ValidationError<'_>) -> usize {
+    use jsonschema::error::ValidationErrorKind;
+
+    let priority = match error.kind() {
+        ValidationErrorKind::Minimum { .. }
+        | ValidationErrorKind::Maximum { .. }
+        | ValidationErrorKind::ExclusiveMinimum { .. }
+        | ValidationErrorKind::ExclusiveMaximum { .. }
+        | ValidationErrorKind::MinItems { .. }
+        | ValidationErrorKind::MaxItems { .. }
+        | ValidationErrorKind::MinLength { .. }
+        | ValidationErrorKind::MaxLength { .. }
+        | ValidationErrorKind::Pattern { .. }
+        | ValidationErrorKind::Type { .. }
+        | ValidationErrorKind::Enum { .. }
+        | ValidationErrorKind::AdditionalProperties { .. } => 300,
+        ValidationErrorKind::Required { .. } => 350,
+        ValidationErrorKind::Constant { .. } => 100,
+        ValidationErrorKind::OneOfNotValid { .. }
+        | ValidationErrorKind::OneOfMultipleValid { .. } => 0,
+        _ => 200,
+    };
+    let depth = error.instance_path().to_string().matches('/').count();
+    priority + depth
+}
+
+fn schema_allowed_value(schema: &Value, error: &jsonschema::ValidationError<'_>) -> String {
+    use jsonschema::error::ValidationErrorKind;
+
+    match error.kind() {
+        ValidationErrorKind::Minimum { limit } => format!(">={limit}"),
+        ValidationErrorKind::Maximum { limit } => format!("<={limit}"),
+        ValidationErrorKind::ExclusiveMinimum { limit } => format!(">{limit}"),
+        ValidationErrorKind::ExclusiveMaximum { limit } => format!("<{limit}"),
+        ValidationErrorKind::MinItems { limit } => format!("items>={limit}"),
+        ValidationErrorKind::MaxItems { limit } => format!("items<={limit}"),
+        ValidationErrorKind::MinLength { limit } => format!("length>={limit}"),
+        ValidationErrorKind::MaxLength { limit } => format!("length<={limit}"),
+        ValidationErrorKind::Enum { options } => bounded_json(options),
+        ValidationErrorKind::Constant { expected_value } => bounded_json(expected_value),
+        ValidationErrorKind::Pattern { pattern } => pattern.clone(),
+        ValidationErrorKind::Required { .. } => "required field".to_owned(),
+        ValidationErrorKind::AdditionalProperties { .. } => {
+            "only fields declared by this action Schema".to_owned()
+        }
+        ValidationErrorKind::Type { kind } => format!("{kind:?}"),
+        _ => schema
+            .pointer(&error.schema_path().to_string())
+            .map_or_else(|| error.to_string(), bounded_json),
+    }
+}
+
+fn bounded_json(value: &Value) -> String {
+    const MAX_CHARS: usize = 160;
+    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "<unprintable>".to_owned());
+    if encoded.chars().count() <= MAX_CHARS {
+        return encoded;
+    }
+    let mut bounded = encoded.chars().take(MAX_CHARS).collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+fn escape_json_pointer(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 fn read_resource<D: ToolDispatcher>(
@@ -366,7 +555,7 @@ fn target_tool() -> Value {
     ]);
     tool_definition(
         "jlink_target",
-        "Connect, disconnect, inspect target status, validate the environment, or manage layered configuration.",
+        "Use for: connect/disconnect, target status, validation and layered config. Do not use for: HSS capture status or target execution control. Ambiguity: target status is live connection state; HSS status belongs to jlink_hss.",
         input,
         target_output_schema(),
         annotations(false, false, false),
@@ -406,7 +595,7 @@ fn program_tool() -> Value {
     ]);
     tool_definition(
         "jlink_program",
-        "Program, erase, or verify target Flash with explicit post-operation state.",
+        "Use for: Flash program/erase and whole-image verify. Do not use for: RAM/MMIO writes or write readback. Ambiguity: verify compares an image range; readback belongs to jlink_write.",
         input,
         empty_or_error_output(),
         annotations(false, true, false),
@@ -440,7 +629,7 @@ fn inspect_tool() -> Value {
     ]);
     tool_definition(
         "jlink_inspect",
-        "Read a DWARF variable, raw memory, core register, or discover exact symbol paths.",
+        "Use for: live DWARF variable, memory/register reads and symbol-path discovery. Do not use for: historical capture data. Ambiguity: symbols finds live ELF paths; capture query belongs to jlink_hss.",
         input,
         inspect_output_schema(),
         annotations(true, false, true),
@@ -477,7 +666,7 @@ fn write_tool() -> Value {
     ]));
     tool_definition(
         "jlink_write",
-        "Write a typed variable, RAM or MMIO bytes, or a writable core register.",
+        "Use for: typed variable, RAM/MMIO or writable-register updates. Do not use for: Flash images. Ambiguity: readback confirms this write; whole-image verify belongs to jlink_program.",
         input,
         empty_or_error_output(),
         annotations(false, true, false),
@@ -497,7 +686,7 @@ fn control_tool() -> Value {
     ]);
     tool_definition(
         "jlink_control",
-        "Halt, resume, reset, or single-step the Cortex-M target.",
+        "Use for: halt/resume/reset/step of the live target. Do not use for: connection status or HSS lifecycle. Ambiguity: target state changes here; capture state changes in jlink_hss.",
         input,
         empty_or_error_output(),
         annotations(false, true, false),
@@ -609,7 +798,7 @@ fn hss_tool() -> Value {
     ));
     tool_definition(
         "jlink_hss",
-        "Plan offline or start fixed-duration capture; read status or query overview, changes, window, around_event. Use exactly one capture_id or capture_key; cursor continues pages.",
+        "Use for: plan/start fixed-duration capture; status or query overview/changes/window/around_event. Do not use for: live reads or target status. Ambiguity: use one capture_id/capture_key; cursor continues pages.",
         with_hss_input_definitions(action_union(variants)),
         hss_output_schema(),
         annotations(false, true, true),
@@ -1946,8 +2135,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        hss_output_schema, hss_plan_output_schema, hss_quality_definition, public_tool_error,
-        with_hss_output_definitions,
+        hss_output_schema, hss_plan_output_schema, hss_quality_definition, hss_tool,
+        public_tool_error, schema_argument_error, tool_catalog, with_hss_output_definitions,
     };
 
     #[test]
@@ -2068,5 +2257,91 @@ mod tests {
         invalid["duration_s"] = json!("invalid");
         assert!(jsonschema::validate(&catalog, &invalid).is_err());
         assert!(jsonschema::validate(&hss_plan_output_schema(), &invalid).is_err());
+    }
+
+    #[test]
+    fn parameter_error_names_field_rule_range_and_actual_value() {
+        let schema = hss_tool()["inputSchema"].clone();
+        let arguments = json!({
+            "action": "plan",
+            "duration_s": 0,
+            "rate_hz": 100,
+            "variables": [{
+                "kind": "raw_address",
+                "address": "0x20000010",
+                "type": "u32",
+                "length": 4,
+                "endianness": "little"
+            }]
+        });
+        let error = jsonschema::validate(&schema, &arguments).expect_err("duration is below range");
+        let message = schema_argument_error("jlink_hss", &schema, &error);
+
+        assert!(message.contains("field=$/duration_s"), "{message}");
+        assert!(message.contains("rule=minimum"), "{message}");
+        assert!(message.contains("allowed=>=1"), "{message}");
+        assert!(message.contains("actual=0"), "{message}");
+    }
+
+    #[test]
+    fn parameter_error_prefers_matching_action_and_nested_selector_branch() {
+        let schema = hss_tool()["inputSchema"].clone();
+        for (arguments, expected) in [
+            (
+                json!({
+                    "action": "plan",
+                    "duration_s": 1,
+                    "rate_hz": 100,
+                    "variables": [{
+                        "kind": "raw_address",
+                        "address": "0x20000010",
+                        "type": "u32",
+                        "endianness": "little"
+                    }]
+                }),
+                [
+                    "field=$/variables/0/length",
+                    "rule=required",
+                    "actual=<missing>",
+                ],
+            ),
+            (
+                json!({ "action": "bogus" }),
+                ["field=$/action", "rule=enum", "actual=\"bogus\""],
+            ),
+            (
+                json!({
+                    "action": "query",
+                    "capture_id": "cap-1",
+                    "view": "window",
+                    "series": ["motor.speed"],
+                    "from_us": 0,
+                    "to_us": 1_000,
+                    "mode": "average"
+                }),
+                ["field=$/mode", "rule=enum", "actual=\"average\""],
+            ),
+        ] {
+            let error =
+                jsonschema::validate(&schema, &arguments).expect_err("fixture must be invalid");
+            let message = schema_argument_error("jlink_hss", &schema, &error);
+            for fragment in expected {
+                assert!(message.contains(fragment), "{message}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_public_tool_description_closes_adjacent_routing_ambiguity() {
+        for tool in tool_catalog() {
+            let name = tool["name"].as_str().expect("tool name");
+            let description = tool["description"].as_str().expect("tool description");
+            for marker in ["Use for:", "Do not use for:", "Ambiguity:"] {
+                assert!(
+                    description.contains(marker),
+                    "{name} description is missing {marker}"
+                );
+            }
+        }
     }
 }
