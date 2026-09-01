@@ -10,6 +10,7 @@ use jlink_domain::{
     ProfileConflict, ProfileConflictSeverity, TargetCapabilities, TargetInterface,
     canonical_device_name,
 };
+use object::{Object, ObjectSegment};
 use serde::Serialize;
 
 use crate::config::{ConfigFile, FlashProfileConfig, ProfileRegionConfig, TargetConfig};
@@ -69,6 +70,7 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
     let mut interfaces = Vec::new();
     let mut speeds = Vec::new();
     let mut flash_regions = Vec::new();
+    let mut loader_ram = None;
     let mut referenced_boards = BTreeSet::new();
     for path in files {
         let Some(contents) = read_metadata(&path, &mut discovery.diagnostics) else {
@@ -134,6 +136,22 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
             continue;
         };
         parse_board_ranges(&contents, &board, &mut flash_regions);
+        for loader in board_loader_paths(&contents, &path) {
+            if let Some(candidate) = loader_ram_from_descriptor(&loader, &mut discovery.diagnostics)
+            {
+                match loader_ram {
+                    None => loader_ram = Some(candidate),
+                    Some(selected) if selected == candidate => {}
+                    Some(selected) => discovery.conflicts.push(ProfileConflict {
+                        field: "profile.loader_ram".to_owned(),
+                        severity: ProfileConflictSeverity::Blocking,
+                        selected: format!("0x{:X}:{}", selected.address, selected.length),
+                        rejected: format!("0x{:X}:{}", candidate.address, candidate.length),
+                        sources: vec![board.clone(), loader.display().to_string()],
+                    }),
+                }
+            }
+        }
         discovery.provenance.push(DiscoveryValue {
             field: "profile.flash_loader_metadata".to_owned(),
             value: "metadata_only".to_owned(),
@@ -146,7 +164,7 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
     discovery.provenance.extend(interfaces.iter().cloned());
     discovery.provenance.extend(speeds.iter().cloned());
     let selected_device = distinct_first(&devices);
-    discovery.conflicts = device_conflicts(&devices);
+    discovery.conflicts.extend(device_conflicts(&devices));
     let selected_interface =
         distinct_first(&interfaces).and_then(|value| match value.value.as_str() {
             "swd" => Some(TargetInterface::Swd),
@@ -161,13 +179,13 @@ pub fn discover_project(root: &Path) -> ProjectDiscovery {
             speed_khz: selected_speed,
         });
     }
-    if !flash_regions.is_empty() {
+    if !flash_regions.is_empty() || loader_ram.is_some() {
         flash_regions.sort_by_key(|region| (region.address, region.length));
         flash_regions.dedup();
         discovery.config.profile = Some(FlashProfileConfig {
             flash_regions,
-            readable_ram: Vec::new(),
-            loader_ram: None,
+            readable_ram: loader_ram.into_iter().collect(),
+            loader_ram,
             capabilities: TargetCapabilities::default(),
         });
     }
@@ -316,6 +334,54 @@ fn parse_board_ranges(contents: &str, source: &str, output: &mut Vec<ProfileRegi
         }
     }
     let _ = source;
+}
+
+fn board_loader_paths(contents: &str, board: &Path) -> Vec<PathBuf> {
+    contents
+        .lines()
+        .filter_map(|line| between(line, "<loader>", "</loader>"))
+        .map(|name| {
+            board
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(name.trim())
+        })
+        .collect()
+}
+
+fn loader_ram_from_descriptor(
+    descriptor: &Path,
+    diagnostics: &mut Vec<DiscoveryDiagnostic>,
+) -> Option<ProfileRegionConfig> {
+    let contents = read_metadata(descriptor, diagnostics)?;
+    let executable = between(&contents, "<exe>", "</exe>")?.trim();
+    let executable = descriptor
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(executable);
+    let bytes = fs::read(&executable).ok()?;
+    let object = object::File::parse(bytes.as_slice()).ok()?;
+    let mut start = u64::MAX;
+    let mut end = 0_u64;
+    for segment in object.segments().filter(|segment| segment.size() > 0) {
+        start = start.min(segment.address());
+        end = end.max(segment.address().checked_add(segment.size())?);
+    }
+    let length = end.checked_sub(start)?;
+    if start == u64::MAX || length == 0 || end > (1_u64 << 32) {
+        return None;
+    }
+    diagnostics.push(DiscoveryDiagnostic {
+        code: "external_loader_metadata_only".to_owned(),
+        source: descriptor.display().to_string(),
+        detail: format!(
+            "IAR loader ELF declares work RAM 0x{start:X}..0x{end:X}; metadata is not executed"
+        ),
+    });
+    Some(ProfileRegionConfig {
+        address: start,
+        length,
+    })
 }
 
 fn parse_cmsis_metadata(

@@ -51,8 +51,9 @@ pub use profile::{
     ProfileSourceKind, TargetCapabilities, canonical_device_name,
 };
 pub use program::{
-    FlashRange, FlashRegion, ProgramAfter, ProgramRequest, VerifyMismatch,
-    VerifyMismatchAccumulator, validate_flash_range, validate_image_flash_ranges,
+    FlashModifiedState, FlashRange, FlashRegion, ProgramAfter, ProgramExecutionFacts,
+    ProgramRangeFact, ProgramRequest, ProgramStage, VerifyMismatch, VerifyMismatchAccumulator,
+    validate_flash_range, validate_image_flash_ranges,
 };
 pub use session::{
     FaultDiagnostics, RecoveryAction, RecoveryNotification, TargetConnectionSpec, ValidationAfter,

@@ -14,8 +14,9 @@ use std::{
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
     HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
-    TargetConnectionSpec, TargetInterface, TargetState, ValidationCheck, ValidationCheckEvidence,
-    ValidationCheckKind, ValidationReport, validate_write_count,
+    ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface, TargetState,
+    ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
+    validate_write_count,
 };
 use serde_json::json;
 use windows_sys::Win32::{
@@ -43,6 +44,7 @@ const DEVICE_AREA_COUNT: usize = 32;
 const MAX_REGISTER_COUNT: usize = 256;
 const PROGRAM_CHUNK_BYTES: usize = 64 * 1024;
 const PROGRAM_CHUNK_BYTES_U64: u64 = 64 * 1024;
+const LOADER_RAM_PREFLIGHT_BYTES: usize = 16;
 const DLL_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 
 type DllLogFn = unsafe extern "C" fn(*const c_char);
@@ -738,46 +740,94 @@ impl DllGateway {
     /// The caller must validate all segments against [`Self::device_flash_regions`]
     /// before invoking this method. Any failure after `BeginDownload` is reported
     /// as execution-uncertain because target side effects may already exist.
-    pub(crate) fn program_image(&mut self, image: &FirmwareImage) -> Result<(), JlinkError> {
+    pub(crate) fn program_image(
+        &mut self,
+        image: &FirmwareImage,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
-        let write_result = image
-            .segments()
-            .iter()
-            .try_for_each(|segment| self.write_download_bytes(segment.address(), segment.data()));
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
+        let write_result = image.segments().iter().try_for_each(|segment| {
+            self.write_download_bytes(segment.address(), segment.data(), facts)
+        });
+        if write_result.is_ok() {
+            facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
+        }
         // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
         let end_result = unsafe { (self.api.end_download)() };
         match (write_result, end_result) {
             (Ok(()), value) if value >= 0 => {
                 let _ = take_dll_diagnostics();
+                facts.confirm_submitted();
+                facts.advance(ProgramStage::EndDownload, ProgramStage::VerifyPreparation);
                 Ok(())
             }
-            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "Flash 写入未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            )))),
-            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "JLINKARM_EndDownload 返回 {value}"
-            )))),
+            (Err(error), value) => Err(attach_dll_diagnostics(
+                error.with_detail("end_download_return_code", json!(value)),
+            )),
+            (Ok(()), value) => Err(attach_dll_diagnostics(
+                JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("JLINKARM_EndDownload returned {value}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(value)),
+            )),
         }
     }
 
     /// Erases all always-present device Flash banks through the J-Link algorithm.
-    pub(crate) fn erase_chip(&mut self) -> Result<(), JlinkError> {
+    pub(crate) fn erase_chip(
+        &mut self,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::SegmentCommit,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned by this gateway.
         let result = unsafe { (self.api.erase_chip)() };
         if result < 0 {
-            return Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "JLINK_EraseChip 返回 {result}"
-            ))));
+            return Err(attach_dll_diagnostics(
+                JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("JLINK_EraseChip returned {result}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(result)),
+            ));
         }
         let _ = take_dll_diagnostics();
+        facts.flash_modified = jlink_domain::FlashModifiedState::True;
+        facts.advance(ProgramStage::SegmentCommit, ProgramStage::FinalState);
         Ok(())
     }
 
@@ -787,13 +837,31 @@ impl DllGateway {
     /// and preservation of bytes outside the requested range to the selected
     /// device algorithm. Hardware evidence must confirm this behavior for each
     /// frozen DLL/device fingerprint before release.
-    pub(crate) fn erase_range(&mut self, address: u64, length: u64) -> Result<(), JlinkError> {
+    pub(crate) fn erase_range(
+        &mut self,
+        address: u64,
+        length: u64,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         reset_dll_diagnostics();
-        self.prepare_flash_operation()
+        self.prepare_flash_operation(facts)
             .map_err(attach_dll_diagnostics)?;
+        facts.last_trusted_target_state = Some(TargetState::Halted);
+        facts.advance(
+            ProgramStage::TargetPreparation,
+            ProgramStage::LoaderRamPreflight,
+        );
+        self.preflight_loader_ram(loader_ram, facts)?;
+        facts.advance(
+            ProgramStage::LoaderRamPreflight,
+            ProgramStage::BeginDownload,
+        );
+        facts.dispatch_side_effect();
         // SAFETY: the connected target is uniquely owned and flags=0 selects the
         // frozen default download behavior.
         unsafe { (self.api.begin_download)(0) };
+        facts.advance(ProgramStage::BeginDownload, ProgramStage::SegmentCommit);
         let erased = vec![0xff_u8; PROGRAM_CHUNK_BYTES];
         let mut remaining = length;
         let mut current = address;
@@ -801,7 +869,7 @@ impl DllGateway {
             while remaining > 0 {
                 let count = usize::try_from(remaining.min(PROGRAM_CHUNK_BYTES_U64))
                     .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 usize"))?;
-                self.write_download_bytes(current, &erased[..count])?;
+                self.write_download_bytes(current, &erased[..count], facts)?;
                 let count = u64::try_from(count)
                     .map_err(|_| execution_uncertain_error("范围擦除块长度无法表示为 u64"))?;
                 current = current
@@ -811,19 +879,29 @@ impl DllGateway {
             }
             Ok(())
         })();
+        if write_result.is_ok() {
+            facts.advance(ProgramStage::SegmentCommit, ProgramStage::EndDownload);
+        }
         // SAFETY: every BeginDownload path is paired with exactly one EndDownload.
         let end_result = unsafe { (self.api.end_download)() };
         match (write_result, end_result) {
             (Ok(()), value) if value >= 0 => {
                 let _ = take_dll_diagnostics();
+                facts.confirm_submitted();
+                facts.advance(ProgramStage::EndDownload, ProgramStage::FinalState);
                 Ok(())
             }
-            (Err(error), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "范围擦除未能完成：{error}；JLINKARM_EndDownload 返回 {value}"
-            )))),
-            (Ok(()), value) => Err(attach_dll_diagnostics(execution_uncertain_error(format!(
-                "范围擦除的 JLINKARM_EndDownload 返回 {value}"
-            )))),
+            (Err(error), value) => Err(attach_dll_diagnostics(
+                error.with_detail("end_download_return_code", json!(value)),
+            )),
+            (Ok(()), value) => Err(attach_dll_diagnostics(
+                JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("range erase JLINKARM_EndDownload returned {value}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(value)),
+            )),
         }
     }
 
@@ -915,13 +993,79 @@ impl DllGateway {
         Ok(actual)
     }
 
-    fn prepare_flash_operation(&mut self) -> Result<(), JlinkError> {
+    fn prepare_flash_operation(
+        &mut self,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         if self.connected_spec.is_none() || !self.is_connected()? {
             return Err(target_connection_error(
                 "Flash 操作要求同一 DLL 会话已确认具体器件选择和目标连接",
             ));
         }
+        facts.dispatch_non_flash_side_effect();
         self.reset_halt_for_flash()
+    }
+
+    fn preflight_loader_ram(
+        &mut self,
+        loader_ram: MemoryRegion,
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
+        if loader_ram.kind() != MemoryRegionKind::Ram || loader_ram.length() == 0 {
+            return Err(JlinkError::new(
+                ErrorCode::ConfigInvalid,
+                "profile.loader_ram must be a non-empty RAM region",
+                false,
+            ));
+        }
+        let length = usize::try_from(loader_ram.length().min(LOADER_RAM_PREFLIGHT_BYTES as u64))
+            .expect("preflight length is bounded");
+        let address = loader_ram.address();
+        let original = self.read_bytes(address, length)?;
+        let pattern = original.iter().map(|byte| byte ^ 0xA5).collect::<Vec<_>>();
+        facts.dispatch_non_flash_side_effect();
+        if let Err(error) = self.write_bytes(address, &pattern) {
+            let restored = self.restore_loader_ram(address, &original);
+            return Err(error
+                .with_detail("loader_ram_restored", json!(restored))
+                .with_detail("flash_modified", json!(false)));
+        }
+        match self.read_bytes(address, length) {
+            Ok(actual) if actual == pattern => {}
+            Ok(_) => {
+                let restored = self.restore_loader_ram(address, &original);
+                return Err(JlinkError::new(
+                    ErrorCode::VerifyFailed,
+                    "Loader RAM preflight pattern readback did not match",
+                    false,
+                )
+                .with_detail("loader_ram_restored", json!(restored))
+                .with_detail("flash_modified", json!(false)));
+            }
+            Err(error) => {
+                let restored = self.restore_loader_ram(address, &original);
+                return Err(error
+                    .with_detail("loader_ram_restored", json!(restored))
+                    .with_detail("flash_modified", json!(false)));
+            }
+        }
+        if !self.restore_loader_ram(address, &original) {
+            return Err(JlinkError::new(
+                ErrorCode::ExecutionUncertain,
+                "Loader RAM preflight could not restore and verify the original bytes",
+                false,
+            )
+            .with_detail("loader_ram_restored", json!(false))
+            .with_detail("flash_modified", json!(false)));
+        }
+        Ok(())
+    }
+
+    fn restore_loader_ram(&mut self, address: u64, original: &[u8]) -> bool {
+        self.write_bytes(address, original).is_ok()
+            && self
+                .read_bytes(address, original.len())
+                .is_ok_and(|actual| actual == original)
     }
 
     /// Establishes the deterministic halted boundary required around Flash work.
@@ -929,7 +1073,12 @@ impl DllGateway {
         require_flash_reset_halted(self.reset_halt_and_observe()?)
     }
 
-    fn write_download_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
+    fn write_download_bytes(
+        &mut self,
+        address: u64,
+        bytes: &[u8],
+        facts: &mut ProgramExecutionFacts,
+    ) -> Result<(), JlinkError> {
         let mut offset = 0_usize;
         while offset < bytes.len() {
             let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
@@ -946,10 +1095,16 @@ impl DllGateway {
             let result =
                 unsafe { (self.api.write_mem)(current, count_u32, bytes[offset..].as_ptr()) };
             if result != i32::try_from(count).expect("fixed write chunk fits i32") {
-                return Err(execution_uncertain_error(format!(
-                    "JLINKARM_WriteMem(0x{current:08X}, {count}) 返回 {result}"
-                )));
+                return Err(JlinkError::new(
+                    ErrorCode::ExecutionUncertain,
+                    format!("JLINKARM_WriteMem(0x{current:08X}, {count}) returned {result}"),
+                    false,
+                )
+                .with_detail("dll_return_code", json!(result))
+                .with_detail("address", json!(format!("0x{current:08X}")))
+                .with_detail("length", json!(count)));
             }
+            facts.submit(u64::from(current), u64::from(count_u32));
             offset += count;
         }
         Ok(())

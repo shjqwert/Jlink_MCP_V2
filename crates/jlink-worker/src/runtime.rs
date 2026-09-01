@@ -901,6 +901,7 @@ mod tests {
             base_address: Some(0),
             verify: true,
             after: ProgramAfter::ResetRun,
+            loader_ram: None,
         };
         let valid = IpcRequest::new(
             ProtocolVersion::V1,

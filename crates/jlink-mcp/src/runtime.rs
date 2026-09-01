@@ -475,6 +475,28 @@ impl Runtime {
             .get("action")
             .and_then(Value::as_str)
             .expect("MCP Schema guarantees program.action");
+        let loader_ram = if matches!(action, "flash" | "erase") {
+            if resolved.profile.has_blocking_conflict() {
+                return Err(JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "Flash Profile contains an unresolved high-risk conflict",
+                    false,
+                )
+                .with_detail("field", json!("profile.conflicts"))
+                .with_detail("conflicts", json!(resolved.profile.conflicts)));
+            }
+            Some(resolved.profile.loader_ram.ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "Flash programming requires profile.loader_ram for the no-Flash preflight",
+                    false,
+                )
+                .with_detail("field", json!("profile.loader_ram"))
+                .with_detail("rule", json!("required for flash and erase"))
+            })?)
+        } else {
+            None
+        };
         let request = match action {
             "flash" => ProgramRequest::Flash {
                 image: program_image_path(arguments, &resolved)?,
@@ -483,6 +505,7 @@ impl Runtime {
                     .get("verify")
                     .is_none_or(|value| value.as_bool().expect("Schema boolean")),
                 after: program_after(arguments)?,
+                loader_ram,
             },
             "erase" => ProgramRequest::Erase {
                 range: arguments
@@ -500,6 +523,7 @@ impl Runtime {
                     })
                     .transpose()?,
                 after: program_after(arguments)?,
+                loader_ram,
             },
             "verify" => ProgramRequest::Verify {
                 image: program_image_path(arguments, &resolved)?,
