@@ -23,7 +23,7 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Secu
 edition = "2024"
 license = "MIT"
 rust-version = "1.98"
-version = "1.1.0"
+version = "1.1.1"
 
 [workspace.lints.rust]
 missing_docs = "deny"

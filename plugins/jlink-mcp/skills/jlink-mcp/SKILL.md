@@ -5,6 +5,20 @@ description: Use jlink_mcp with one local SEGGER J-Link ARM Cortex-M target for 
 
 # J-Link MCP
 
+## Device ownership and memory
+
+Use one named logical device operator for the current target: the primary session
+or one explicitly assigned child. All other agents refrain from J-Link calls,
+including reads. Transfer ownership only after the previous operator has stopped
+issuing calls and any active capture/control operation is settled or explicitly
+handed over. Existing worker serialization and probe exclusivity remain in force.
+
+Use live variables, registers and HSS samples only within the active debugging
+task. Do not put these snapshots, samples or capture references into Handoff or
+RAG. Firmware and code changes invalidate earlier runtime assumptions; re-observe
+the current target when needed. Existing capture, persisted-sample queries and
+export features remain available to the current operator.
+
 Operate the fixed six-tool V1 contract. Live tool definitions are the sole syntax
 authority; this self-contained Skill supplies routing, lifecycle state, result
 semantics, and recovery. Do not load runtime references or recreate a Schema here.
