@@ -798,7 +798,7 @@ fn hss_tool() -> Value {
     ));
     tool_definition(
         "jlink_hss",
-        "Use for: plan/start fixed-duration capture; status or query overview/changes/window/around_event. Do not use for: live reads or target status. Ambiguity: use one capture_id/capture_key; cursor continues pages.",
+        "Use for: fixed-duration capture plan/start/status/query: overview/changes/window/around_event. Prefer return_when=started on long runs. Do not use for: live reads/target status. Ambiguity: one capture_id/capture_key; cursor continues pages.",
         with_hss_input_definitions(action_union(variants)),
         hss_output_schema(),
         annotations(false, true, true),

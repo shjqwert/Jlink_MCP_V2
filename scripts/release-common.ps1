@@ -27,15 +27,61 @@ function Get-ContainedPath {
     return $result
 }
 
+function Test-SamePath {
+    param([string]$Left, [string]$Right)
+    $leftFull = [IO.Path]::GetFullPath($Left).TrimEnd('\', '/')
+    $rightFull = [IO.Path]::GetFullPath($Right).TrimEnd('\', '/')
+    return $leftFull.Equals($rightFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-RequiredDirectory {
+    param([string]$Path, [string]$Label = 'Directory')
+    $full = [IO.Path]::GetFullPath($Path)
+    try {
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer) { throw "$Label is not a directory: $full" }
+        $enumerator = [IO.Directory]::EnumerateFileSystemEntries($full).GetEnumerator()
+        try { $null = $enumerator.MoveNext() }
+        finally { if ($enumerator -is [IDisposable]) { $enumerator.Dispose() } }
+    }
+    catch [Management.Automation.ItemNotFoundException] { throw "$Label does not exist: $full" }
+    catch [IO.DirectoryNotFoundException] { throw "$Label does not exist: $full" }
+    catch [IO.FileNotFoundException] { throw "$Label does not exist: $full" }
+    catch [UnauthorizedAccessException] { throw "$Label cannot be accessed due to permissions: $full" }
+    catch [Security.SecurityException] { throw "$Label cannot be accessed due to permissions: $full" }
+    return $full
+}
+
+function Get-RequiredFile {
+    param([string]$Path, [string]$Label = 'File')
+    $full = [IO.Path]::GetFullPath($Path)
+    try {
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if ($item.PSIsContainer) { throw "$Label is not a file: $full" }
+        $stream = [IO.File]::Open($full, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+        $stream.Dispose()
+    }
+    catch [Management.Automation.ItemNotFoundException] { throw "$Label does not exist: $full" }
+    catch [IO.DirectoryNotFoundException] { throw "$Label does not exist: $full" }
+    catch [IO.FileNotFoundException] { throw "$Label does not exist: $full" }
+    catch [UnauthorizedAccessException] { throw "$Label cannot be accessed due to permissions: $full" }
+    catch [Security.SecurityException] { throw "$Label cannot be accessed due to permissions: $full" }
+    return $full
+}
+
 function Assert-NoReparsePoint {
     param([string]$Path)
     $cursor = [IO.Path]::GetFullPath($Path)
     while ($cursor) {
-        if (Test-Path -LiteralPath $cursor) {
-            $item = Get-Item -LiteralPath $cursor -Force
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "Reparse points are not supported in installation paths: $cursor"
-            }
+        $item = $null
+        try { $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop }
+        catch [Management.Automation.ItemNotFoundException] { $item = $null }
+        catch [IO.DirectoryNotFoundException] { $item = $null }
+        catch [IO.FileNotFoundException] { $item = $null }
+        catch [UnauthorizedAccessException] { throw "Installation path cannot be accessed due to permissions: $cursor" }
+        catch [Security.SecurityException] { throw "Installation path cannot be accessed due to permissions: $cursor" }
+        if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Reparse points are not supported in installation paths: $cursor"
         }
         $cursor = Split-Path -Parent $cursor
     }
@@ -132,8 +178,10 @@ function Get-PeImports {
 
 function Read-ReleasePackage {
     param([string]$Root)
+    $Root = Get-RequiredDirectory $Root 'Release package directory'
     Assert-NoReparsePoint $Root
-    $manifestPath = Get-ContainedPath $Root 'release-manifest.json'
+    $manifestPath = Get-RequiredFile (Get-ContainedPath $Root 'release-manifest.json') 'Release manifest'
+    Assert-NoReparsePoint $manifestPath
     $manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($manifest.schema_version -ne 1 -or $manifest.version -notmatch '^\d+\.\d+\.\d+$' -or
         $manifest.target -ne 'x86_64-pc-windows-msvc' -or $manifest.crt_linkage -ne 'static') {
@@ -148,7 +196,7 @@ function Read-ReleasePackage {
         $seen[$entry.path] = $true
         $filePath = Get-ContainedPath $Root $entry.path
         Assert-NoReparsePoint $filePath
-        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) { throw "Missing release file: $($entry.path)" }
+        $filePath = Get-RequiredFile $filePath "Release file $($entry.path)"
         if ((Get-Item -LiteralPath $filePath).Length -ne $entry.bytes -or
             (Get-Sha256Hex $filePath) -ne $entry.sha256) {
             throw "Release file integrity mismatch: $($entry.path)"
@@ -185,9 +233,58 @@ function Get-ProductRoot {
 
 function Get-CurrentDeployment {
     param([string]$ProductRoot)
-    $pointerPath = Get-ContainedPath $ProductRoot 'current.json'
+    $pointerPath = Get-RequiredFile (Get-ContainedPath $ProductRoot 'current.json') 'Current deployment pointer'
     Assert-NoReparsePoint $pointerPath
     $pointer = Get-Content -LiteralPath $pointerPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($pointer.schema_version -ne 1 -or $pointer.deployment -notmatch '^deployments/\d+\.\d+\.\d+-[a-f0-9]{16}(-[a-f0-9]{8})?$') { throw 'Invalid current deployment pointer; rerun the installer' }
-    return (Get-ContainedPath $ProductRoot $pointer.deployment)
+    return (Get-RequiredDirectory (Get-ContainedPath $ProductRoot $pointer.deployment) 'Current deployment')
+}
+
+function Remove-StaleManagedDeployments {
+    param([string]$ProductRoot, [string]$CurrentDeployment)
+    $result = [ordered]@{ removed = @(); retained_unrecognized = @(); warnings = @() }
+    $deploymentsRoot = Get-ContainedPath $ProductRoot 'deployments'
+    try { $deploymentsRoot = Get-RequiredDirectory $deploymentsRoot 'Managed deployments directory' }
+    catch {
+        if ($_.Exception.Message -like 'Managed deployments directory does not exist:*') { return [pscustomobject]$result }
+        $result.warnings += $_.Exception.Message
+        return [pscustomobject]$result
+    }
+    try { $candidates = @(Get-ChildItem -LiteralPath $deploymentsRoot -Directory -Force -ErrorAction Stop) }
+    catch {
+        $result.warnings += "Managed deployments cannot be enumerated due to permissions or an I/O error: $($_.Exception.Message)"
+        return [pscustomobject]$result
+    }
+    foreach ($candidate in $candidates) {
+        if ($candidate.Name -notmatch '^\d+\.\d+\.\d+-[a-f0-9]{16}(-[a-f0-9]{8})?$' -or
+            (Test-SamePath $candidate.FullName $CurrentDeployment)) { continue }
+        try {
+            Assert-NoReparsePoint $candidate.FullName
+            $null = Read-ReleasePackage $candidate.FullName
+        }
+        catch {
+            $result.retained_unrecognized += $candidate.Name
+            $result.warnings += "Retained unrecognized or inaccessible deployment $($candidate.Name): $($_.Exception.Message)"
+            continue
+        }
+        $expected = Get-ContainedPath $deploymentsRoot $candidate.Name
+        if (-not (Test-SamePath $expected $candidate.FullName) -or (Test-SamePath $candidate.FullName $CurrentDeployment)) {
+            $result.warnings += "Refused unsafe deployment cleanup path: $($candidate.FullName)"
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $candidate.FullName -Recurse -Force -ErrorAction Stop
+            $result.removed += $candidate.Name
+        }
+        catch [UnauthorizedAccessException] {
+            $result.warnings += "Managed deployment cannot be removed due to permissions: $($candidate.FullName)"
+        }
+        catch [Security.SecurityException] {
+            $result.warnings += "Managed deployment cannot be removed due to permissions: $($candidate.FullName)"
+        }
+        catch {
+            $result.warnings += "Managed deployment cleanup failed for $($candidate.FullName): $($_.Exception.Message)"
+        }
+    }
+    return [pscustomobject]$result
 }

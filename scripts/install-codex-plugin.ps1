@@ -17,7 +17,7 @@ if ($BinaryDirectory) {
     throw 'Bare binaries are no longer installed. Build a release package, then use -PackageDirectory. No compilation is performed here.'
 }
 if (-not $PackageDirectory) { $PackageDirectory = Split-Path -Parent $PSScriptRoot }
-$PackageDirectory = [IO.Path]::GetFullPath($PackageDirectory)
+$PackageDirectory = Get-RequiredDirectory $PackageDirectory 'Package directory'
 $manifest = Read-ReleasePackage $PackageDirectory
 $manifestHash = Get-Sha256Hex (Join-Path $PackageDirectory 'release-manifest.json')
 $codexCommand = Get-Command codex -ErrorAction Stop
@@ -70,6 +70,7 @@ $registrationTouched = $false
 $pointerTouched = $false
 $oldPointerText = $null
 $oldState = $null
+$installationCommitted = $false
 try {
     try {
         $lockPath = Get-ContainedPath $productRoot 'install.lock'
@@ -96,7 +97,7 @@ try {
         foreach ($entry in $sourceEntries) {
             if ($entry.marketplaceSource.sourceType -ne 'local') { throw 'Only local product marketplaces can be replaced and restored automatically' }
         }
-        if (-not (Test-Path -LiteralPath $oldState.market[0].root -PathType Container)) { throw 'Previous marketplace root is unavailable; cannot guarantee restoration' }
+        $null = Get-RequiredDirectory $oldState.market[0].root 'Previous marketplace root'
     }
     $pointerPath = Get-ContainedPath $productRoot 'current.json'
     Assert-NoReparsePoint $pointerPath
@@ -169,18 +170,30 @@ try {
     }
     $pointerTouched = $true
     Set-ReleasePointer $pointerPath ([ordered]@{ schema_version = 1; version = $manifest.version; deployment = $deploymentRelative })
-    if ((Get-CurrentDeployment $productRoot) -ne $deployment) { throw 'Deployment pointer verification failed' }
+    $currentDeployment = Get-CurrentDeployment $productRoot
+    if (-not (Test-SamePath $currentDeployment $deployment)) { throw 'Deployment pointer verification failed' }
     $transaction.state = 'installed'
     Write-ReleaseJson $transactionPath $transaction
+    $installationCommitted = $true
+    $cleanup = Remove-StaleManagedDeployments $productRoot $currentDeployment
+    $transaction['deployment_cleanup'] = $cleanup
+    try { Write-ReleaseJson $transactionPath $transaction }
+    catch { $cleanup.warnings += "Installation committed, but cleanup evidence could not be written: $($_.Exception.Message)" }
     [pscustomobject]@{
         plugin = 'jlink-mcp@jlink-mcp-v2'; version = $manifest.version
         product_directory = $productRoot; deployment = $deployment
         manifest_sha256 = $manifestHash; segger_managed = $false
+        old_deployments_removed = @($cleanup.removed)
+        retained_unrecognized_deployments = @($cleanup.retained_unrecognized)
+        cleanup_warnings = @($cleanup.warnings)
         next_step = 'Open a new Codex task. Prepare SEGGER and project configuration yourself before connecting hardware.'
     } | ConvertTo-Json -Depth 4
 }
 catch {
     $originalError = $_.Exception.Message
+    if ($installationCommitted) {
+        throw "Installation completed and remains active, but post-install processing failed: $originalError"
+    }
     $rollbackErrors = @()
     if ($pointerTouched) {
         try {
