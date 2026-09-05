@@ -5,6 +5,22 @@ description: Use jlink_mcp with one local SEGGER J-Link ARM Cortex-M target for 
 
 # J-Link MCP
 
+## Device ownership and memory
+
+Use one named logical device operator for the current target: the primary session
+or one explicitly assigned child. All other agents refrain from J-Link calls,
+including reads. Transfer ownership only after the previous operator has stopped issuing calls.
+An active capture or an unfinished control operation remains owned by that operator
+until it reaches a known terminal state or an explicit handoff identifies the next
+operator and the exact live state. Existing worker serialization and probe
+exclusivity remain in force.
+
+Use live variables, registers and HSS samples only within the active debugging
+task. Do not put these snapshots, samples or capture references into Handoff or
+RAG. Firmware and code changes invalidate earlier runtime assumptions; re-observe
+the current target when needed. Existing capture, persisted-sample queries and
+export features remain available to the current operator.
+
 Operate the fixed six-tool V1 contract. Live tool definitions are the sole syntax
 authority; this self-contained Skill supplies routing, lifecycle state, result
 semantics, and recovery. Do not load runtime references or recreate a Schema here.
@@ -23,7 +39,10 @@ semantics, and recovery. Do not load runtime references or recreate a Schema her
 Use `inspect.symbols` when an ELF or DWARF path is unknown, and `hss.query` for
 persisted data. A single live value routes to `inspect`; repeated samples,
 transitions, duration, or high-rate observation routes to `hss.plan` then `start`.
-HSS has no stop action.
+HSS has no stop action. Prefer `return_when: started` for a capture expected to
+outlast a normal tool turn, then use `status` and `query`; reserve
+`return_when: completed` for a short capture that fits the current tool wait. The
+same named operator owns the capture through its terminal state or explicit handoff.
 
 `target.status` reports connection/CPU; `hss.status` reports capture lifecycle and
 quality. Neither replaces the other. `program.verify` compares image to Flash;
