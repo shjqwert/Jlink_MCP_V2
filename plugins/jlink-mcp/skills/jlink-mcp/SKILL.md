@@ -9,7 +9,8 @@ description: Use jlink_mcp with one local SEGGER J-Link ARM Cortex-M target for 
 
 Use one named logical device operator for the current target: the primary session
 or one explicitly assigned child. All other agents refrain from J-Link calls,
-including reads. Transfer ownership only after the previous operator has stopped issuing calls.
+including reads. Code implementation ownership does not grant device ownership.
+Transfer ownership only after the previous operator has stopped issuing calls.
 An active capture or an unfinished control operation remains owned by that operator
 until it reaches a known terminal state or an explicit handoff identifies the next
 operator and the exact live state. Existing worker serialization and probe
@@ -43,6 +44,8 @@ HSS has no stop action. Prefer `return_when: started` for a capture expected to
 outlast a normal tool turn, then use `status` and `query`; reserve
 `return_when: completed` for a short capture that fits the current tool wait. The
 same named operator owns the capture through its terminal state or explicit handoff.
+When an authorized stimulus must occur during capture, use `return_when: started`
+and have that operator issue the allowed serialized write after start succeeds.
 
 `target.status` reports connection/CPU; `hss.status` reports capture lifecycle and
 quality. Neither replaces the other. `program.verify` compares image to Flash;
@@ -90,6 +93,10 @@ are not DWARF variables and must not receive symbol semantics. DWARF selectors
 require strong firmware identity. Requested rate is not achieved rate: report
 actual samples and quality fields. Without independent overflow/sequence evidence,
 never claim that no samples were lost.
+`actual_rate_millihz` is derived from source timestamps, not an independent host
+rate measurement. `source_host_clock_mismatch` invalidates period/runtime use:
+preserve the raw records and both clocks; do not truncate or rescale to match the
+requested duration.
 
 For HSS `status`/`query`, provide exactly one capture identity. A continuation uses
 the same identity and cursor with `action: query`, omitting prior view-specific

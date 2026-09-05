@@ -984,6 +984,26 @@ mod tests {
     }
 
     #[test]
+    fn source_host_mismatch_survives_capture_completion_and_tail_drain() {
+        let records = (0..1_200)
+            .flat_map(|index| record(index, index))
+            .collect::<Vec<_>>();
+        let snapshot = quality_capture([(records, false)]);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(snapshot.complete_records, 1_200);
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Degraded);
+        assert!(!snapshot.quality.usable_for_period_estimation);
+        assert!(!snapshot.quality.usable_for_runtime_estimation);
+        assert!(
+            snapshot
+                .quality
+                .reason_codes
+                .contains(&jlink_domain::HssQualityReasonCode::SourceHostClockMismatch)
+        );
+        assert_eq!(snapshot.quality.loss.evidence, HssQualityEvidence::Unknown);
+    }
+
+    #[test]
     fn t_p3_quality_reports_rate_loss_overflow_and_millisecond_clock_evidence() {
         let snapshot = quality_capture([(record(12_345, 1), false), (record(12_346, 2), false)]);
         assert_eq!(snapshot.state, HssRunState::Completed);
