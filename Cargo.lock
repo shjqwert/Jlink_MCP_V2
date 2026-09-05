@@ -411,7 +411,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "jlink-capture"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "crc32fast",
  "jlink-domain",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-domain"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "object",
  "serde",
@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-mcp"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "data-encoding",
  "gimli",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "jlink-worker"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "jlink-capture",
  "jlink-domain",

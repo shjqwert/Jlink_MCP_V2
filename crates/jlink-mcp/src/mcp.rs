@@ -1546,6 +1546,7 @@ fn hss_quality_definition() -> Value {
                     "items": string_enum(&[
                         "stable_intervals_available",
                         "runtime_bounds_available",
+                        "source_host_clock_mismatch",
                         "insufficient_samples",
                         "incomplete_frame",
                         "clock_regression",

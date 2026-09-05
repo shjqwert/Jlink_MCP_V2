@@ -2,9 +2,9 @@
 
 通过 Codex 使用 SEGGER J-Link 调试 ARM Cortex-M 目标。Windows x64 Rust 实现，以独立 Worker 隔离 J-Link DLL 和目标会话。
 
-当前发布版本为 **1.1.1**，补充单一设备操作者、异步采集生命周期与受管旧部署清理，并明确区分安装路径缺失和权限不足。源码逻辑与设计检查、完整非硬件 workspace 门禁（fmt、clippy、测试与依赖方向）、Windows 候选包 CI、安装和六工具客户端枚举均通过；硬件专用测试按设计保持 ignored，本次未执行真机操作。
+当前版本为 **1.1.2**，修复 HSS 源时钟与主机时钟矛盾时仍被标记为可用于周期和运行时估计的问题，同步 MCP 结果合同与单一设备操作者规则。完整非硬件 workspace 门禁包含 fmt、clippy、测试与依赖方向；4 项硬件专用自动测试保持 ignored，不能将其计为通过。
 
-历史 V1.1.0 已验证 Windows x64、Codex、SWD、Z20K146MC、J-Link 9.64 和 1 MHz，该证据不代表 1.1.1 已验证。P1-18 专项验证、原 S32K118/J-Link 6.98a 的 P0-12 根因和 JTAG 真机发布门禁仍保留原有待办。
+本轮候选版本在 Windows x64、Codex、SWD、Z20K146MC、J-Link 9.64 和 1 MHz 环境实测：5 秒 100 Hz 返回 600 条，5 秒 50 Hz 返回 300 条，主机约 5.04 秒而源时间约 5.98 秒，两次均正确报告 degraded 和 source_host_clock_mismatch。约 20% 的源/主机时间比例差异尚未定位，本次修复不代表物理采样计时已修复。历史 V1.1.0 及原 S32K118/J-Link 6.98a 证据保留；P1-18、P0-12 根因及 JTAG 真机发布门禁仍保留原有待办。
 
 ## 安装与使用
 
@@ -56,3 +56,19 @@ cargo build --locked --release --target x86_64-pc-windows-msvc -p jlink-mcp -p j
 ## 许可证
 
 项目使用 [MIT License](LICENSE)。发布包附带第三方依赖声明；SEGGER 组件不包含在本项目的分发包中。
+
+
+### HSS clock evidence
+
+`actual_rate_millihz` uses raw source timestamp intervals; it is not a host-clock
+rate measurement. When a source timestamp exceeds its host read completion plus
+the Start-call mapping bound, `source_host_clock_mismatch` marks degraded timing
+and disables period/runtime estimates. All raw records remain available; unknown
+loss evidence stays unknown. Do not truncate or rescale records to fit a request.
+The host `duration_s` interval starts after DLL Start returns; completion elapsed
+also includes Stop/tail drain. DLL/probe clock discrepancies require separate
+hardware investigation and cannot be corrected by relabelling source time.
+
+Only the named device operator may use J-Link, including reads; code delegation
+does not transfer device ownership. For an authorized stimulus during HSS, use
+`return_when: started`, then the operator performs the allowed serialized write.

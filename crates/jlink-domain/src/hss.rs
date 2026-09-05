@@ -561,6 +561,8 @@ pub enum HssQualityReasonCode {
     IncompleteFrame,
     /// At least one source timestamp moved backwards.
     ClockRegression,
+    /// A source timestamp exceeded its host observation plus the Start-call bound.
+    SourceHostClockMismatch,
     /// Source slots contain an unreconciled gap.
     SourceTimestampGap,
     /// A direct DLL signal confirmed overflow.
@@ -736,6 +738,7 @@ pub struct HssQualityTracker {
     previous_timestamp_us: Option<u64>,
     previous_slot: Option<u64>,
     last_host_elapsed_us: u64,
+    source_host_clock_mismatch: bool,
 }
 
 impl HssQualityTracker {
@@ -766,6 +769,7 @@ impl HssQualityTracker {
             previous_timestamp_us: None,
             previous_slot: None,
             last_host_elapsed_us: 0,
+            source_host_clock_mismatch: false,
         }
     }
 
@@ -900,7 +904,8 @@ impl HssQualityTracker {
             .intervals
             .gap_slots
             .saturating_sub(summary.intervals.collisions);
-        summary.usable_for_period_estimation = summary.actual_samples >= 2
+        summary.usable_for_period_estimation = !self.source_host_clock_mismatch
+            && summary.actual_samples >= 2
             && final_tail_bytes == 0
             && summary.intervals.regressions == 0
             && unmatched_gaps == 0
@@ -915,6 +920,9 @@ impl HssQualityTracker {
         }
         if summary.usable_for_runtime_estimation {
             reasons.push(HssQualityReasonCode::RuntimeBoundsAvailable);
+        }
+        if self.source_host_clock_mismatch {
+            reasons.push(HssQualityReasonCode::SourceHostClockMismatch);
         }
         if summary.actual_samples < 2 {
             reasons.push(HssQualityReasonCode::InsufficientSamples);
@@ -944,7 +952,8 @@ impl HssQualityTracker {
             .intervals
             .gap_slots
             .saturating_sub(self.summary.intervals.collisions);
-        if final_tail_bytes > 0
+        if self.source_host_clock_mismatch
+            || final_tail_bytes > 0
             || self.summary.overflow.evidence == HssQualityEvidence::Confirmed
             || self.summary.intervals.regressions > 0
             || unmatched_gaps > 0
@@ -956,6 +965,13 @@ impl HssQualityTracker {
     }
 
     fn observe_timestamp(&mut self, timestamp_us: u64, host_elapsed_us: u64, record_index: u64) {
+        // Buffering can delay observation but cannot place a source sample in
+        // the future. Preserve this contradiction even if later host time catches up.
+        if let Some(bound) = self.summary.clock.mapping_error_us
+            && timestamp_us > host_elapsed_us.saturating_add(bound)
+        {
+            self.source_host_clock_mismatch = true;
+        }
         self.summary
             .clock
             .first_timestamp_us
@@ -2989,6 +3005,54 @@ mod tests {
                 .and_then(|details| details.get("expanded_sample_bytes")),
             Some(&json!(41))
         );
+    }
+
+    #[test]
+    fn quality_rejects_source_clock_ahead_of_host_without_discarding_samples() {
+        let plan = raw_plan(100);
+        let mut tracker = HssQualityTracker::new(&plan, 977);
+        let records: Vec<u8> = (0_u32..600)
+            .flat_map(|index| {
+                [index.saturating_mul(10).to_le_bytes(), index.to_le_bytes()].concat()
+            })
+            .collect();
+        tracker
+            .observe_complete_records(plan.frame_layout(), &records, 4_996_183)
+            .unwrap();
+        let summary = tracker.summary(0);
+        assert_eq!(summary.actual_samples, 600);
+        assert_eq!(summary.clock.last_timestamp_us, Some(5_990_000));
+        assert_eq!(summary.actual_rate_millihz, Some(100_000));
+        assert!(!summary.usable_for_period_estimation);
+        assert!(!summary.usable_for_runtime_estimation);
+        assert_eq!(tracker.integrity(0), crate::HssDataIntegrity::Degraded);
+        assert_eq!(summary.loss.evidence, crate::HssQualityEvidence::Unknown);
+        assert!(
+            summary
+                .reason_codes
+                .contains(&HssQualityReasonCode::SourceHostClockMismatch)
+        );
+        tracker.observe_read_shape(0, 8, 7_000_000, 600);
+        assert!(!tracker.summary(0).usable_for_runtime_estimation);
+    }
+
+    #[test]
+    fn quality_allows_start_bound_and_delayed_buffer_reads() {
+        let plan = raw_plan(100);
+        for (host, source) in [(9_000_u64, 10_u32), (500_000, 10)] {
+            let mut tracker = HssQualityTracker::new(&plan, 977);
+            let records = [
+                0_u32.to_le_bytes(),
+                [0_u8; 4],
+                source.to_le_bytes(),
+                [1_u8; 4],
+            ]
+            .concat();
+            tracker
+                .observe_complete_records(plan.frame_layout(), &records, host)
+                .unwrap();
+            assert!(tracker.summary(0).usable_for_period_estimation);
+        }
     }
 
     #[test]
