@@ -41,10 +41,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Diff check failed' }
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git commit -m 'fix: recover HSS admission and improve preflight and diagnostics'
-          if ($LASTEXITCODE -ne 0) { throw 'Repair commit failed' }
-          git push origin HEAD:refs/heads/codex/hss-recovery-preflight-fixes
-          if ($LASTEXITCODE -ne 0) { throw 'Fast-forward repair push failed; no force push attempted' }
+          git diff --cached --quiet
+          if ($LASTEXITCODE -eq 1) {
+            git commit -m 'fix: recover HSS admission and improve preflight and diagnostics'
+            if ($LASTEXITCODE -ne 0) { throw 'Repair commit failed' }
+            git push origin HEAD:refs/heads/codex/hss-recovery-preflight-fixes
+            if ($LASTEXITCODE -ne 0) { throw 'Fast-forward repair push failed; no force push attempted' }
+          } elseif ($LASTEXITCODE -ne 0) { throw 'Cannot inspect staged changes' }
           git rev-parse HEAD | Set-Content target/hss-repair-tested-sha.txt
       - name: Targeted HSS and capture regressions
         shell: pwsh
@@ -57,10 +60,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Readiness regressions failed' }
           cargo test --locked -p jlink-mcp worker_client::
           if ($LASTEXITCODE -ne 0) { throw 'Worker diagnostic regressions failed' }
-      - name: Firmware helper regressions on Windows PowerShell 5.1
+      - name: Firmware helper checks on Windows PowerShell 5.1
         shell: powershell
         run: |
-          ./scripts/test-firmware-workflow.ps1
+          ./scripts/check-firmware-workflow.ps1
       - name: Complete non-hardware workspace gate
         shell: pwsh
         run: |
