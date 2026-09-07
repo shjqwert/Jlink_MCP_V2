@@ -594,6 +594,32 @@ pub fn inspect_config(
     Ok(inspection)
 }
 
+/// Resolves only available offline fields without requiring a target or DLL.
+///
+/// # Errors
+/// Returns invalid-layer or malformed-field errors without touching hardware.
+pub fn offline_config(
+    session: &ConfigFile,
+    paths: &ConfigPaths,
+    discovered: &ConfigFile,
+) -> Result<ConfigFile, JlinkError> {
+    let mut result = discovered.clone();
+    for (path, scope) in [
+        (&paths.project, ConfigScope::Project),
+        (&paths.user, ConfigScope::User),
+    ] {
+        if let Some(layer) = read_config_file(path)? {
+            validate_layer_scope(&layer, scope)?;
+            validate_partial(&layer)?;
+            merge_config(&mut result, &layer);
+        }
+    }
+    validate_layer_scope(session, ConfigScope::Session)?;
+    validate_partial(session)?;
+    merge_config(&mut result, session);
+    Ok(result)
+}
+
 /// Resolves request, user, project, discovery, and safe-default layers.
 ///
 /// # Errors
@@ -891,7 +917,7 @@ pub fn config_set(
     patch: &ConfigFile,
     state: ConfigSetState,
 ) -> Result<(), JlinkError> {
-    if state.connected || state.capture_active {
+    if state.capture_active || (state.connected && connection_patch(patch)) {
         return Err(JlinkError::new(
             ErrorCode::OperationConflict,
             "configuration cannot change while connected or capturing",
@@ -927,7 +953,7 @@ pub fn apply_session_patch(
     patch: &ConfigFile,
     state: ConfigSetState,
 ) -> Result<(), JlinkError> {
-    if state.connected || state.capture_active {
+    if state.capture_active || (state.connected && connection_patch(patch)) {
         return Err(JlinkError::new(
             ErrorCode::OperationConflict,
             "configuration cannot change while connected or capturing",
@@ -1177,6 +1203,13 @@ fn read_config_file(path: &Path) -> Result<Option<ConfigFile>, JlinkError> {
     }
 }
 
+pub(crate) fn connection_patch(patch: &ConfigFile) -> bool {
+    patch.target.is_some()
+        || patch.jlink.is_some()
+        || patch.probe.is_some()
+        || patch.profile.is_some()
+}
+
 fn merge_config(base: &mut ConfigFile, patch: &ConfigFile) {
     merge_target(&mut base.target, patch.target.as_ref());
     merge_symbols(&mut base.symbols, patch.symbols.as_ref());
@@ -1184,8 +1217,20 @@ fn merge_config(base: &mut ConfigFile, patch: &ConfigFile) {
     merge_jlink(&mut base.jlink, patch.jlink.as_ref());
     merge_probe(&mut base.probe, patch.probe.as_ref());
     merge_capture(&mut base.capture, patch.capture.as_ref());
-    if patch.profile.is_some() {
-        base.profile.clone_from(&patch.profile);
+    if let Some(patch) = &patch.profile {
+        let profile = base.profile.get_or_insert_with(FlashProfileConfig::default);
+        if !patch.flash_regions.is_empty() {
+            profile.flash_regions.clone_from(&patch.flash_regions);
+        }
+        if !patch.readable_ram.is_empty() {
+            profile.readable_ram.clone_from(&patch.readable_ram);
+        }
+        if patch.loader_ram.is_some() {
+            profile.loader_ram = patch.loader_ram;
+        }
+        if patch.capabilities != TargetCapabilities::default() {
+            profile.capabilities.clone_from(&patch.capabilities);
+        }
     }
 }
 

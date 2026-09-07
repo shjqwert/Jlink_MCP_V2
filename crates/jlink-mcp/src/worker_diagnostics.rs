@@ -2,9 +2,10 @@
 use std::{
     fs::{self, File},
     io::{self, Read, Seek, SeekFrom, Write},
-    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+    os::windows::io::{AsHandle, AsRawHandle, FromRawHandle, OwnedHandle},
     path::{Path, PathBuf},
     process::ChildStderr,
+    sync::Arc,
     thread,
 };
 
@@ -14,19 +15,34 @@ use windows_sys::Win32::{
     Foundation::{GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
-        WaitForSingleObject,
+        TerminateProcess, WaitForSingleObject,
     },
 };
 
 const MAX_LOG_BYTES: usize = 32 * 1024;
 const OMITTED: &[u8] = b"[older worker output omitted]\n";
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(super) struct WorkerDiagnostics {
     pid: u32,
     path: PathBuf,
     dll_sha256: String,
+    owned_process: Option<Arc<OwnedHandle>>,
 }
+
+impl PartialEq for WorkerDiagnostics {
+    fn eq(&self, other: &Self) -> bool {
+        self.pid == other.pid
+            && self.path == other.path
+            && self.dll_sha256 == other.dll_sha256
+            && match (&self.owned_process, &other.owned_process) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+}
+impl Eq for WorkerDiagnostics {}
 
 impl WorkerDiagnostics {
     pub(super) fn new(root: &Path, pid: u32, dll_sha256: &str) -> Self {
@@ -34,7 +50,33 @@ impl WorkerDiagnostics {
             pid,
             path: root.join(format!("worker-{pid}.log")),
             dll_sha256: dll_sha256.to_owned(),
+            owned_process: None,
         }
+    }
+
+    pub(super) fn retain_child(&mut self, child: &std::process::Child) -> Result<(), JlinkError> {
+        self.owned_process = Some(Arc::new(
+            child
+                .as_handle()
+                .try_clone_to_owned()
+                .map_err(|error| diagnostic_error(&error))?,
+        ));
+        Ok(())
+    }
+
+    pub(super) fn terminate_timed_out_child(&self) -> Value {
+        let Some(process) = &self.owned_process else {
+            return json!({"terminated": false, "reason": "no owned process handle; foreign/attached Worker is not terminated"});
+        };
+        // SAFETY: this duplicated handle identifies the exact child we spawned,
+        // never a process found later by a potentially recycled PID.
+        let result = unsafe { TerminateProcess(process.as_raw_handle(), 0xE000_0001) };
+        if result == 0 {
+            return json!({"terminated": false, "error": io::Error::last_os_error().to_string()});
+        }
+        // SAFETY: the retained process handle has synchronization rights.
+        let observed = unsafe { WaitForSingleObject(process.as_raw_handle(), 1_000) };
+        json!({"terminated": true, "exit_observed": observed == WAIT_OBJECT_0})
     }
 
     pub(super) fn capture_stderr(&self, stderr: ChildStderr) -> Result<(), JlinkError> {
@@ -42,7 +84,8 @@ impl WorkerDiagnostics {
             fs::create_dir_all(self.path.parent().expect("diagnostic root"))?;
             File::create(&self.path)
         };
-        let file = prepare().map_err(|error| diagnostic_error(&error))?;
+        // Diagnostics are optional; still drain stderr when storage is unavailable.
+        let file = prepare().ok();
         thread::Builder::new()
             .name(format!("jlink-stderr-{}", self.pid))
             .spawn(move || drain_output(stderr, file))
@@ -117,8 +160,8 @@ impl TailBuffer {
     }
 }
 
-fn drain_output(mut input: impl Read, file: File) {
-    let mut destination = Some(file);
+fn drain_output(mut input: impl Read, file: Option<File>) {
+    let mut destination = file;
     let mut tail = TailBuffer::default();
     let mut buffer = [0_u8; 4096];
     loop {
@@ -185,7 +228,10 @@ mod tests {
             WorkerDiagnostics::new(directory.path(), std::process::id(), &"ab".repeat(32));
         let mut bytes = vec![b'x'; MAX_LOG_BYTES * 3];
         bytes.extend_from_slice(b"\nhss native_call=Start boundary=enter\n");
-        drain_output(io::Cursor::new(bytes), File::create(&context.path).unwrap());
+        drain_output(
+            io::Cursor::new(bytes),
+            Some(File::create(&context.path).unwrap()),
+        );
         let stored = fs::read(&context.path).unwrap();
         assert!(stored.len() <= MAX_LOG_BYTES);
         assert!(stored.starts_with(OMITTED));
@@ -217,5 +263,43 @@ mod tests {
         let details = error.details.unwrap();
         assert_eq!(details["worker_log"]["available"], false);
         assert_eq!(details["worker"]["observed_state"], "running");
+    }
+
+    #[test]
+    fn unavailable_log_storage_still_drains_a_real_child_stderr_pipe() {
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let blocked = root.path().join("not-a-directory");
+        fs::write(&blocked, b"occupied").unwrap();
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Console]::Error.Write('x' * 131072)",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let context = WorkerDiagnostics::new(&blocked, child.id(), &"00".repeat(32));
+        context
+            .capture_stderr(child.stderr.take().unwrap())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("stderr pipe blocked child");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(context.log_evidence()["available"], false);
     }
 }

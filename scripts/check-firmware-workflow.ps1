@@ -75,6 +75,18 @@ try {
     Assert-True ($payload.Count -eq $legacy.Count + 2) 'Legacy package shape must remain an exact closed set'
     Assert-True ($legacy -notcontains 'scripts/new-firmware-identity.ps1') 'Legacy package incorrectly requires a new helper'
     Assert-True ($legacy -contains 'bin/jlink-worker.exe') 'Legacy compatibility removed a core payload requirement'
+    $incremental = Join-Path $root 'incremental.ps1'
+    $inputFile = Join-Path $root 'source.c'
+    $freshArtifact = Join-Path $root 'incremental.out'
+    [IO.File]::WriteAllText($inputFile, 'source version 1')
+    [IO.File]::WriteAllText($incremental, 'param([string]$Output); if (-not (Test-Path -LiteralPath $Output)) { [IO.File]::WriteAllText($Output, "built image") }; exit 0')
+    $options = @{ FilePath='powershell.exe'; ArgumentList=@('-NoProfile', '-File', $incremental, '-Output', $freshArtifact); ArtifactPath=$freshArtifact; InputPath=@($inputFile, $incremental); BuildConfiguration='fixture-debug' }
+    $first = & $build @options
+    $second = & $build @options -AllowUnchangedArtifact
+    Assert-True (-not $first.reused_artifact -and $second.reused_artifact) 'Proven unchanged incremental result was not reused'
+    [IO.File]::WriteAllText($inputFile, 'source version 2')
+    Assert-Throws { & $build @options -AllowUnchangedArtifact } 'Changed input reused stale firmware'
+    Assert-True (-not (Test-Path -LiteralPath ($freshArtifact + '.jlink-build.json'))) 'Rejected reuse left an applicable receipt'
     Write-Host 'PASS: JLID generation, size/ASCII bounds, overwrite guard, failed/stale build blocking, receipt protection, fresh output and payload inclusion.'
 }
 finally { Remove-Item -LiteralPath $root -Recurse -Force }

@@ -11,6 +11,10 @@ Use one named logical device operator for the current target: the primary sessio
 or one explicitly assigned child. All other agents refrain from J-Link calls,
 including reads. Code implementation ownership does not grant device ownership.
 Transfer ownership only after the previous operator has stopped issuing calls.
+Logical handoff assumes the same MCP service instance. A different MCP process
+cannot take over the old Worker: finish its capture, disconnect from the old
+instance and wait for that Worker to release the probe before the new instance
+connects. Do not bypass parent-PID or probe-exclusivity checks.
 An active capture or an unfinished control operation remains owned by that operator
 until it reaches a known terminal state or an explicit handoff identifies the next
 operator and the exact live state. Existing worker serialization and probe
@@ -64,8 +68,13 @@ prepare, copy, flash or test an old OUT as the new build. The packaged
 require a fresh nonempty output, and invoke an explicitly supplied dependent step
 only after success. Its receipt binds that output path and SHA-256, not arbitrary
 future files. Recheck the hash before later use; independent MCP calls are not
-magically gated by the receipt. Use an explicit rebuild/new output path when
-incremental builds leave the previous artifact unchanged. Deliberate rollback to
+magically gated by the receipt. The wrapper is optional. Its default rejects
+unchanged artifacts. To accept a successful incremental no-op, explicitly pass
+`AllowUnchangedArtifact`, the complete `InputPath` dependency list and a stable
+`BuildConfiguration`; the prior receipt must match inputs, compiler, arguments,
+configuration and output hash. Include all relevant generated/configuration inputs
+and toolchain/environment identity in that evidence. If completeness cannot be
+established, rebuild or use a new output path. Deliberate rollback to
 an identified old image is a separate authorized task, not a failed-build fallback.
 
 ## Route precisely
@@ -79,8 +88,9 @@ an identified old image is a separate authorized task, not a failed-build fallba
 | CPU execution | `jlink_control`: `halt`, `resume`, `reset`, `step` | Use explicit transitions; no implicit halt/reset. |
 | Plan/capture/query high-speed data | `jlink_hss`: `plan`, `start`, `status`, `query` | Plan is offline; start persists a fixed capture. |
 
-Use `inspect.symbols` when an ELF or DWARF path is unknown, and `hss.query` for
-persisted data. Choose the least invasive evidence that meets acceptance: a
+Find an ELF file through configuration discovery or project/file tools first;
+`inspect.symbols` searches only inside an already configured `symbols.elf`.
+Use `hss.query` for persisted data. Choose the least invasive evidence that meets acceptance: a
 latched result, counter, completion flag or bounded target-run result routes to
 `inspect`, even when the test performed many internal transitions. Use `hss.plan`
 then `start` only when continuous samples, ordering or transient timing evidence
@@ -92,8 +102,11 @@ same named operator owns the capture through its terminal state or explicit hand
 When an authorized stimulus must occur during capture, use `return_when: started`
 and have that operator issue the allowed serialized write after start succeeds.
 
-`target.status` reports connection/CPU; `hss.status` reports capture lifecycle and
-quality. Neither replaces the other. `program.verify` compares image to Flash;
+`target.status` reports cached connection/CPU state; `hss.status` reports capture
+lifecycle and quality. `state_source=session_cache` is not a fresh target read.
+For a new observation on a usable, connected session outside HSS, use
+`target.validate` without `after`. A quarantined or uncertain session must not be
+treated as freshly observed by querying status. `program.verify` compares image to Flash;
 `readback` is a `jlink_write.variable`/`memory` verify mode, not an action or a
 follow-up inspect call. Inspect is current state; HSS query is historical data.
 
@@ -109,8 +122,9 @@ follow-up inspect call. Inspect is current state; HSS query is historical data.
    an uncertain result, invalidation, or contradiction. UI state, another task,
    and configuration files do not prove a live connection.
 3. Offline configuration, symbol lookup, HSS planning, and persisted-capture
-   queries must not connect. A live read may establish its required session and
-   must report any resume/reset notice; a read never authorizes a write, program,
+   queries must not connect. Live read tools do not implicitly connect: establish
+   their required session with explicit `target.connect` and preserve its
+   resume/reset notices. A read never authorizes a write, program,
    erase, or control action. Keep implicit Skill invocation enabled for routine
    debugging and apply this routing automatically.
 4. During active HSS, only target status, HSS status/query, and serialized variable
@@ -120,6 +134,20 @@ follow-up inspect call. Inspect is current state; HSS query is historical data.
 
 ## Side effects and recovery
 
+- Outside active HSS, symbols, firmware image and capture-size configuration can
+  change while retaining the connection. DLL, target, probe and profile changes
+  require disconnect. Active HSS rejects every configuration update. Profile RAM
+  ranges can be supplied through the public config Schema; offline raw planning
+  needs readable RAM, not an otherwise complete hardware configuration.
+- Worker exchanges have bounded deadlines: ordinary requests 30 s, status 5 s,
+  flash/erase/verify 300 s and shutdown 2 s. On timeout the service terminates only
+  a Worker it spawned, using its retained process handle. Dispatched side effects
+  remain uncertain; termination is not a target reset or permission to replay.
+- Unconfirmed HSS native cleanup quarantines the session. Status/history remain
+  available, but further device operations require closing that Worker. Do not
+  treat ordinary static rejection as a quarantined session. A write whose DLL
+  reported completion but readback failed returns non-retryable `VERIFY_FAILED`
+  with separate write/verification facts; do not repeat the write automatically.
 - Treat `{}` as successful completion, not missing output and not permission to
   repeat. Flash, erase, writes, control, and a new connection can change hardware.
 - On failure or a lost response, inspect `structuredContent.error` (code, message,
@@ -140,6 +168,11 @@ are not DWARF variables and must not receive symbol semantics. DWARF selectors
 require strong firmware identity. Requested rate is not achieved rate: report
 actual samples and quality fields. Without independent overflow/sequence evidence,
 never claim that no samples were lost.
+Rate assessment can be reused only in the same gateway/connection with matching
+target, firmware identity, variable addresses/layout and capabilities. Writes,
+execution control and reconnect invalidate it. `rate_assessment.reused` exposes
+reuse; its recommended ceiling is a conservative short-window estimate, not a
+measured absolute maximum.
 `actual_rate_millihz` is derived from source timestamps, not an independent host
 rate measurement. `source_host_clock_mismatch` invalidates period/runtime use:
 preserve the raw records and both clocks; do not truncate or rescale to match the
@@ -150,6 +183,12 @@ the same identity and cursor with `action: query`, omitting prior view-specific
 fields. `CURSOR_INVALID` and `CURSOR_EXPIRED` end that chain; never silently restart
 page one. Lifecycle and integrity/quality are independent facts, so preserve
 degraded or unknown evidence.
+Verified prefixes of orphaned partial captures can be queried and exported.
+They retain `aborted`/`unknown` and cannot prove completion, complete sample loss
+accounting or timing accuracy. Export adds an explicit aborted manifest without
+altering the source. Historical lookup is project-wide across probe partitions
+and needs no live DLL or probe configuration. A damaged requested capture reports
+its error; unrelated completed captures are not parsed during Worker startup.
 
 Release evidence covers Windows x64/SWD; JTAG is Schema-supported, not
 hardware-release-verified.

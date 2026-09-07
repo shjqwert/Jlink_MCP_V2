@@ -62,7 +62,10 @@ pub struct CaptureOverview {
 /// sample counts, source-time evidence, or variable slices disagree with the
 /// capture's self-description.
 pub fn overview(snapshot: &CaptureSnapshot) -> Result<CaptureOverview, JlinkError> {
-    if snapshot.status().state != HssRunState::Completed {
+    if !matches!(
+        snapshot.status().state,
+        HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+    ) {
         return Err(JlinkError::new(
             ErrorCode::OperationConflict,
             "overview 只接受生命周期为 completed 的不可变 capture；请先查询 status",

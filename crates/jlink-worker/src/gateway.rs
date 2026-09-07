@@ -400,6 +400,8 @@ pub(crate) struct DllGateway {
     connected_spec: Option<TargetConnectionSpec>,
     target_id: Option<u32>,
     hss_started: bool,
+    quarantined: bool,
+    hss_rate_cache: Option<(serde_json::Value, HssRateAssessment)>,
     path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -443,6 +445,8 @@ impl DllGateway {
             connected_spec: None,
             target_id: None,
             hss_started: false,
+            quarantined: false,
+            hss_rate_cache: None,
             path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
@@ -451,6 +455,20 @@ impl DllGateway {
     /// Reports whether this gateway currently owns a loaded module.
     pub(crate) const fn is_loaded(&self) -> bool {
         !self.module.is_null()
+    }
+
+    pub(crate) const fn is_quarantined(&self) -> bool {
+        self.quarantined
+    }
+
+    /// Forbids further native calls after cleanup could not be confirmed.
+    pub(crate) fn quarantine(&mut self) {
+        self.hss_rate_cache = None;
+        self.quarantined = true;
+        self.opened = false;
+        self.hss_started = false;
+        self.connected_spec = None;
+        self.target_id = None;
     }
 
     /// Reads and validates the exact HSS capability set needed before Start.
@@ -656,6 +674,16 @@ impl DllGateway {
         capabilities: HssCapabilities,
     ) -> Result<HssRateAssessment, JlinkError> {
         capabilities.validate_start(plan)?;
+        let key = json!({"layout": plan.frame_layout(), "variables": plan.variables(), "identity": plan.firmware(), "target": self.connected_spec, "capabilities": capabilities});
+        if let Some((previous, assessment)) = &self.hss_rate_cache
+            && *previous == key
+        {
+            let mut reused = *assessment;
+            reused.requested_rate_hz = plan.rate_hz();
+            reused.accepted = plan.rate_hz() <= reused.recommended_max_rate_hz;
+            reused.reused = true;
+            return reused.ensure_accepted();
+        }
         let measurement_rate_hz = capabilities.max_frequency_hz().min(1_000);
         let measurement_plan = plan.with_rate_for_measurement(measurement_rate_hz)?;
         let record_bytes = usize::try_from(measurement_plan.frame_layout().record_bytes())
@@ -720,7 +748,7 @@ impl DllGateway {
         let recommended_max_rate_hz = conservative_rate
             .min(capabilities.max_frequency_hz())
             .max(1);
-        HssRateAssessment::new(
+        let assessment = HssRateAssessment::new(
             measurement_rate_hz,
             measurement_window_us,
             complete_samples,
@@ -729,7 +757,9 @@ impl DllGateway {
             recommended_max_rate_hz,
             plan.rate_hz(),
         )?
-        .ensure_accepted()
+        .ensure_accepted()?;
+        self.hss_rate_cache = Some((key, assessment));
+        Ok(assessment)
     }
 
     /// Reads authoritative Flash regions from the loaded J-Link device database.
@@ -1025,6 +1055,7 @@ impl DllGateway {
 
     /// Writes one complete ordinary RAM or MMIO range and rejects short writes.
     pub(crate) fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
+        self.hss_rate_cache = None;
         let mut offset = 0_usize;
         while offset < bytes.len() {
             let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
@@ -1299,6 +1330,7 @@ impl DllGateway {
 
     /// Closes the target and clears all gateway-local session facts.
     pub(crate) fn close_target(&mut self) {
+        self.hss_rate_cache = None;
         if self.hss_started
             && let Err(error) = self.stop_hss()
         {
@@ -1446,6 +1478,7 @@ impl DllGateway {
         register: CoreRegister,
         value: u32,
     ) -> Result<(), JlinkError> {
+        self.hss_rate_cache = None;
         register.ensure_writable()?;
         let index = self.register_index(register)?;
         let write_index = i32::try_from(index).map_err(|_| {
@@ -1584,6 +1617,7 @@ impl DllGateway {
 
     /// Halts the connected target and returns the resulting observed state.
     pub(crate) fn halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        self.hss_rate_cache = None;
         // SAFETY: the target connection is active and the call is serialized.
         let halt_status = unsafe { (self.api.halt)() };
         self.wait_until_halted().map_err(|error| {
@@ -1594,6 +1628,7 @@ impl DllGateway {
 
     /// Resumes a halted target and observes the stable final state.
     pub(crate) fn resume_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        self.hss_rate_cache = None;
         // SAFETY: the target connection is active and the call is serialized.
         unsafe { (self.api.go)() };
         self.wait_for_stable_state()
@@ -1601,6 +1636,7 @@ impl DllGateway {
 
     /// Resets and starts the target, then observes the stable final state.
     pub(crate) fn reset_run_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        self.hss_rate_cache = None;
         reset_dll_diagnostics();
         // SAFETY: the target connection is active and the reset call is serialized.
         let reset_status = unsafe { (self.api.reset)() };
@@ -1616,6 +1652,7 @@ impl DllGateway {
 
     /// Resets and explicitly leaves the target halted.
     pub(crate) fn reset_halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        self.hss_rate_cache = None;
         reset_dll_diagnostics();
         // SAFETY: the target connection is active and the reset call is serialized.
         let reset_status = unsafe { (self.api.reset)() };
@@ -1636,6 +1673,7 @@ impl DllGateway {
 
     /// Executes exactly one instruction from an already halted target.
     pub(crate) fn step_and_observe(&mut self) -> Result<TargetState, JlinkError> {
+        self.hss_rate_cache = None;
         let before = self.observe_target_state()?;
         if before != TargetState::Halted {
             return Err(JlinkError::new(
@@ -1931,6 +1969,11 @@ fn finish_download_after_segments(
 
 impl Drop for DllGateway {
     fn drop(&mut self) {
+        if self.quarantined {
+            // Do not call Close/Stop or run DLL unload callbacks on this thread.
+            // The process owns the remaining module until it terminates.
+            return;
+        }
         self.close_target();
         if !self.module.is_null() {
             // SAFETY: `module` was returned by LoadLibraryExW and is freed exactly once here.

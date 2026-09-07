@@ -575,6 +575,9 @@ pub enum HssQualityReasonCode {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HssRateAssessment {
+    /// True when a matching assessment from this target session was reused.
+    #[serde(default)]
+    pub reused: bool,
     /// Rate used by the temporary measurement stream.
     pub measurement_rate_hz: u32,
     /// Host-monotonic measurement window.
@@ -622,6 +625,7 @@ impl HssRateAssessment {
         }
         Ok(Self {
             measurement_rate_hz,
+            reused: false,
             measurement_window_us,
             complete_samples,
             measured_rate_hz,

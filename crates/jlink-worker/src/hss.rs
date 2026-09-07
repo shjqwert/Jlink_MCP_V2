@@ -113,24 +113,6 @@ impl HssCoordinator {
         let mut registry = HssStartRegistry::new();
         let mut retired_keys = BTreeMap::new();
         let mut terminal = BTreeMap::new();
-        for snapshot in store.completed_snapshots()? {
-            let reservation =
-                registry.reserve(probe_identity, snapshot.target(), snapshot.plan())?;
-            validate_recovered_capture_id(&reservation, snapshot.capture_id())?;
-            retired_keys.insert(
-                snapshot.plan().capture_key().to_owned(),
-                snapshot.capture_id().to_owned(),
-            );
-            terminal.insert(
-                snapshot.capture_id().to_owned(),
-                TerminalCapture {
-                    snapshot: snapshot.status().clone(),
-                    _plan: Some(snapshot.plan().clone()),
-                    _store: Some(snapshot),
-                    _failure: None,
-                },
-            );
-        }
         for recovery in recoveries {
             match recovery {
                 CaptureRecovery::Published(_) => {}
@@ -228,6 +210,21 @@ impl HssCoordinator {
             }
             HssReservationOutcome::Created(reservation) => reservation,
         };
+        let previous = self
+            .store
+            .find_snapshot_by_key(plan.capture_key())
+            .inspect_err(|_| {
+                self.registry.rollback_created(&plan, &reservation);
+            })?;
+        if let Some(previous) = previous {
+            self.registry.rollback_created(&plan, &reservation);
+            return Err(JlinkError::new(
+                ErrorCode::CaptureKeyConflict,
+                "Historical capture_key cannot start a new acquisition",
+                false,
+            )
+            .with_detail("capture_id", json!(previous.capture_id())));
+        }
         if self.active.is_some() {
             self.registry.rollback_created(&plan, &reservation);
             return Err(JlinkError::new(
@@ -595,9 +592,12 @@ impl HssCoordinator {
         {
             return Ok(snapshot(active, now));
         }
-        self.terminal
-            .get(capture_id)
-            .map(|capture| capture.snapshot.clone())
+        if let Some(capture) = self.terminal.get(capture_id) {
+            return Ok(capture.snapshot.clone());
+        }
+        self.store
+            .find_snapshot(capture_id)?
+            .map(|capture| capture.status().clone())
             .ok_or_else(|| {
                 JlinkError::new(ErrorCode::ValueInvalid, "Worker 找不到 capture_id", false)
                     .with_detail("capture_id", json!(capture_id))
@@ -613,12 +613,17 @@ impl HssCoordinator {
             .registry
             .capture_id_for_key(capture_key)
             // Retirement prevents a new Start, not a historical status lookup.
-            .or_else(|| self.retired_keys.get(capture_key).map(String::as_str))
+            .or_else(|| self.retired_keys.get(capture_key).map(String::as_str));
+        if let Some(capture_id) = capture_id {
+            return self.status(capture_id, now);
+        }
+        self.store
+            .find_snapshot_by_key(capture_key)?
+            .map(|capture| capture.status().clone())
             .ok_or_else(|| {
                 JlinkError::new(ErrorCode::ValueInvalid, "Worker 找不到 capture_key", false)
                     .with_detail("capture_key", json!(capture_key))
-            })?;
-        self.status(capture_id, now)
+            })
     }
 
     pub(crate) fn begin_write(
@@ -1441,6 +1446,36 @@ mod tests {
         assert!(!recovered.started_new);
         assert_eq!(recovered.snapshot.capture_id, failed.capture_id);
         assert_eq!(io.calls, ["start"]);
+    }
+
+    #[test]
+    fn temporary_preflight_cleanup_failure_retains_aborted_without_formal_start() {
+        let (_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss::healthy([]);
+        let error = coordinator
+            .start(
+                "260106173",
+                &target(),
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| {
+                    Err(JlinkError::new(
+                        ErrorCode::TargetRecoveryFailed,
+                        "temporary Stop unconfirmed",
+                        false,
+                    ))
+                },
+            )
+            .expect_err("preflight fails");
+        assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
+        assert!(io.calls.is_empty(), "formal Start must not run");
+        let snapshot = coordinator
+            .status_by_key("run-fixture", Instant::now())
+            .unwrap();
+        assert_eq!(snapshot.state, HssRunState::Aborted);
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
+        assert!(!coordinator.is_active());
     }
 
     #[test]

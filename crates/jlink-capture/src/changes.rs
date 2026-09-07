@@ -121,7 +121,10 @@ pub fn changes(
     snapshot: &CaptureSnapshot,
     query: &CaptureChangesQuery,
 ) -> Result<CaptureChanges, JlinkError> {
-    if snapshot.status().state != HssRunState::Completed {
+    if !matches!(
+        snapshot.status().state,
+        HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+    ) {
         return Err(JlinkError::new(
             ErrorCode::OperationConflict,
             "changes 只接受生命周期为 completed 的不可变 capture；请先查询 status",

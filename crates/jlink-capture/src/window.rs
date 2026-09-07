@@ -900,7 +900,10 @@ fn capture_sample_range(snapshot: &CaptureSnapshot) -> Result<(u64, u64), JlinkE
 }
 
 fn require_completed(snapshot: &CaptureSnapshot, view: &str) -> Result<(), JlinkError> {
-    if snapshot.status().state == HssRunState::Completed {
+    if matches!(
+        snapshot.status().state,
+        HssRunState::Completed | HssRunState::Failed | HssRunState::Aborted
+    ) {
         Ok(())
     } else {
         Err(JlinkError::new(

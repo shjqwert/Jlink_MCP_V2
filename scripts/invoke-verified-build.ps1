@@ -5,7 +5,10 @@ param(
     [string[]]$ArgumentList = @(),
     [Parameter(Mandatory = $true)][string]$ArtifactPath,
     [string]$ReceiptPath = '',
-    [scriptblock]$OnSuccess
+    [scriptblock]$OnSuccess,
+    [string[]]$InputPath = @(),
+    [string]$BuildConfiguration = '',
+    [switch]$AllowUnchangedArtifact
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -17,8 +20,30 @@ if ($artifact.Equals($receipt, [StringComparison]::OrdinalIgnoreCase)) {
 }
 # Remove only this helper's prior receipt, never the user's prior firmware image.
 # A failed build must not leave a stale success receipt eligible for a next stage.
-if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
+$previous = $null
+if (Test-Path -LiteralPath $receipt) {
+    try { $previous = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json } catch { $previous = $null }
+    Remove-Item -LiteralPath $receipt -Force
+}
 $command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop | Select-Object -First 1
+if ($AllowUnchangedArtifact -and ($InputPath.Count -eq 0 -or -not $BuildConfiguration)) {
+    throw 'Unchanged-artifact reuse requires an explicit complete InputPath list and BuildConfiguration'
+}
+function Get-InputEvidence {
+    $files = @(foreach ($path in @($InputPath | Sort-Object -Unique)) {
+        $full = [IO.Path]::GetFullPath($path)
+        if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw "Missing declared build input: $full" }
+        [ordered]@{ path = $full; sha256 = (Get-FileHash -LiteralPath $full).Hash }
+    })
+    [ordered]@{
+        configuration = $BuildConfiguration
+        command = $command.Source
+        command_sha256 = (Get-FileHash -LiteralPath $command.Source).Hash
+        arguments = @($ArgumentList)
+        inputs = $files
+    } | ConvertTo-Json -Depth 8 -Compress
+}
+$inputsBefore = if ($InputPath.Count -gt 0) { Get-InputEvidence } else { '' }
 $before = $null
 if (Test-Path -LiteralPath $artifact -PathType Leaf) {
     $item = Get-Item -LiteralPath $artifact
@@ -36,10 +61,17 @@ if (-not (Test-Path -LiteralPath $artifact -PathType Leaf)) { throw 'Build repor
 $item = Get-Item -LiteralPath $artifact
 if ($item.Length -eq 0) { throw 'Build produced an empty firmware image' }
 $sha256 = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash
+if ($inputsBefore -and (Get-InputEvidence) -ne $inputsBefore) { throw 'Declared build inputs changed during the build' }
+$reuse = $false
 if ($item.LastWriteTimeUtc -lt $started -or
     ($null -ne $before -and $before.modified -eq $item.LastWriteTimeUtc -and
      $before.length -eq $item.Length -and $before.sha256 -eq $sha256)) {
-    throw 'No fresh image from this build was proven; use an explicit rebuild or a new output path'
+    $reuse = $AllowUnchangedArtifact -and $null -ne $previous -and
+        $null -ne $previous.PSObject.Properties['input_evidence'] -and
+        $previous.input_evidence -eq $inputsBefore -and
+        $previous.build_succeeded -eq $true -and $previous.exit_code -eq 0 -and
+        $previous.artifact_path -eq $artifact -and $previous.artifact_sha256 -eq $sha256.ToLowerInvariant()
+    if (-not $reuse) { throw 'No fresh image or matching prior build/input evidence was proven' }
 }
 $result = [pscustomobject][ordered]@{
     schema_version = 1
@@ -50,6 +82,8 @@ $result = [pscustomobject][ordered]@{
     artifact_path = $artifact
     artifact_bytes = $item.Length
     artifact_sha256 = $sha256.ToLowerInvariant()
+    reused_artifact = [bool]$reuse
+    input_evidence = $inputsBefore
 }
 $temporary = $receipt + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
 try {

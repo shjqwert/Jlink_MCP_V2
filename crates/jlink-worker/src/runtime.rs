@@ -417,7 +417,15 @@ impl WorkerRuntime {
     }
 
     fn graceful_shutdown(&mut self) -> Result<(), JlinkError> {
-        if self.hss.shutdown(&mut self.gateway)? {
+        if self.gateway.is_quarantined() {
+            return Ok(());
+        }
+        let stopped = self.hss.shutdown(&mut self.gateway).inspect_err(|error| {
+            if hss_failure_requires_quarantine(error.code) {
+                self.gateway.quarantine();
+            }
+        })?;
+        if stopped {
             self.session.record_hss_completed();
         }
         self.session.disconnect(&mut self.gateway)
@@ -602,10 +610,19 @@ impl WorkerRuntime {
                 ),
                 true,
             ),
-            Err(error) => (
-                IpcResponse::failure(ProtocolVersion::V1, request_id, error),
-                true,
-            ),
+            Err(mut error) => {
+                if hss_failure_requires_quarantine(error.code) {
+                    self.gateway.quarantine();
+                    let _ = self.session.record_execution_uncertain(
+                        jlink_domain::ValidationInvalidation::ConnectionLost,
+                    );
+                    error = error.with_detail("session_quarantined", json!(true));
+                }
+                (
+                    IpcResponse::failure(ProtocolVersion::V1, request_id, error),
+                    true,
+                )
+            }
         }
     }
 
@@ -675,6 +692,7 @@ impl WorkerRuntime {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle(&mut self, request: IpcRequest, queued_at: Instant) -> (IpcResponse, bool) {
         if let Err(error) = validate_request_contract(&request) {
             return (
@@ -683,6 +701,11 @@ impl WorkerRuntime {
             );
         }
         let request_id = request.request_id;
+        if self.gateway.is_quarantined()
+            && let Some(reply) = quarantined_reply(request_id.clone(), request.command)
+        {
+            return reply;
+        }
         match request.command {
             SessionCommand::Status => self.handle_status(request_id),
             SessionCommand::Shutdown => self.handle_shutdown(request_id),
@@ -773,6 +796,30 @@ impl WorkerRuntime {
                 self.handle_hss_status(request_id, request.capture_id, request.capture_key)
             }
         }
+    }
+}
+
+fn hss_failure_requires_quarantine(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::ExecutionUncertain | ErrorCode::TargetRecoveryFailed
+    )
+}
+
+fn quarantined_reply(
+    request_id: jlink_domain::RequestId,
+    command: SessionCommand,
+) -> Option<(IpcResponse, bool)> {
+    match command {
+        SessionCommand::Status | SessionCommand::HssStatus => None,
+        SessionCommand::Shutdown | SessionCommand::Disconnect => Some((
+            IpcResponse::success(ProtocolVersion::V1, request_id, json!({})), false,
+        )),
+        _ => Some((IpcResponse::failure(ProtocolVersion::V1, request_id, JlinkError::new(
+            ErrorCode::ExecutionUncertain,
+            "Native HSS cleanup is unconfirmed; close this Worker before further target operations",
+            false,
+        ).with_detail("session_quarantined", json!(true))), true)),
     }
 }
 
@@ -870,7 +917,16 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
         if parent_exit {
             break;
         }
-        if runtime.hss.is_active() && runtime.hss.advance(&mut runtime.gateway)? {
+        if runtime.hss.is_active()
+            && runtime
+                .hss
+                .advance(&mut runtime.gateway)
+                .inspect_err(|error| {
+                    if hss_failure_requires_quarantine(error.code) {
+                        runtime.gateway.quarantine();
+                    }
+                })?
+        {
             runtime.session.record_hss_completed();
         }
         let wait = if runtime.hss.is_active() {
@@ -942,6 +998,43 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn uncertain_hss_cleanup_quarantines_device_commands_but_preserves_status() {
+        assert!(hss_failure_requires_quarantine(
+            ErrorCode::TargetRecoveryFailed
+        ));
+        assert!(hss_failure_requires_quarantine(
+            ErrorCode::ExecutionUncertain
+        ));
+        assert!(!hss_failure_requires_quarantine(ErrorCode::HssUnsupported));
+        assert!(!hss_failure_requires_quarantine(ErrorCode::ConfigInvalid));
+        for command in [
+            SessionCommand::Connect,
+            SessionCommand::Validate,
+            SessionCommand::ReadMemory,
+            SessionCommand::WriteMemory,
+            SessionCommand::HssStart,
+            SessionCommand::Control,
+        ] {
+            let (reply, alive) =
+                quarantined_reply(RequestId::new("test").unwrap(), command).unwrap();
+            let value = serde_json::to_value(reply).unwrap();
+            assert_eq!(value["error"]["code"], "EXECUTION_UNCERTAIN");
+            assert_eq!(value["error"]["retryable"], false);
+            assert!(alive);
+        }
+        for command in [SessionCommand::Status, SessionCommand::HssStatus] {
+            assert!(quarantined_reply(RequestId::new("test").unwrap(), command).is_none());
+        }
+        for command in [SessionCommand::Disconnect, SessionCommand::Shutdown] {
+            assert!(
+                !quarantined_reply(RequestId::new("test").unwrap(), command)
+                    .unwrap()
+                    .1
+            );
+        }
+    }
 
     #[test]
     fn worker_options_keep_probe_leases_and_project_captures_separate() {

@@ -92,7 +92,7 @@ pub fn raw_capture_resource_link(capture_id: &str) -> Value {
         "type": "resource_link",
         "uri": format!("jlink-mcp://capture/{capture_id}/raw"),
         "name": format!("{capture_id}-raw"),
-        "description": "Complete self-describing HSS capture",
+        "description": "Self-describing HSS capture; inspect terminal state and integrity",
         "mimeType": RAW_CAPTURE_MIME
     })
 }
@@ -160,7 +160,7 @@ fn handle_request<D: ToolDispatcher>(request: &Value, dispatcher: &mut D) -> Opt
             "resourceTemplates": [{
                 "uriTemplate": RAW_CAPTURE_URI_TEMPLATE,
                 "name": "jlink-capture-raw",
-                "description": "Complete self-describing HSS capture",
+                "description": "Self-describing HSS capture; inspect terminal state and integrity",
                 "mimeType": RAW_CAPTURE_MIME
             }]
         })),
@@ -522,6 +522,15 @@ fn target_tool() -> Value {
             ("jlink.dll_version", non_empty_string()),
             ("jlink.dll_sha256", sha256_schema()),
             ("capture.max_bytes", positive_integer()),
+            ("profile.loader_ram", profile_region_schema()),
+            (
+                "profile.readable_ram",
+                json!({"type":"array", "minItems":1, "items":profile_region_schema()}),
+            ),
+            (
+                "profile.flash_regions",
+                json!({"type":"array", "minItems":1, "items":profile_region_schema()}),
+            ),
         ],
         &[],
     );
@@ -555,10 +564,20 @@ fn target_tool() -> Value {
     ]);
     tool_definition(
         "jlink_target",
-        "Use for: connect/disconnect, target status, validation and layered config. Do not use for: HSS capture status or target execution control. Ambiguity: target status is live connection state; HSS status belongs to jlink_hss.",
+        "Use for: connect/disconnect, cached target status, explicit live validation and layered config. Do not use for: HSS capture status or target execution control. Ambiguity: target status is cached session state; HSS status belongs to jlink_hss.",
         input,
         target_output_schema(),
         annotations(false, false, false),
+    )
+}
+
+fn profile_region_schema() -> Value {
+    closed_object(
+        vec![
+            ("address", address_schema()),
+            ("length", positive_integer()),
+        ],
+        &["address", "length"],
     )
 }
 
@@ -862,6 +881,7 @@ fn target_output_schema() -> Value {
             ),
             ("target_id", non_negative_integer()),
             ("validation_runs", non_negative_integer()),
+            ("state_source", string_enum(&["session_cache"])),
             (
                 "recovery_notifications",
                 json!({ "type": "array", "items": string_enum(&["resumed_from_halt", "reset_after_fault"]) }),
@@ -1089,6 +1109,11 @@ fn hss_status_output_schema() -> Value {
 fn hss_overview_output_schema() -> Value {
     closed_object(
         vec![
+            ("capture_state", hss_state_schema()),
+            (
+                "data_integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
             ("capture_id", non_empty_string()),
             ("from_us", non_negative_integer()),
             ("to_us", non_negative_integer()),
@@ -1134,6 +1159,11 @@ fn hss_completed_start_output_schema() -> Value {
 fn hss_changes_output_schema() -> Value {
     closed_object(
         vec![
+            ("capture_state", hss_state_schema()),
+            (
+                "data_integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
             (
                 "dictionary",
                 json!({ "type": "object", "additionalProperties": non_empty_string() }),
@@ -1199,6 +1229,11 @@ fn hss_change_item_definition() -> Value {
 fn hss_window_rows_output_schema() -> Value {
     closed_object(
         vec![
+            ("capture_state", hss_state_schema()),
+            (
+                "data_integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
             ("clock", json!({ "const": "sample" })),
             ("dictionary", hss_series_dictionary_schema()),
             (
@@ -1233,6 +1268,11 @@ fn hss_window_rows_output_schema() -> Value {
 fn hss_window_buckets_output_schema() -> Value {
     closed_object(
         vec![
+            ("capture_state", hss_state_schema()),
+            (
+                "data_integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
             ("clock", json!({ "const": "sample" })),
             ("dictionary", hss_series_dictionary_schema()),
             (
@@ -1271,6 +1311,11 @@ fn hss_window_buckets_output_schema() -> Value {
 fn hss_around_event_output_schema() -> Value {
     closed_object(
         vec![
+            ("capture_state", hss_state_schema()),
+            (
+                "data_integrity",
+                string_enum(&["complete", "degraded", "unknown"]),
+            ),
             ("event", hss_capture_event_schema()),
             (
                 "window",

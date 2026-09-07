@@ -20,7 +20,7 @@ use jlink_domain::{
     HssRunSnapshot, HssRunState, HssSelectorPlan, HssStartPlan, HssThresholdRule, JlinkError,
     MemoryRange, ProfileConflict, ProfileConflictSeverity, ProfileSource, ProfileSourceKind,
     ProgramAfter, ProgramRequest, TargetConnectionSpec, TargetInterface, ValidationAfter,
-    VariableSelector, WriteVerify, canonical_device_name, probe_identity_hash,
+    VariableSelector, WriteVerify, canonical_device_name,
 };
 use serde_json::{Map, Value, json};
 
@@ -86,7 +86,24 @@ impl Runtime {
     /// HSS capability errors when the request cannot form one fixed sampling frame.
     #[allow(clippy::too_many_lines)]
     pub fn prepare_hss_start(&mut self, arguments: &Value) -> Result<HssStartPlan, JlinkError> {
-        let resolved = self.resolve()?;
+        let config = crate::config::offline_config(
+            &self.session_config,
+            &self.config_paths,
+            &self.discover().config,
+        )?;
+        let readable_ram = config
+            .profile
+            .map(|profile| profile.readable_ram)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|region| {
+                jlink_domain::MemoryRegion::new(
+                    region.address,
+                    region.length,
+                    jlink_domain::MemoryRegionKind::Ram,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let variables = arguments
             .get("variables")
             .and_then(Value::as_array)
@@ -128,9 +145,7 @@ impl Runtime {
                     }
                 };
                 let range = MemoryRange::new(address, u64::from(length))?;
-                let allowed_region = resolved
-                    .profile
-                    .readable_ram
+                let allowed_region = readable_ram
                     .iter()
                     .copied()
                     .find(|region| {
@@ -331,6 +346,7 @@ impl Runtime {
             serde_json::to_value(status.connection_state).map_err(serialization_error)?,
         );
         if status.connection_state != ConnectionState::Disconnected {
+            result.insert("state_source".to_owned(), json!("session_cache"));
             result.insert(
                 "state".to_owned(),
                 serde_json::to_value(status.target_state).map_err(serialization_error)?,
@@ -449,10 +465,12 @@ impl Runtime {
         } else {
             config_set(&self.config_paths, scope, &patch, state)?;
         }
-        if let Some(attachment) = &self.attachment {
-            attachment.client.disconnect()?;
+        if crate::config::connection_patch(&patch) {
+            if let Some(attachment) = &self.attachment {
+                attachment.client.disconnect()?;
+            }
+            self.attachment = None;
         }
-        self.attachment = None;
         Ok(ToolCall::success(json!({})))
     }
 
@@ -732,10 +750,12 @@ impl Runtime {
         let snapshot = self.completed_snapshot(arguments)?;
         let capture_id = snapshot.capture_id().to_owned();
         let result = overview(&snapshot)?;
-        Ok(ToolCall::with_raw_capture(
-            serde_json::to_value(result).map_err(serialization_error)?,
-            &capture_id,
-        ))
+        let mut result = serde_json::to_value(result).map_err(serialization_error)?;
+        if snapshot.status().state != HssRunState::Completed {
+            result["capture_state"] = json!(snapshot.status().state);
+            result["data_integrity"] = json!(snapshot.status().integrity);
+        }
+        Ok(ToolCall::with_raw_capture(result, &capture_id))
     }
 
     fn changes_hss(&self, arguments: &Value) -> Result<ToolCall, JlinkError> {
@@ -1021,6 +1041,16 @@ impl Runtime {
     }
 
     fn finish_cursor_page(mut page: CursorPageContext<'_>) -> Result<ToolCall, JlinkError> {
+        if page.snapshot.status().state != HssRunState::Completed {
+            page.structured.insert(
+                "capture_state".to_owned(),
+                json!(page.snapshot.status().state),
+            );
+            page.structured.insert(
+                "data_integrity".to_owned(),
+                json!(page.snapshot.status().integrity),
+            );
+        }
         let mut all_series = page.emitted_series.to_vec();
         if let Some(dictionary) = page
             .structured
@@ -1072,15 +1102,6 @@ impl Runtime {
     }
 
     fn completed_snapshot(&self, arguments: &Value) -> Result<CaptureSnapshot, JlinkError> {
-        let resolved = self.resolve()?;
-        let probe = resolved.probe.serial.as_ref().ok_or_else(|| {
-            JlinkError::new(
-                ErrorCode::ConfigInvalid,
-                "查询 HSS capture 前必须配置 probe.serial",
-                false,
-            )
-        })?;
-        let identity_hash = probe_identity_hash(&probe.value.to_string())?;
         let identity = (
             arguments.get("capture_id").and_then(Value::as_str),
             arguments.get("capture_key").and_then(Value::as_str),
@@ -1092,13 +1113,12 @@ impl Runtime {
                 false,
             ));
         }
-        let project_root = self.capture_root.join(&identity_hash);
-        if let Some(snapshot) = find_completed_snapshot(&project_root, identity)? {
+        if let Some(snapshot) = find_partitioned_snapshot(&self.capture_root, identity)? {
             return Ok(snapshot);
         }
-        let legacy_root = self.lease_root.join("captures").join(&identity_hash);
-        if legacy_root != project_root
-            && let Some(snapshot) = find_completed_snapshot(&legacy_root, identity)?
+        let legacy_root = self.lease_root.join("captures");
+        if legacy_root != self.capture_root
+            && let Some(snapshot) = find_partitioned_snapshot(&legacy_root, identity)?
         {
             return Ok(snapshot);
         }
@@ -1133,14 +1153,21 @@ impl Runtime {
     }
 
     fn inspect_symbols(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
-        let resolved = self.resolve()?;
-        let elf_path = resolved.symbols.elf.ok_or_else(|| {
-            JlinkError::new(
-                ErrorCode::ConfigInvalid,
-                "symbols.elf 未配置，无法建立 DWARF 索引",
-                false,
-            )
-        })?;
+        let config = crate::config::offline_config(
+            &self.session_config,
+            &self.config_paths,
+            &self.discover().config,
+        )?;
+        let elf_path = config
+            .symbols
+            .and_then(|symbols| symbols.elf)
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    "symbols.elf 未配置，无法建立 DWARF 索引",
+                    false,
+                )
+            })?;
         let query = arguments
             .get("query")
             .and_then(Value::as_str)
@@ -1158,7 +1185,7 @@ impl Runtime {
                         )
                     })
                 })?;
-        let index = self.symbol_cache.load_path(&elf_path.value)?;
+        let index = self.symbol_cache.load_path(&elf_path)?;
         let symbols = index.search(query, limit)?;
         Ok(ToolCall::success(json!({ "symbols": symbols })))
     }
@@ -1320,23 +1347,29 @@ impl Runtime {
         &mut self,
         operation: &str,
     ) -> Result<(Arc<SymbolIndex>, FirmwareIdentityPlan), JlinkError> {
-        let resolved = self.resolve()?;
-        let elf_path = resolved.symbols.elf.ok_or_else(|| {
-            JlinkError::new(
-                ErrorCode::ConfigInvalid,
-                format!("symbols.elf 未配置，无法执行{operation}"),
-                false,
-            )
-        })?;
-        let data = fs::read(&elf_path.value).map_err(|error| {
+        let config = crate::config::offline_config(
+            &self.session_config,
+            &self.config_paths,
+            &self.discover().config,
+        )?;
+        let elf_path = config
+            .symbols
+            .and_then(|symbols| symbols.elf)
+            .ok_or_else(|| {
+                JlinkError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!("symbols.elf 未配置，无法执行{operation}"),
+                    false,
+                )
+            })?;
+        let data = fs::read(&elf_path).map_err(|error| {
             JlinkError::new(
                 ErrorCode::ValueInvalid,
-                format!("无法读取符号 ELF {}：{error}", elf_path.value.display()),
+                format!("无法读取符号 ELF {}：{error}", elf_path.display()),
                 false,
             )
         })?;
         let file_name = elf_path
-            .value
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| {
@@ -1564,6 +1597,41 @@ mod discovery_profile_tests {
         assert_eq!(sources[1].kind, ProfileSourceKind::Segger);
         assert_eq!(sources[1].locator, "device.jflash");
     }
+}
+
+fn find_partitioned_snapshot(
+    root: &Path,
+    identity: (Option<&str>, Option<&str>),
+) -> Result<Option<CaptureSnapshot>, JlinkError> {
+    if !root.exists() {
+        return Ok(None);
+    }
+    let mut roots = vec![root.to_path_buf()];
+    for entry in fs::read_dir(root)
+        .map_err(|e| JlinkError::new(ErrorCode::ValueInvalid, e.to_string(), false))?
+    {
+        let entry =
+            entry.map_err(|e| JlinkError::new(ErrorCode::ValueInvalid, e.to_string(), false))?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) && entry.path().is_dir()
+        {
+            roots.push(entry.path());
+        }
+    }
+    let mut found = None;
+    for partition in roots {
+        if let Some(snapshot) = find_completed_snapshot(&partition, identity)?
+            && found.replace(snapshot).is_some()
+        {
+            return Err(JlinkError::new(
+                ErrorCode::CaptureKeyConflict,
+                "Capture identity occurs in multiple probe partitions",
+                false,
+            ));
+        }
+    }
+    Ok(found)
 }
 
 fn find_completed_snapshot(
@@ -2598,5 +2666,28 @@ length = 4096
         assert_eq!(fields[0]["byte_offset"], 0);
         assert_eq!(fields[1]["path"], "arr[6]");
         assert_eq!(fields[1]["byte_offset"], 2);
+    }
+
+    #[test]
+    fn public_profile_patch_enables_raw_plan_without_dll_target_or_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runtime = Runtime::new(
+            ConfigPaths::new(
+                root.path().join("project.toml"),
+                root.path().join("user.toml"),
+            ),
+            root.path().join("no-worker.exe"),
+            root.path().join("leases"),
+        );
+        let args = json!({"action":"config_set", "scope":"session", "values": {
+            "profile.loader_ram":{"address":"0x20000000","length":4096},
+            "profile.readable_ram":[{"address":"0x20000000","length":4096}]
+        }});
+        let schema = &crate::mcp::tool_catalog()[0]["inputSchema"];
+        assert!(jsonschema::is_valid(schema, &args));
+        assert!(runtime.config_set(&args).is_ok());
+        let plan = runtime.prepare_hss_start(&json!({"action":"plan", "duration_s":1, "rate_hz":10, "variables":[{"kind":"raw_address","address":"0x20000010","type":"u32","length":4,"endianness":"little"}]})).unwrap();
+        assert_eq!(plan.frame_layout().sample_bytes(), 4);
+        assert!(runtime.attachment.is_none());
     }
 }

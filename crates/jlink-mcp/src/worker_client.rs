@@ -1,7 +1,6 @@
 //! Attach-first Windows client for the versioned local Worker transport.
 
 use std::{
-    fs::File,
     os::windows::{
         ffi::OsStrExt,
         io::{FromRawHandle, OwnedHandle},
@@ -24,13 +23,16 @@ use jlink_domain::{
 use serde_json::json;
 use windows_sys::Win32::{
     Foundation::{GENERIC_READ, GENERIC_WRITE, GetLastError, INVALID_HANDLE_VALUE},
-    Storage::FileSystem::{CreateFileW, OPEN_EXISTING},
+    Storage::FileSystem::{CreateFileW, FILE_FLAG_OVERLAPPED, OPEN_EXISTING},
     System::Pipes::WaitNamedPipeW,
 };
 
 #[path = "worker_diagnostics.rs"]
 mod diagnostics;
 use diagnostics::WorkerDiagnostics;
+#[path = "worker_deadline.rs"]
+mod deadline;
+use deadline::DeadlinePipe;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -372,6 +374,18 @@ impl WorkerClient {
     where
         F: FnOnce(IpcRequest) -> IpcRequest,
     {
+        self.request_with_timeout(command, configure, request_timeout(command))
+    }
+
+    fn request_with_timeout<F>(
+        &self,
+        command: SessionCommand,
+        configure: F,
+        timeout: Duration,
+    ) -> Result<IpcResponse, JlinkError>
+    where
+        F: FnOnce(IpcRequest) -> IpcRequest,
+    {
         let request_id = RequestId::new(format!(
             "{}-{}",
             std::process::id(),
@@ -382,12 +396,22 @@ impl WorkerClient {
             request_id.clone(),
             command,
         ));
-        let mut pipe =
-            open_pipe(&self.endpoint, 100).map_err(|error| self.transport_error(error))?;
-        write_ipc_frame(&mut pipe, &request)
-            .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
-        let response: IpcResponse = read_ipc_frame(&mut pipe)
-            .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
+        let mut pipe = open_pipe(&self.endpoint, 100, Instant::now() + timeout)
+            .map_err(|error| self.transport_error(error))?;
+        let result = write_ipc_frame(&mut pipe, &request)
+            .and_then(|()| read_ipc_frame::<_, IpcResponse>(&mut pipe));
+        let response = result.map_err(|error| {
+            let mut failure = dispatched_request_error(command, &error);
+            if pipe.timed_out {
+                failure.retryable = false;
+                failure = failure.with_detail("request_timeout_ms", json!(timeout.as_millis()))
+                    .with_detail("worker_timeout_action", self.diagnostics.as_ref().map_or_else(
+                        || json!({"terminated": false, "reason": "Worker ownership not established"}),
+                        WorkerDiagnostics::terminate_timed_out_child,
+                    ));
+            }
+            self.transport_error(failure)
+        })?;
         response
             .validate()
             .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
@@ -480,7 +504,12 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         )
     })?;
 
-    let diagnostics = WorkerDiagnostics::new(&diagnostic_root, child.id(), &spec.dll_sha256);
+    let mut diagnostics = WorkerDiagnostics::new(&diagnostic_root, child.id(), &spec.dll_sha256);
+    if let Err(error) = diagnostics.retain_child(&child) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
     let Some(stderr) = child.stderr.take() else {
         // A newly spawned process has not received a target request yet.
         let _ = child.kill();
@@ -622,8 +651,12 @@ fn response_result(response: IpcResponse) -> Result<serde_json::Value, JlinkErro
     }
 }
 
-/// Opens a synchronous byte-mode named pipe after waiting for one server instance.
-fn open_pipe(endpoint: &str, timeout_ms: u32) -> Result<File, JlinkError> {
+/// Opens a cancelable byte-mode named pipe after waiting for one server instance.
+fn open_pipe(
+    endpoint: &str,
+    timeout_ms: u32,
+    deadline: Instant,
+) -> Result<DeadlinePipe, JlinkError> {
     let wide: Vec<u16> = Path::new(endpoint)
         .as_os_str()
         .encode_wide()
@@ -643,7 +676,7 @@ fn open_pipe(endpoint: &str, timeout_ms: u32) -> Result<File, JlinkError> {
             0,
             ptr::null(),
             OPEN_EXISTING,
-            0,
+            FILE_FLAG_OVERLAPPED,
             ptr::null_mut(),
         )
     };
@@ -652,7 +685,18 @@ fn open_pipe(endpoint: &str, timeout_ms: u32) -> Result<File, JlinkError> {
     }
     // SAFETY: `raw` is a unique valid handle returned by CreateFileW.
     let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
-    Ok(File::from(owned))
+    Ok(DeadlinePipe::new(owned, deadline))
+}
+
+fn request_timeout(command: SessionCommand) -> Duration {
+    match command {
+        SessionCommand::Flash | SessionCommand::Erase | SessionCommand::Verify => {
+            Duration::from_secs(300)
+        }
+        SessionCommand::Shutdown => Duration::from_secs(2),
+        SessionCommand::Status | SessionCommand::HssStatus => Duration::from_secs(5),
+        _ => Duration::from_secs(30),
+    }
 }
 
 fn last_worker_error(context: &str) -> JlinkError {
@@ -676,6 +720,107 @@ mod tests {
     use jlink_domain::{ErrorCode, JlinkError, SessionCommand};
 
     use super::{WorkerClient, dispatched_request_error};
+
+    #[test]
+    fn silent_peer_child() {
+        use std::{
+            fs::File,
+            os::windows::{
+                ffi::OsStrExt,
+                io::{FromRawHandle, OwnedHandle},
+            },
+        };
+        use windows_sys::Win32::{
+            Foundation::INVALID_HANDLE_VALUE,
+            Storage::FileSystem::PIPE_ACCESS_DUPLEX,
+            System::Pipes::{ConnectNamedPipe, CreateNamedPipeW, PIPE_TYPE_BYTE, PIPE_WAIT},
+        };
+        let Some(endpoint) = std::env::var_os("JLINK_TEST_SILENT_PIPE") else {
+            return;
+        };
+        let wide: Vec<u16> = endpoint.encode_wide().chain(Some(0)).collect();
+        // SAFETY: all pointers are valid for this call; one private test pipe.
+        let raw = unsafe {
+            CreateNamedPipeW(
+                wide.as_ptr(),
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_WAIT,
+                1,
+                4096,
+                4096,
+                0,
+                std::ptr::null(),
+            )
+        };
+        assert_ne!(raw, INVALID_HANDLE_VALUE);
+        // SAFETY: this function owns the newly created pipe handle.
+        let owned = unsafe { OwnedHandle::from_raw_handle(raw) };
+        std::fs::write(std::env::var_os("JLINK_TEST_READY").unwrap(), b"ready").unwrap();
+        // SAFETY: raw remains valid and this is a synchronous server pipe.
+        unsafe {
+            ConnectNamedPipe(raw, std::ptr::null_mut());
+        }
+        let mut file = File::from(owned);
+        let _: jlink_domain::IpcRequest = jlink_domain::read_ipc_frame(&mut file).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn unresponsive_owned_worker_is_terminated_with_uncertain_execution() {
+        check_unresponsive_peer(true);
+        check_unresponsive_peer(false);
+    }
+
+    fn check_unresponsive_peer(owned: bool) {
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut client =
+            WorkerClient::for_probe(&format!("silent-{}", std::process::id())).unwrap();
+        let ready = root.path().join("ready");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worker_client::tests::silent_peer_child"])
+            .env("JLINK_TEST_SILENT_PIPE", client.endpoint())
+            .env("JLINK_TEST_READY", &ready)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut diagnostics =
+            super::WorkerDiagnostics::new(root.path(), child.id(), &"00".repeat(32));
+        if owned {
+            diagnostics.retain_child(&child).unwrap();
+        }
+        client.diagnostics = Some(diagnostics);
+        let started = Instant::now();
+        while !ready.exists() && started.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !ready.exists() {
+            let _ = child.kill();
+            panic!("test peer did not start");
+        }
+        let started = Instant::now();
+        let error = client
+            .request_with_timeout(SessionCommand::HssStart, |r| r, Duration::from_millis(100))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ExecutionUncertain);
+        assert!(!error.retryable);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(child.try_wait().unwrap().is_some(), owned);
+        if owned {
+            assert_eq!(
+                error.details.unwrap()["worker_timeout_action"]["terminated"],
+                true
+            );
+        } else {
+            // Test teardown owns the helper, while the client deliberately does not.
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
 
     #[test]
     fn endpoint_is_stable_without_exposing_probe_identity() {

@@ -2,7 +2,7 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
-    os::windows::ffi::OsStrExt,
+    os::windows::{ffi::OsStrExt, fs::OpenOptionsExt},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -114,6 +114,7 @@ pub struct CaptureSnapshot {
     path: PathBuf,
     header: CaptureHeader,
     manifest: CaptureManifest,
+    recovered_prefix: bool,
 }
 
 impl CaptureSnapshot {
@@ -184,8 +185,36 @@ impl CaptureSnapshot {
     /// Returns a stable identity, frame, CRC, digest, size, or local storage error.
     pub fn read_verified_resource(&self) -> Result<Vec<u8>, JlinkError> {
         let (mut file, file_len) = open_capture_file(&self.path)?;
-        let scan = scan_capture_file(&mut file, file_len, false)?;
+        let scan = scan_capture_file(&mut file, file_len, self.recovered_prefix)?;
         self.verify_scan_identity(&scan)?;
+        if self.recovered_prefix {
+            file.seek(SeekFrom::Start(12))
+                .map_err(|error| storage_error(error.to_string()))?;
+            let mut length = [0; 4];
+            file.read_exact(&mut length)
+                .map_err(|error| storage_error(error.to_string()))?;
+            let prefix = FILE_HEADER_BYTES
+                + u64::from(u32::from_le_bytes(length))
+                + scan.valid_blocks * BLOCK_HEADER_BYTES
+                + scan.valid_payload_bytes;
+            file.seek(SeekFrom::Start(0))
+                .map_err(|error| storage_error(error.to_string()))?;
+            let mut resource = Vec::new();
+            file.take(prefix)
+                .read_to_end(&mut resource)
+                .map_err(|error| storage_error(error.to_string()))?;
+            let manifest = serde_json::to_vec(&self.manifest)
+                .map_err(|error| storage_error(error.to_string()))?;
+            resource.extend_from_slice(TERMINAL_MAGIC);
+            resource.extend_from_slice(
+                &u32::try_from(manifest.len())
+                    .map_err(|_| invalid_store("manifest too large"))?
+                    .to_le_bytes(),
+            );
+            resource.extend_from_slice(&crc32(&manifest).to_le_bytes());
+            resource.extend_from_slice(&manifest);
+            return Ok(resource);
+        }
         let resource_len = usize::try_from(file_len)
             .map_err(|_| storage_error("Capture Store 资源大小无法表示为 usize"))?;
         file.seek(SeekFrom::Start(0))
@@ -200,7 +229,12 @@ impl CaptureSnapshot {
     }
 
     fn verify_scan_identity(&self, scan: &CaptureScan) -> Result<(), JlinkError> {
-        if scan.header != self.header || scan.manifest.as_ref() != Some(&self.manifest) {
+        let manifest = if self.recovered_prefix {
+            Some(partial_manifest(scan)?)
+        } else {
+            scan.manifest.clone()
+        };
+        if scan.header != self.header || manifest.as_ref() != Some(&self.manifest) {
             return Err(invalid_store(
                 "查询期间 Capture Store 自描述身份或终态清单发生变化",
             ));
@@ -399,6 +433,7 @@ impl CaptureStore {
             path,
             header: scan.header,
             manifest,
+            recovered_prefix: false,
         })
     }
 
@@ -416,7 +451,9 @@ impl CaptureStore {
                 "完成 capture 路径不是文件：{}",
                 path.display()
             ))),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                self.find_partial_snapshot(capture_id)
+            }
             Err(error) => Err(storage_error(format!(
                 "无法读取完成 capture 元数据 {}：{error}",
                 path.display()
@@ -425,6 +462,32 @@ impl CaptureStore {
     }
 
     /// Finds one immutable completed capture by Agent-provided recovery key.
+    fn find_partial_snapshot(
+        &self,
+        capture_id: &str,
+    ) -> Result<Option<CaptureSnapshot>, JlinkError> {
+        let path = self.partial_path(capture_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let scan = scan_capture(&path, true)?;
+        if scan.header.capture_id != capture_id {
+            return Err(invalid_store("partial identity mismatch"));
+        }
+        let recovered_prefix = scan.manifest.is_none();
+        let manifest = match &scan.manifest {
+            Some(manifest) => manifest.clone(),
+            None => partial_manifest(&scan)?,
+        };
+        Ok(Some(CaptureSnapshot {
+            path,
+            header: scan.header,
+            manifest,
+            recovered_prefix,
+        }))
+    }
+
+    /// Finds a finalized capture or an orphaned partial by its recovery key.
     ///
     /// # Errors
     ///
@@ -442,12 +505,33 @@ impl CaptureStore {
             ));
         }
         let mut found = None;
-        for snapshot in self.completed_snapshots()? {
-            if snapshot.capture_key() != capture_key {
+        for entry in fs::read_dir(&self.root).map_err(|error| storage_error(error.to_string()))? {
+            let path = entry
+                .map_err(|error| storage_error(error.to_string()))?
+                .path();
+            if path.extension() != Some(OsStr::new("capture"))
+                && path.extension() != Some(OsStr::new("partial"))
+            {
                 continue;
             }
-            if found.replace(snapshot).is_some() {
-                return Err(invalid_store("同一 Capture Store 存在重复 capture_key"));
+            let header =
+                open_capture_file(&path).and_then(|(mut file, _)| read_capture_header(&mut file));
+            match header {
+                Ok(header) if header.capture_key == capture_key => {
+                    let snapshot = self
+                        .find_snapshot(&header.capture_id)?
+                        .ok_or_else(|| invalid_store("capture disappeared"))?;
+                    if snapshot.path() != path {
+                        return Err(invalid_store("capture path/identity mismatch"));
+                    }
+                    if found.replace(snapshot).is_some() {
+                        return Err(invalid_store("同一 Capture Store 存在重复 capture_key"));
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("capture unavailable path={} error={error}", path.display());
+                }
             }
         }
         Ok(found)
@@ -521,6 +605,7 @@ impl CaptureStore {
                         path: completed_path,
                         header: scan.header,
                         manifest,
+                        recovered_prefix: false,
                     }));
                 }
                 Ok(aborted_recovery(AbortedRecoveryInput {
@@ -782,6 +867,7 @@ impl CaptureWriter {
             path: self.completed_path,
             header: scan.header,
             manifest: verified_manifest,
+            recovered_prefix: false,
         })
     }
 }
@@ -802,8 +888,56 @@ fn scan_capture(path: &Path, retain_payload: bool) -> Result<CaptureScan, JlinkE
     scan_capture_file(&mut file, file_len, retain_payload)
 }
 
+fn partial_manifest(scan: &CaptureScan) -> Result<CaptureManifest, JlinkError> {
+    let batch = scan.header.plan.frame_layout().parse(&scan.raw_payload)?;
+    if !batch.incomplete_tail.is_empty() {
+        return Err(invalid_store("partial contains an incomplete record"));
+    }
+    let records =
+        u64::try_from(batch.frames.len()).map_err(|_| invalid_store("partial count overflow"))?;
+    let mut quality = jlink_domain::HssQualitySummary {
+        requested_rate_hz: scan.header.plan.rate_hz(),
+        actual_samples: records,
+        ..jlink_domain::HssQualitySummary::default()
+    };
+    quality.clock.first_timestamp_us = batch
+        .frames
+        .first()
+        .map(|f| jlink_domain::normalize_hss_timestamp_us(f.timestamp_raw));
+    quality.clock.last_timestamp_us = batch
+        .frames
+        .last()
+        .map(|f| jlink_domain::normalize_hss_timestamp_us(f.timestamp_raw));
+    Ok(CaptureManifest {
+        snapshot: HssRunSnapshot {
+            capture_id: scan.header.capture_id.clone(),
+            state: jlink_domain::HssRunState::Aborted,
+            integrity: HssDataIntegrity::Unknown,
+            elapsed_us: scan.last_host_elapsed_us,
+            complete_records: records,
+            drain: HssDrainTiming::default(),
+            quality,
+            writes: Vec::new(),
+            failure_code: None,
+            partial_available: records > 0,
+            reason: Some(
+                "verified prefix of interrupted capture; native outcome and loss remain unknown"
+                    .to_owned(),
+            ),
+            recoverable: Some(!scan.crc_error),
+            recovery_notifications: Vec::new(),
+        },
+        blocks: scan.valid_blocks,
+        payload_bytes: scan.valid_payload_bytes,
+        raw_sha256: hex_digest(Sha256::digest(&scan.raw_payload).as_slice()),
+    })
+}
+
 fn open_capture_file(path: &Path) -> Result<(File, u64), JlinkError> {
-    let file = File::open(path)
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+        .open(path)
         .map_err(|error| storage_error(format!("无法打开 {}：{error}", path.display())))?;
     let file_len = file
         .metadata()
@@ -812,11 +946,7 @@ fn open_capture_file(path: &Path) -> Result<(File, u64), JlinkError> {
     Ok((file, file_len))
 }
 
-fn scan_capture_file(
-    file: &mut File,
-    file_len: u64,
-    retain_payload: bool,
-) -> Result<CaptureScan, JlinkError> {
+fn read_capture_header(file: &mut File) -> Result<CaptureHeader, JlinkError> {
     let mut fixed = [0_u8; FILE_HEADER_LEN];
     file.read_exact(&mut fixed)
         .map_err(|error| invalid_store(format!("Capture Store 头不完整：{error}")))?;
@@ -843,6 +973,15 @@ fn scan_capture_file(
     {
         return Err(invalid_store("Capture Store 自描述身份不一致"));
     }
+    Ok(header)
+}
+
+fn scan_capture_file(
+    file: &mut File,
+    file_len: u64,
+    retain_payload: bool,
+) -> Result<CaptureScan, JlinkError> {
+    let header = read_capture_header(file)?;
     let mut scan = CaptureScan {
         header,
         manifest: None,
@@ -1272,6 +1411,54 @@ mod tests {
                 .is_err(),
             "completed capture is never overwritten"
         );
+    }
+
+    #[test]
+    fn orphan_prefix_is_queryable_and_exported_as_aborted_without_modifying_source() {
+        use super::scan_capture;
+        use std::{fs, io::Write};
+        let directory = tempdir().unwrap();
+        let store = CaptureStore::open(directory.path()).unwrap();
+        let mut writer = store
+            .create_writer("cap-orphan", &target(), &start_plan(), 16 * 1024 * 1024)
+            .unwrap();
+        let payload = [1_u32.to_le_bytes(), 7_u32.to_le_bytes()].concat();
+        writer.append(10, CapturePhase::Live, &payload).unwrap();
+        writer.checkpoint().unwrap();
+        assert!(
+            store.find_snapshot("cap-orphan").is_err(),
+            "live writer is not an aborted snapshot"
+        );
+        let path = writer.partial_path().to_path_buf();
+        drop(writer);
+        // Simulate a torn trailing block after the last durable, valid prefix.
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"BLK1broken")
+            .unwrap();
+        let before = fs::read(&path).unwrap();
+        fs::write(
+            directory.path().join("capture-bad.capture"),
+            b"broken old capture",
+        )
+        .unwrap();
+        let snapshot = store
+            .find_snapshot_by_key("store-fixture")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.status().state, HssRunState::Aborted);
+        assert_eq!(snapshot.status().integrity, HssDataIntegrity::Unknown);
+        assert_eq!(snapshot.read_verified_payload().unwrap(), payload);
+        assert_eq!(crate::overview(&snapshot).unwrap().variables[0].samples, 1);
+        let exported = directory.path().join("export.capture");
+        fs::write(&exported, snapshot.read_verified_resource().unwrap()).unwrap();
+        let scan = scan_capture(&exported, true).unwrap();
+        assert_eq!(scan.raw_payload, payload);
+        assert_eq!(scan.manifest.unwrap().snapshot.state, HssRunState::Aborted);
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(store.find_snapshot("bad").is_err());
     }
 
     #[test]
