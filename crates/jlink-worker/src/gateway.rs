@@ -808,6 +808,7 @@ impl DllGateway {
     }
 
     fn device_info(&mut self, device: &str) -> Result<DeviceInfo, JlinkError> {
+        let device_name = device;
         let device = CString::new(device).map_err(|_| {
             JlinkError::new(
                 ErrorCode::ConfigInvalid,
@@ -823,7 +824,10 @@ impl DllGateway {
                 ErrorCode::ConfigInvalid,
                 "J-Link 设备数据库中不存在配置的 target.device",
                 false,
-            ));
+            )
+            .with_detail("device", json!(device_name))
+            .with_detail("dll_path", json!(self.path))
+            .with_detail("recommendation", json!("Install the matching vendor device package for this DLL or select a DLL that supports the configured device; no device-selection dialog was opened")));
         }
         let mut info = DeviceInfo::default();
         // SAFETY: the size-versioned structure matches the frozen x64 ABI and
@@ -1203,6 +1207,9 @@ impl DllGateway {
                 true,
             ));
         }
+        // Unknown names can open a modal picker in older DLLs despite SuppressGUI.
+        // Validate against this DLL's database before opening or selecting a probe.
+        self.device_info(spec.device())?;
         self.exec_command("SuppressGUI = 1")?;
         // SAFETY: the unique gateway serializes calls using the frozen 6.98a ABI.
         let selected = unsafe { (self.api.select_probe)(spec.probe_serial()) };
@@ -1239,6 +1246,7 @@ impl DllGateway {
     ) -> Result<TargetObservation, JlinkError> {
         self.exec_command("SetRestartOnClose = 0")?;
         self.exec_command("SetSkipDebugDeInit = 1")?;
+        self.exec_command("HideDeviceSelection = 1")?;
         self.exec_command(&format!("device = {}", spec.device()))?;
         let interface = match spec.interface() {
             TargetInterface::Swd => 1,
@@ -2347,6 +2355,31 @@ mod tests {
         );
         let gateway = DllGateway::load(&path).expect("load frozen DLL");
         assert!(gateway.api.hss.missing_exports().is_empty());
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly selected DLL; does not open a probe"]
+    fn unknown_device_is_rejected_before_probe_open() {
+        let path = PathBuf::from(env::var("JLINK_MCP_DEVICE_CHECK_DLL").expect("selected DLL"));
+        let mut gateway = DllGateway::load(&path).expect("load DLL");
+        let spec = TargetConnectionSpec::new(
+            "JLINK_MCP_NONEXISTENT_DEVICE_20260907",
+            TargetInterface::Swd,
+            1_000,
+            Some(1),
+            None,
+        )
+        .expect("valid request syntax");
+        let error = gateway
+            .open_target(&spec)
+            .err()
+            .expect("unknown device must fail offline");
+        assert_eq!(error.code, ErrorCode::ConfigInvalid);
+        assert!(!error.retryable);
+        assert!(!gateway.opened);
+        let details = error.details.expect("actionable device diagnostic");
+        assert_eq!(details["device"], spec.device());
+        assert_eq!(details["dll_path"], serde_json::json!(path));
     }
 
     #[test]
