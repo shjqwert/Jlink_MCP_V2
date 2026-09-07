@@ -1712,4 +1712,140 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn recovery_child_exits_without_dropping_admission() {
+        let Some(root) = std::env::var_os("JLINK_TEST_HSS_HARD_EXIT_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("JLINK_TEST_HSS_HARD_EXIT_PHASE").unwrap();
+        struct ExitAtFormalStart;
+        impl HssIo for ExitAtFormalStart {
+            fn start_hss(&mut self, _: &HssStartPlan) -> Result<(), JlinkError> {
+                std::process::exit(71);
+            }
+            fn read_hss(&mut self, _: &mut [u8], _: usize) -> Result<HssReadOutcome, JlinkError> {
+                panic!("hard-exit fixture must never drain");
+            }
+            fn stop_hss(&mut self) -> Result<(), JlinkError> {
+                panic!("hard-exit fixture must never stop");
+            }
+        }
+        let mut coordinator =
+            HssCoordinator::open(std::path::PathBuf::from(root), "260106173").unwrap();
+        let _ = coordinator.start(
+            "260106173",
+            &target(),
+            start_plan(),
+            TEST_CAPTURE_MAX_BYTES,
+            &mut ExitAtFormalStart,
+            |_| {
+                if phase == "preflight" {
+                    // process::exit does not unwind or flush the Rust BufWriter.
+                    std::process::exit(71);
+                }
+                assert_eq!(phase, "formal_start");
+                Ok(rate_assessment())
+            },
+        );
+        panic!("hard-exit fixture unexpectedly returned");
+    }
+
+    #[test]
+    fn recovery_survives_process_exit_without_destructors_in_both_start_phases() {
+        for phase in ["preflight", "formal_start"] {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "hss::tests::recovery_child_exits_without_dropping_admission",
+                    "--nocapture",
+                ])
+                .env("JLINK_TEST_HSS_HARD_EXIT_ROOT", root.path())
+                .env("JLINK_TEST_HSS_HARD_EXIT_PHASE", phase)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(71),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
+            let plan = start_plan();
+            let snapshot = recovered
+                .status_by_key(plan.capture_key(), Instant::now())
+                .unwrap();
+            assert_eq!(snapshot.state, HssRunState::Aborted);
+            assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
+            assert_eq!(snapshot.complete_records, 0);
+            assert!(!snapshot.partial_available);
+            assert!(
+                snapshot
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .contains(&format!("{phase}_pending"))
+            );
+            assert_eq!(
+                recovered
+                    .status(&snapshot.capture_id, Instant::now())
+                    .unwrap(),
+                snapshot
+            );
+            let mut io = ScriptedHss::healthy([]);
+            let error = recovered
+                .start(
+                    "260106173",
+                    &target(),
+                    plan,
+                    TEST_CAPTURE_MAX_BYTES,
+                    &mut io,
+                    |_| panic!("historical lookup must not permit a new native stream"),
+                )
+                .unwrap_err();
+            assert_eq!(error.code, ErrorCode::CaptureKeyConflict);
+            assert!(io.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn recovery_uncertain_preflight_cleanup_remains_aborted_unknown() {
+        let (root, mut coordinator) = open_coordinator();
+        let plan = start_plan();
+        let mut io = ScriptedHss::healthy([]);
+        let error = coordinator
+            .start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| {
+                    Err(JlinkError::new(
+                        ErrorCode::TargetRecoveryFailed,
+                        "temporary Stop unconfirmed",
+                        false,
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
+        assert!(!error.retryable);
+        let snapshot = coordinator
+            .status_by_key(plan.capture_key(), Instant::now())
+            .unwrap();
+        assert_eq!(snapshot.state, HssRunState::Aborted);
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
+        assert_eq!(snapshot.failure_code, Some(ErrorCode::TargetRecoveryFailed));
+        assert!(!snapshot.partial_available);
+        drop(coordinator);
+        let recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
+        assert_eq!(
+            recovered
+                .status_by_key(plan.capture_key(), Instant::now())
+                .unwrap(),
+            snapshot
+        );
+    }
 }

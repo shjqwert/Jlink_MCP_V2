@@ -42,11 +42,11 @@ impl WorkerDiagnostics {
             fs::create_dir_all(self.path.parent().expect("diagnostic root"))?;
             File::create(&self.path)
         };
-        let file = prepare().map_err(diagnostic_error)?;
+        let file = prepare().map_err(|error| diagnostic_error(&error))?;
         thread::Builder::new()
             .name(format!("jlink-stderr-{}", self.pid))
             .spawn(move || drain_output(stderr, file))
-            .map_err(diagnostic_error)?;
+            .map_err(|error| diagnostic_error(&error))?;
         Ok(())
     }
 
@@ -80,7 +80,7 @@ impl WorkerDiagnostics {
     }
 }
 
-fn diagnostic_error(error: io::Error) -> JlinkError {
+fn diagnostic_error(error: &io::Error) -> JlinkError {
     JlinkError::new(
         ErrorCode::WorkerUnavailable,
         format!("Cannot start bounded Worker diagnostics: {error}"),

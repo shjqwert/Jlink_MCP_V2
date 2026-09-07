@@ -481,10 +481,16 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
     })?;
 
     let diagnostics = WorkerDiagnostics::new(&diagnostic_root, child.id(), &spec.dll_sha256);
-    let stderr = child
-        .stderr
-        .take()
-        .expect("Worker was spawned with piped stderr");
+    let Some(stderr) = child.stderr.take() else {
+        // A newly spawned process has not received a target request yet.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(JlinkError::new(
+            ErrorCode::WorkerUnavailable,
+            "New Worker did not expose the requested diagnostic pipe",
+            false,
+        ));
+    };
     if let Err(error) = diagnostics.capture_stderr(stderr) {
         // No target request has been sent to this newly created Worker.
         let _ = child.kill();
