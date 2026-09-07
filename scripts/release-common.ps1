@@ -2,14 +2,19 @@
 Set-StrictMode -Version Latest
 
 function Get-ReleasePayloadPaths {
-    @(
+    param([switch]$Legacy)
+    $paths = @(
         'bin/jlink-mcp.exe', 'bin/jlink-worker.exe',
         'scripts/install-codex-plugin.ps1', 'scripts/launch-jlink-mcp.ps1', 'scripts/release-common.ps1',
+        'scripts/new-firmware-identity.ps1', 'scripts/invoke-verified-build.ps1',
         '.agents/plugins/marketplace.json', 'plugins/jlink-mcp/.codex-plugin/plugin.json',
         'plugins/jlink-mcp/.mcp.json', 'plugins/jlink-mcp/skills/jlink-mcp/SKILL.md',
         'plugins/jlink-mcp/skills/jlink-mcp/agents/openai.yaml',
         'jlink-mcp.example.toml', 'INSTALL.md', 'LICENSE', 'THIRD-PARTY-NOTICES.txt'
     )
+    if ($Legacy) {
+        $paths | Where-Object { $_ -notin @('scripts/new-firmware-identity.ps1', 'scripts/invoke-verified-build.ps1') }
+    } else { $paths }
 }
 
 function Get-ContainedPath {
@@ -187,7 +192,9 @@ function Read-ReleasePackage {
         $manifest.target -ne 'x86_64-pc-windows-msvc' -or $manifest.crt_linkage -ne 'static') {
         throw 'Unsupported release manifest, version, architecture or CRT mode'
     }
-    $expected = @(Get-ReleasePayloadPaths)
+    $helperPaths = @('scripts/new-firmware-identity.ps1', 'scripts/invoke-verified-build.ps1')
+    $hasWorkflowHelpers = @($manifest.files | Where-Object { $helperPaths -contains $_.path }).Count -gt 0
+    $expected = @(Get-ReleasePayloadPaths -Legacy:(-not $hasWorkflowHelpers))
     $seen = @{}
     foreach ($entry in $manifest.files) {
         if ($expected -cnotcontains $entry.path -or $seen.ContainsKey($entry.path) -or $entry.sha256 -notmatch '^[A-Fa-f0-9]{64}$') {

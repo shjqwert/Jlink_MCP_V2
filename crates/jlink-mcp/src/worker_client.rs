@@ -28,6 +28,10 @@ use windows_sys::Win32::{
     System::Pipes::WaitNamedPipeW,
 };
 
+#[path = "worker_diagnostics.rs"]
+mod diagnostics;
+use diagnostics::WorkerDiagnostics;
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_POLL: Duration = Duration::from_millis(20);
@@ -108,6 +112,7 @@ impl WorkerAttachment {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkerClient {
     endpoint: String,
+    diagnostics: Option<WorkerDiagnostics>,
 }
 
 impl WorkerClient {
@@ -119,6 +124,7 @@ impl WorkerClient {
     pub fn for_probe(identity: &str) -> Result<Self, JlinkError> {
         Ok(Self {
             endpoint: worker_endpoint_name(identity)?,
+            diagnostics: None,
         })
     }
 
@@ -376,23 +382,31 @@ impl WorkerClient {
             request_id.clone(),
             command,
         ));
-        let mut pipe = open_pipe(&self.endpoint, 100)?;
+        let mut pipe =
+            open_pipe(&self.endpoint, 100).map_err(|error| self.transport_error(error))?;
         write_ipc_frame(&mut pipe, &request)
-            .map_err(|error| dispatched_request_error(command, &error))?;
-        let response: IpcResponse =
-            read_ipc_frame(&mut pipe).map_err(|error| dispatched_request_error(command, &error))?;
+            .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
+        let response: IpcResponse = read_ipc_frame(&mut pipe)
+            .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
         response
             .validate()
-            .map_err(|error| dispatched_request_error(command, &error))?;
+            .map_err(|error| self.transport_error(dispatched_request_error(command, &error)))?;
         if response.protocol_version != ProtocolVersion::V1 || response.request_id != request_id {
             let error = JlinkError::new(
                 ErrorCode::IpcProtocolError,
                 "Worker 响应版本或 request_id 与请求不一致",
                 false,
             );
-            return Err(dispatched_request_error(command, &error));
+            return Err(self.transport_error(dispatched_request_error(command, &error)));
         }
         Ok(response)
+    }
+
+    fn transport_error(&self, error: JlinkError) -> JlinkError {
+        match &self.diagnostics {
+            Some(diagnostics) => diagnostics.enrich(error),
+            None => error,
+        }
     }
 }
 
@@ -413,12 +427,22 @@ fn parse_hss_snapshot(value: serde_json::Value) -> Result<HssRunSnapshot, JlinkE
 /// Returns immediately for non-connectivity protocol errors. After a spawn, it
 /// returns [`ErrorCode::WorkerUnavailable`] when the process exits early or the
 /// endpoint does not become reachable before the fixed deadline.
+#[allow(clippy::too_many_lines)]
 pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, JlinkError> {
-    let client = WorkerClient::for_probe(&spec.probe_identity)?;
+    let mut client = WorkerClient::for_probe(&spec.probe_identity)?;
+    let diagnostic_root = spec
+        .lease_root
+        .join("diagnostics")
+        .join(jlink_domain::probe_identity_hash(&spec.probe_identity)?);
     match client.status() {
         Ok(status) => {
             ensure_current_parent(&status)?;
             ensure_current_dll(&status, &spec.dll_sha256)?;
+            client.diagnostics = Some(WorkerDiagnostics::new(
+                &diagnostic_root,
+                status.worker_pid,
+                &spec.dll_sha256,
+            ));
             return Ok(WorkerAttachment {
                 client,
                 status,
@@ -446,7 +470,7 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         .arg(std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     let mut child = command.spawn().map_err(|error| {
         JlinkError::new(
@@ -456,6 +480,18 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
         )
     })?;
 
+    let diagnostics = WorkerDiagnostics::new(&diagnostic_root, child.id(), &spec.dll_sha256);
+    let stderr = child
+        .stderr
+        .take()
+        .expect("Worker was spawned with piped stderr");
+    if let Err(error) = diagnostics.capture_stderr(stderr) {
+        // No target request has been sent to this newly created Worker.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    client.diagnostics = Some(diagnostics);
     let deadline = Instant::now() + ATTACH_TIMEOUT;
     loop {
         match client.status() {
@@ -464,6 +500,11 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
                 if status.worker_pid != child.id() {
                     stop_non_authoritative_child(&mut child)?;
                     ensure_current_parent(&status)?;
+                    client.diagnostics = Some(WorkerDiagnostics::new(
+                        &diagnostic_root,
+                        status.worker_pid,
+                        &spec.dll_sha256,
+                    ));
                     return Ok(WorkerAttachment {
                         client,
                         status,
@@ -488,11 +529,11 @@ pub fn attach_or_spawn(spec: &WorkerLaunchSpec) -> Result<WorkerAttachment, Jlin
                 true,
             )
         })? {
-            return Err(JlinkError::new(
+            return Err(client.transport_error(JlinkError::new(
                 ErrorCode::WorkerUnavailable,
                 format!("jlink-worker 在建立端点前退出：{status}"),
                 true,
-            ));
+            )));
         }
         if Instant::now() >= deadline {
             let _ = child.kill();

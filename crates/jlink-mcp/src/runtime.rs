@@ -394,8 +394,12 @@ impl Runtime {
 
     fn config_get(&self) -> Result<ToolCall, JlinkError> {
         let discovery = self.discover();
-        let inspection =
+        let mut inspection =
             inspect_config(&self.session_config, &self.config_paths, &discovery.config)?;
+        if let Some(resolved) = inspection.resolved.as_mut() {
+            apply_discovery_profile(resolved, &discovery);
+        }
+        inspection.refresh_operation_readiness();
         let mut result = serde_json::to_value(&inspection)
             .map_err(serialization_error)?
             .as_object()
@@ -413,8 +417,7 @@ impl Runtime {
             "diagnostics".to_owned(),
             serde_json::to_value(&discovery.diagnostics).map_err(serialization_error)?,
         );
-        if let Some(mut resolved) = inspection.resolved {
-            apply_discovery_profile(&mut resolved, &discovery);
+        if let Some(resolved) = inspection.resolved {
             result.insert(
                 "conflicts".to_owned(),
                 serde_json::to_value(&resolved.profile.conflicts).map_err(serialization_error)?,

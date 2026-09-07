@@ -66,3 +66,33 @@ jlink-mcp/
 - 文件锁/进程占用：关闭本工具的任务和会话后重试；遗留的空 `install.lock` 文件本身不代表仍被占用。
 - 缺少 DLL、哈希不符或目标无法连接：由用户检查 SEGGER 环境及工程配置。
 - 不支持的 CLI 输出/策略限制：保持原安装，提供错误与 CLI 版本，不通过修改全局配置绕过。
+
+## 测试固件准备与失败阻断（修复分支，尚未发布）
+
+先固定当前工程经过确认的 DLL 路径、精确版本和 SHA-256，再检查
+`config_get.readiness`。`static_ready` 只代表静态配置，不代表目标连接、
+固件强身份或 HSS 能力已经验证。`flash/erase` 缺少 `loader_ram` 时先补齐；
+`verify` 和普通读取不应因此受阻。HSS 先规划再启动，所有选择项合计载荷
+不得超过 40 字节（另加时间戳），不要通过真实启动来发现静态限制。
+
+完整发布包增加两个离线工作流辅助脚本，不自动调用、不自动连接或烧录：
+
+```powershell
+# BuildId 应随固件改变；以下字符串只是格式示例，不应重复用于不同固件。
+./scripts/new-firmware-identity.ps1 -BuildId 'project-build-unique-id' -OutputPath './identity.c'
+
+# 替换为已经获准执行的实际原生构建程序、参数和输出文件。
+./scripts/invoke-verified-build.ps1 -FilePath '<compiler.exe>' -ArgumentList @('<project>', '<rebuild-options>') -ArtifactPath '<firmware.out>'
+```
+
+身份块必须在最终 ELF 中保留并位于加载到 Flash 的只读区。IAR 使用
+`__root`，GCC/Clang 的 section GC 需要链接脚本 `KEEP` 对应段；生成源码
+不替代最终 ELF 检查。构建辅助脚本失败时不生成成功凭据，也不会调用
+`-OnSuccess` 提供的依赖步骤；旧固件文件不会被删除。成功凭据记录输出路径
+和 SHA-256，后续独立操作仍需核对文件没有改变。该脚本不是所有外部构建
+命令的全局拦截器，调用者不能忽略失败后继续烧录。
+
+Worker 失联诊断日志按探针/PID 保存于租约目录下 `diagnostics/`，每个文件
+最多 32 KiB。它是有界、尽力保留的日志尾部，不证明最终原生调用或 DLL 崩溃。
+HSS 的 `.start-journal` 仅记录已刷盘的启动意图边界；`aborted/unknown` 不能
+解释为采样从未执行。历史 key 可查询终态，但不能隐式重新启动旧采集。

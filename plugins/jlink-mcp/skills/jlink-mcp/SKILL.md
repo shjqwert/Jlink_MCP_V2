@@ -26,6 +26,42 @@ Operate the fixed six-tool V1 contract. Live tool definitions are the sole synta
 authority; this self-contained Skill supplies routing, lifecycle state, result
 semantics, and recovery. Do not load runtime references or recreate a Schema here.
 
+## Preparation before test-firmware changes
+
+Freeze the project's verified DLL path, exact file version and SHA-256 before
+connecting. Use the existing project/session identity checks; do not silently
+switch versions or hard-code one SEGGER version for every device. For a project
+whose agreed baseline is 6.98a, retain that exact DLL throughout the test. Ordinary
+reads succeeding does not attest to HSS compatibility.
+
+Read `target.config_get` and its action-specific `readiness` first. A
+`static_ready` value is configuration evidence, not successful live validation;
+resolve `missing` fields and retain `pending_checks`. Flash/erase need loader RAM;
+verify and ordinary reads do not acquire that requirement. Before HSS-dependent
+firmware design, budget the combined payload and run offline `hss.plan` once the
+ELF/selectors exist. The current payload limit is 40 bytes excluding the timestamp.
+Do not start HSS just to discover its static limits.
+
+For DWARF writes/HSS, the final ELF must retain `__jlink_mcp_identity` in loaded,
+read-only Flash. Its bytes are `JLID`, format byte `1`, one-byte ASCII build-ID
+length N, then N printable ASCII bytes; N is 1..58 and total size is at most 64.
+Use `scripts/new-firmware-identity.ps1` from the complete package to generate the
+array without a hand-maintained length. GCC/Clang section GC also needs the linker
+KEEP rule stated by that generator. Change the build ID with firmware changes;
+reusing a demonstration ID does not prove that two different builds match.
+Raw-address HSS instead requires explicit type/range and declared readable RAM;
+it must not be silently relabelled as DWARF evidence.
+
+A failed compiler/linker result ends its dependency chain immediately: do not
+prepare, copy, flash or test an old OUT as the new build. The packaged
+`scripts/invoke-verified-build.ps1` can run the approved native build command,
+require a fresh nonempty output, and invoke an explicitly supplied dependent step
+only after success. Its receipt binds that output path and SHA-256, not arbitrary
+future files. Recheck the hash before later use; independent MCP calls are not
+magically gated by the receipt. Use an explicit rebuild/new output path when
+incremental builds leave the previous artifact unchanged. Deliberate rollback to
+an identified old image is a separate authorized task, not a failed-build fallback.
+
 ## Route precisely
 
 | Intent | Tool and actions | Boundary |
@@ -38,8 +74,11 @@ semantics, and recovery. Do not load runtime references or recreate a Schema her
 | Plan/capture/query high-speed data | `jlink_hss`: `plan`, `start`, `status`, `query` | Plan is offline; start persists a fixed capture. |
 
 Use `inspect.symbols` when an ELF or DWARF path is unknown, and `hss.query` for
-persisted data. A single live value routes to `inspect`; repeated samples,
-transitions, duration, or high-rate observation routes to `hss.plan` then `start`.
+persisted data. Choose the least invasive evidence that meets acceptance: a
+latched result, counter, completion flag or bounded target-run result routes to
+`inspect`, even when the test performed many internal transitions. Use `hss.plan`
+then `start` only when continuous samples, ordering or transient timing evidence
+is actually needed. Software latches do not by themselves prove pin waveforms.
 HSS has no stop action. Prefer `return_when: started` for a capture expected to
 outlast a normal tool turn, then use `status` and `query`; reserve
 `return_when: completed` for a short capture that fits the current tool wait. The
@@ -82,7 +121,9 @@ follow-up inspect call. Inspect is current state; HSS query is historical data.
   replay program/write/control; reconcile state and obtain safe read-only evidence
   or ask how to proceed. An HSS `start` may recover only with the same key and an
   equivalent request in the same lifecycle. A new lifecycle or changed request
-  needs a new key.
+  needs a new key. Historical `status` can still use the original key after a
+  Worker restart; this lookup never restarts acquisition. Preserve aborted/unknown
+  outcomes and last recorded boundaries without inferring unobserved hardware results.
 
 ## HSS evidence and pagination
 

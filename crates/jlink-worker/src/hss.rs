@@ -15,6 +15,10 @@ use serde_json::json;
 
 use crate::gateway::DllGateway;
 
+#[path = "hss_start_journal.rs"]
+mod start_journal;
+use start_journal::StartBoundary;
+
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const DRAIN_INTERVAL: Duration = Duration::from_millis(1);
 const TAIL_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -134,9 +138,10 @@ impl HssCoordinator {
                     capture_id,
                     plan,
                     target,
-                    status,
+                    mut status,
                     ..
                 } => {
+                    start_journal::annotate_recovery(store.root(), &capture_id, &mut status);
                     match (&target, &plan) {
                         (Some(target), Some(plan)) => {
                             let reservation = registry.reserve(probe_identity, target, plan)?;
@@ -191,6 +196,7 @@ impl HssCoordinator {
         DRAIN_INTERVAL
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn start<I, F>(
         &mut self,
         probe_identity: &str,
@@ -230,13 +236,6 @@ impl HssCoordinator {
                 true,
             ));
         }
-        let rate_assessment = match preflight(io) {
-            Ok(assessment) => assessment.ensure_accepted()?,
-            Err(error) => {
-                self.registry.rollback_created(&plan, &reservation);
-                return Err(error);
-            }
-        };
         let capture_id = reservation.capture_id().to_owned();
         let writer = match self
             .store
@@ -248,10 +247,32 @@ impl HssCoordinator {
                 return Err(error);
             }
         };
+        // The self-describing header is durable before preflight, which can
+        // itself run a temporary native stream. Never lose an admitted key.
+        if let Err(error) =
+            start_journal::record(self.store.root(), &capture_id, StartBoundary::Preflight)
+        {
+            return Err(self.record_start_failure(&capture_id, plan, writer, error));
+        }
+        let rate_assessment = match preflight(io).and_then(HssRateAssessment::ensure_accepted) {
+            Ok(assessment) => assessment,
+            Err(error) => {
+                let error =
+                    error.with_detail("start_boundary", json!(StartBoundary::Preflight.label()));
+                return Err(self.record_start_failure(&capture_id, plan, writer, error));
+            }
+        };
+        if let Err(error) =
+            start_journal::record(self.store.root(), &capture_id, StartBoundary::FormalStart)
+        {
+            return Err(self.record_start_failure(&capture_id, plan, writer, error));
+        }
         let start_called = Instant::now();
         let start_result = io.start_hss(&plan);
         let started = Instant::now();
         if let Err(error) = start_result {
+            let error =
+                error.with_detail("start_boundary", json!(StartBoundary::FormalStart.label()));
             return Err(self.record_start_failure(&capture_id, plan, writer, error));
         }
         let deadline = started + Duration::from_secs(u64::from(plan.duration_s()));
@@ -295,9 +316,23 @@ impl HssCoordinator {
         error: JlinkError,
     ) -> JlinkError {
         let mut status = HssCaptureState::starting();
-        status
-            .mark_failed(error.code, false, Vec::new())
-            .expect("a controlled Start failure can terminate starting");
+        if matches!(
+            error.code,
+            ErrorCode::ExecutionUncertain | ErrorCode::TargetRecoveryFailed
+        ) {
+            status
+                .mark_aborted(
+                    "HSS admission ended with unconfirmed native execution or cleanup",
+                    false,
+                    false,
+                    Vec::new(),
+                )
+                .expect("an uncertain start remains aborted/unknown");
+        } else {
+            status
+                .mark_failed(error.code, false, Vec::new())
+                .expect("a controlled Start failure can terminate starting");
+        }
         let snapshot = HssRunSnapshot {
             capture_id: capture_id.to_owned(),
             state: status.lifecycle(),
@@ -307,11 +342,11 @@ impl HssCoordinator {
             drain: HssDrainTiming::default(),
             quality: HssQualitySummary::default(),
             writes: Vec::new(),
-            failure_code: status.failure_code(),
+            failure_code: Some(error.code),
             partial_available: false,
-            reason: None,
-            recoverable: None,
-            recovery_notifications: Vec::new(),
+            reason: status.reason().map(str::to_owned),
+            recoverable: status.recoverable(),
+            recovery_notifications: status.recovery_notifications().to_vec(),
         };
         let store_result = writer.finish(&snapshot);
         self.terminal.insert(
@@ -325,7 +360,7 @@ impl HssCoordinator {
         );
         let mut error = error
             .with_detail("capture_id", json!(capture_id))
-            .with_detail("state", json!(HssRunState::Failed))
+            .with_detail("state", json!(status.lifecycle()))
             .with_detail("partial_available", json!(false));
         if let Err(store_error) = store_result {
             error = error.with_detail("capture_store_publish", json!(store_error.to_string()));
@@ -576,6 +611,8 @@ impl HssCoordinator {
         let capture_id = self
             .registry
             .capture_id_for_key(capture_key)
+            // Retirement prevents a new Start, not a historical status lookup.
+            .or_else(|| self.retired_keys.get(capture_key).map(String::as_str))
             .ok_or_else(|| {
                 JlinkError::new(ErrorCode::ValueInvalid, "Worker 找不到 capture_key", false)
                     .with_detail("capture_key", json!(capture_key))
@@ -1198,9 +1235,8 @@ mod tests {
         assert_eq!(
             recovered
                 .status_by_key(plan.capture_key(), Instant::now())
-                .expect_err("capture key does not cross Worker lifecycles")
-                .code,
-            ErrorCode::ValueInvalid
+                .expect("historical status remains queryable by key"),
+            by_id
         );
 
         let mut second_io = ScriptedHss::healthy([]);
@@ -1445,10 +1481,10 @@ mod tests {
             .expect("aborted partial remains queryable after restart");
         assert_eq!(snapshot.state, HssRunState::Aborted);
         assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
-        let retired_key = recovered
+        let by_key = recovered
             .status_by_key("run-fixture", Instant::now())
-            .expect_err("aborted capture key is retired after restart");
-        assert_eq!(retired_key.code, ErrorCode::ValueInvalid);
+            .expect("retired key can query an aborted capture without restarting it");
+        assert_eq!(by_key, snapshot);
     }
 
     #[test]
@@ -1487,5 +1523,192 @@ mod tests {
         assert_eq!(snapshot.complete_records, 1);
         assert_eq!(snapshot.failure_code, None);
         assert!(!snapshot.partial_available);
+    }
+
+    #[test]
+    fn recovery_preflight_has_durable_identity_before_any_native_work() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let (root, mut coordinator) = open_coordinator();
+        let plan = start_plan();
+        let mut io = ScriptedHss::healthy([]);
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = coordinator.start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |io| {
+                    // Inspect before unwinding: BufWriter::drop must not be what makes
+                    // the identity readable. No hardware is used by this fault injection.
+                    let store = CaptureStore::open(root.path()).unwrap();
+                    let recoveries = store.recover_partials().unwrap();
+                    assert_eq!(recoveries.len(), 1);
+                    match &recoveries[0] {
+                        CaptureRecovery::Aborted {
+                            capture_key,
+                            plan: stored_plan,
+                            ..
+                        } => {
+                            assert_eq!(capture_key.as_deref(), Some(plan.capture_key()));
+                            assert_eq!(
+                                stored_plan.as_ref().unwrap().request_fingerprint(),
+                                plan.request_fingerprint()
+                            );
+                        }
+                        CaptureRecovery::Published(_) => panic!("admission is not completed data"),
+                    }
+                    io.start_hss(&plan)?;
+                    panic!("injected Worker loss during temporary HSS preflight");
+                },
+            );
+        }));
+        assert!(result.is_err());
+        drop(coordinator);
+        let recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
+        let snapshot = recovered
+            .status_by_key(plan.capture_key(), Instant::now())
+            .unwrap();
+        assert_eq!(snapshot.state, HssRunState::Aborted);
+        assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
+        assert_eq!(snapshot.complete_records, 0);
+        assert!(!snapshot.partial_available);
+        assert!(
+            snapshot
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("preflight_pending")
+        );
+        assert_eq!(
+            recovered
+                .status(&snapshot.capture_id, Instant::now())
+                .unwrap(),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn recovery_formal_start_loss_keeps_key_without_claiming_hardware_success() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        struct LostAtStart;
+        impl HssIo for LostAtStart {
+            fn start_hss(&mut self, _: &HssStartPlan) -> Result<(), JlinkError> {
+                panic!("injected loss at formal Start");
+            }
+            fn read_hss(&mut self, _: &mut [u8], _: usize) -> Result<HssReadOutcome, JlinkError> {
+                panic!("no drain should occur");
+            }
+            fn stop_hss(&mut self) -> Result<(), JlinkError> {
+                panic!("unconfirmed Start must not be blindly replayed or stopped");
+            }
+        }
+        let (root, mut coordinator) = open_coordinator();
+        let plan = start_plan();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            let _ = coordinator.start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut LostAtStart,
+                |_| Ok(rate_assessment()),
+            );
+        }));
+        assert!(result.is_err());
+        drop(coordinator);
+        let mut recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
+        let snapshot = recovered
+            .status_by_key(plan.capture_key(), Instant::now())
+            .unwrap();
+        assert_eq!(snapshot.state, HssRunState::Aborted);
+        assert!(
+            snapshot
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("formal_start_pending")
+        );
+        let mut io = ScriptedHss::healthy([]);
+        let error = recovered
+            .start(
+                "260106173",
+                &target(),
+                plan,
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| panic!("historical key cannot restart a stream"),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::CaptureKeyConflict);
+        assert!(io.calls.is_empty());
+    }
+
+    #[test]
+    fn recovery_preflight_rejection_is_recorded_and_does_not_leave_a_dangling_key() {
+        let (root, mut coordinator) = open_coordinator();
+        let plan = start_plan();
+        let mut io = ScriptedHss::healthy([]);
+        let error = coordinator
+            .start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| {
+                    Err(JlinkError::new(
+                        ErrorCode::HssUnsupported,
+                        "rate rejected",
+                        false,
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::HssUnsupported);
+        let failed = coordinator
+            .status_by_key(plan.capture_key(), Instant::now())
+            .unwrap();
+        assert_eq!(failed.state, HssRunState::Failed);
+        assert_eq!(failed.failure_code, Some(ErrorCode::HssUnsupported));
+        assert!(io.calls.is_empty());
+        let again = coordinator
+            .start(
+                "260106173",
+                &target(),
+                plan.clone(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |_| panic!("same request recovers the failed attempt, not a second preflight"),
+            )
+            .unwrap();
+        assert!(!again.started_new);
+        assert_eq!(again.snapshot, failed);
+        drop(coordinator);
+        let recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
+        assert_eq!(
+            recovered
+                .status_by_key(plan.capture_key(), Instant::now())
+                .unwrap(),
+            failed
+        );
+    }
+
+    #[test]
+    fn recovery_capacity_failure_never_enters_live_preflight() {
+        let (_root, mut coordinator) = open_coordinator();
+        let mut io = ScriptedHss::healthy([]);
+        let error = coordinator
+            .start("260106173", &target(), start_plan(), 1, &mut io, |_| {
+                panic!("storage admission must finish before temporary HSS")
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::HssUnsupported);
+        assert!(io.calls.is_empty());
+        assert!(
+            coordinator
+                .status_by_key("never-admitted", Instant::now())
+                .is_err()
+        );
     }
 }

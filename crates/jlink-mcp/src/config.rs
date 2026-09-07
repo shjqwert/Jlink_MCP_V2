@@ -13,10 +13,13 @@ use std::{
 };
 
 pub use jlink_capture::DEFAULT_CAPTURE_MAX_BYTES;
+#[path = "config_readiness.rs"]
+mod readiness;
 use jlink_domain::{
     ErrorCode, FlashProfile, JlinkError, MemoryRegion, MemoryRegionKind, ProfileSource,
     ProfileSourceKind, TargetCapabilities, TargetInterface,
 };
+pub use readiness::OperationReadiness;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -283,6 +286,8 @@ pub struct ConfigInspection {
     pub missing: Vec<String>,
     /// Whether each public operation has enough static configuration to proceed.
     pub operations: BTreeMap<String, bool>,
+    /// Action-specific static prerequisites; pending checks are not successful validation.
+    pub readiness: BTreeMap<String, OperationReadiness>,
     /// Same-directory x64 selection performed from a configured 32-bit candidate.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dll_selection: Option<DllSelection>,
@@ -576,14 +581,17 @@ pub fn inspect_config(
         "hss".to_owned(),
         static_ready && probe_ready && symbols_ready,
     );
-    Ok(ConfigInspection {
+    let mut inspection = ConfigInspection {
         effective,
         sources,
         missing,
         operations,
+        readiness: BTreeMap::new(),
         dll_selection,
         resolved,
-    })
+    };
+    inspection.refresh_operation_readiness();
+    Ok(inspection)
 }
 
 /// Resolves request, user, project, discovery, and safe-default layers.

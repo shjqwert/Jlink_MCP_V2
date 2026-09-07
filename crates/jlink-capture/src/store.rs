@@ -615,6 +615,14 @@ impl CaptureWriter {
             .and_then(|()| writer.write_all(&crc32(&header_json).to_le_bytes()))
             .and_then(|()| writer.write_all(&header_json))
             .map_err(|error| storage_error(format!("无法写入 Capture Store 头：{error}")))?;
+        // Admission must survive a hard Worker exit, not only BufWriter::drop.
+        // This sync is before any temporary or formal native HSS Start.
+        writer
+            .flush()
+            .and_then(|()| writer.get_ref().sync_all())
+            .map_err(|error| {
+                storage_error(format!("Cannot persist Capture Store admission: {error}"))
+            })?;
         let bytes_written = FILE_HEADER_BYTES
             + u64::try_from(header_json.len()).expect("validated header length fits u64");
         Ok(Self {

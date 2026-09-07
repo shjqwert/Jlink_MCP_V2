@@ -16,3 +16,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 & "$PSScriptRoot\check-dependencies.ps1"
+
+# Pure helper checks use the minimum supported PowerShell runtime; no probe access.
+& powershell.exe -NoLogo -NoProfile -File "$PSScriptRoot\check-firmware-workflow.ps1"
+if ($LASTEXITCODE -ne 0) { throw "Firmware workflow checks failed" }

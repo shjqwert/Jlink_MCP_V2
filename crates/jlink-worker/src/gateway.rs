@@ -27,6 +27,11 @@ use windows_sys::Win32::{
     },
 };
 
+fn log_hss_boundary(message: &str) {
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stderr().lock(), "hss {message}");
+}
+
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNNING_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -470,8 +475,12 @@ impl DllGateway {
             .hss
             .get_caps
             .expect("complete HSS export set contains GetCaps");
+        log_hss_boundary("native_call=GetCaps boundary=enter");
         // SAFETY: `caps` is writable and the frozen 6.98a ABI was verified in F0-A.
         let result = unsafe { get_caps(&raw mut caps) };
+        log_hss_boundary(&format!(
+            "native_call=GetCaps boundary=return result={result}"
+        ));
         if result < 0 {
             return Err(JlinkError::new(
                 ErrorCode::HssUnsupported,
@@ -535,6 +544,7 @@ impl DllGateway {
             .hss
             .start
             .expect("HSS preflight requires the complete export set");
+        log_hss_boundary("native_call=Start boundary=enter");
         // SAFETY: block layout and call signature are frozen by F0-A; the unique
         // gateway owns the live target and serializes every DLL call.
         let result = unsafe {
@@ -545,6 +555,9 @@ impl DllGateway {
                 jlink_domain::HSS_START_FLAGS_698A_MAINLINE,
             )
         };
+        log_hss_boundary(&format!(
+            "native_call=Start boundary=return result={result}"
+        ));
         if result < 0 {
             return Err(hss_start_error(result));
         }
@@ -619,8 +632,10 @@ impl DllGateway {
         // Mark consumed before interpreting the result so cleanup never retries a
         // failed Stop against an uncertain DLL state.
         self.hss_started = false;
+        log_hss_boundary("native_call=Stop boundary=enter");
         // SAFETY: the unique gateway owns the matching successful Start call.
         let result = unsafe { stop() };
+        log_hss_boundary(&format!("native_call=Stop boundary=return result={result}"));
         if result < 0 {
             return Err(JlinkError::new(
                 ErrorCode::TargetRecoveryFailed,
