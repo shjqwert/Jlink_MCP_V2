@@ -42,6 +42,13 @@ try {
     Assert-True (-not (Test-Path -LiteralPath $receipt)) 'Old success receipt survived a failed build'
     Assert-True ([IO.File]::ReadAllText($artifact) -eq 'old image') 'Old firmware was deleted or changed'
 
+    [IO.File]::WriteAllText($receipt, '{"build_succeeded":true}')
+    Assert-Throws {
+        & $build -FilePath (Join-Path $root 'missing-compiler.exe') -ArtifactPath $artifact -OnSuccess $followup
+    } 'An unresolved compiler did not stop dependent work'
+    Assert-True (-not (Test-Path -LiteralPath $receipt)) 'Old success receipt survived compiler lookup failure'
+    Assert-True (-not (Test-Path -LiteralPath $marker)) 'Dependent stage ran without a compiler'
+
     $noop = Join-Path $root 'noop.ps1'
     [IO.File]::WriteAllText($noop, 'exit 0')
     Assert-Throws {

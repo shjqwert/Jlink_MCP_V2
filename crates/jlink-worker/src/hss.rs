@@ -1527,6 +1527,7 @@ mod tests {
 
     #[test]
     fn recovery_preflight_has_durable_identity_before_any_native_work() {
+        use jlink_capture::{CaptureRecovery, CaptureStore};
         use std::panic::{AssertUnwindSafe, catch_unwind};
         let (root, mut coordinator) = open_coordinator();
         let plan = start_plan();

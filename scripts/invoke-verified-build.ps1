@@ -15,7 +15,6 @@ $receipt = [IO.Path]::GetFullPath($ReceiptPath)
 if ($artifact.Equals($receipt, [StringComparison]::OrdinalIgnoreCase)) {
     throw 'ReceiptPath must not equal ArtifactPath'
 }
-$command = Get-Command -Name $FilePath -CommandType Application -ErrorAction Stop | Select-Object -First 1
 # Remove only this helper's prior receipt, never the user's prior firmware image.
 # A failed build must not leave a stale success receipt eligible for a next stage.
 if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
