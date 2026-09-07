@@ -871,6 +871,7 @@ fn target_output_schema() -> Value {
             ("sources", sources),
             ("missing", Value::Bool(true)),
             ("operations", Value::Bool(true)),
+            ("readiness", readiness_schema()),
             ("provenance", Value::Bool(true)),
             ("conflicts", Value::Bool(true)),
             ("diagnostics", Value::Bool(true)),
@@ -880,6 +881,20 @@ fn target_output_schema() -> Value {
         ],
         &[],
     )
+}
+
+fn readiness_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": closed_object(
+            vec![
+                ("static_ready", boolean()),
+                ("missing", json!({ "type": "array", "items": { "type": "string" } })),
+                ("pending_checks", json!({ "type": "array", "items": { "type": "string" } })),
+            ],
+            &["static_ready", "missing", "pending_checks"],
+        )
+    })
 }
 
 fn inspect_output_schema() -> Value {
@@ -2139,6 +2154,50 @@ mod tests {
         hss_output_schema, hss_plan_output_schema, hss_quality_definition, hss_tool,
         public_tool_error, schema_argument_error, tool_catalog, with_hss_output_definitions,
     };
+
+    #[test]
+    fn config_readiness_survives_real_stdio_output_validation() {
+        let root = tempfile::tempdir().expect("temporary configuration");
+        let mut runtime = crate::runtime::Runtime::new(
+            crate::config::ConfigPaths::new(
+                root.path().join("project.toml"),
+                root.path().join("user.toml"),
+            ),
+            root.path().join("worker-must-not-run.exe"),
+            root.path().join("leases"),
+        );
+        let request = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "jlink_target", "arguments": { "action": "config_get" } }
+        });
+        let mut output = Vec::new();
+        super::serve(
+            std::io::Cursor::new(format!("{request}\n")),
+            &mut output,
+            &mut runtime,
+        )
+        .expect("stdio response");
+        let response: serde_json::Value = serde_json::from_slice(&output).expect("JSON response");
+        assert!(response.get("error").is_none(), "{response}");
+        let result = &response["result"]["structuredContent"];
+        assert!(result.get("error").is_none(), "{result}");
+        assert_eq!(result["readiness"]["program.flash"]["static_ready"], false);
+        assert!(
+            result["readiness"]["program.flash"]["missing"]
+                .as_array()
+                .expect("missing fields")
+                .contains(&json!("profile.loader_ram"))
+        );
+        assert!(!root.path().join("leases").exists());
+
+        let schema = &tool_catalog()[0]["outputSchema"];
+        let mut malformed = result.clone();
+        malformed["readiness"]["program.flash"]["static_ready"] = json!("true");
+        assert!(!jsonschema::is_valid(schema, &malformed));
+        malformed = result.clone();
+        malformed["readiness"]["program.flash"]["unexpected"] = json!(true);
+        assert!(!jsonschema::is_valid(schema, &malformed));
+    }
 
     #[test]
     fn frame_invalid_remains_a_structured_public_error() {
