@@ -346,7 +346,8 @@ impl HssCoordinator {
             partial_available: false,
             reason: status.reason().map(str::to_owned),
             recoverable: status.recoverable(),
-            recovery_notifications: status.recovery_notifications().to_vec(),
+            // No restart scan occurred when this live admission was rejected.
+            recovery_notifications: Vec::new(),
         };
         let store_result = writer.finish(&snapshot);
         self.terminal.insert(
@@ -1708,17 +1709,13 @@ mod tests {
         assert!(io.calls.is_empty());
         assert!(
             coordinator
-                .status_by_key("never-admitted", Instant::now())
+                .status_by_key("run-fixture", Instant::now())
                 .is_err()
         );
     }
 
     #[test]
     fn recovery_child_exits_without_dropping_admission() {
-        let Some(root) = std::env::var_os("JLINK_TEST_HSS_HARD_EXIT_ROOT") else {
-            return;
-        };
-        let phase = std::env::var("JLINK_TEST_HSS_HARD_EXIT_PHASE").unwrap();
         struct ExitAtFormalStart;
         impl HssIo for ExitAtFormalStart {
             fn start_hss(&mut self, _: &HssStartPlan) -> Result<(), JlinkError> {
@@ -1731,6 +1728,10 @@ mod tests {
                 panic!("hard-exit fixture must never stop");
             }
         }
+        let Some(root) = std::env::var_os("JLINK_TEST_HSS_HARD_EXIT_ROOT") else {
+            return;
+        };
+        let phase = std::env::var("JLINK_TEST_HSS_HARD_EXIT_PHASE").unwrap();
         let mut coordinator =
             HssCoordinator::open(std::path::PathBuf::from(root), "260106173").unwrap();
         let _ = coordinator.start(
@@ -1838,6 +1839,7 @@ mod tests {
         assert_eq!(snapshot.state, HssRunState::Aborted);
         assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
         assert_eq!(snapshot.failure_code, Some(ErrorCode::TargetRecoveryFailed));
+        assert!(snapshot.recovery_notifications.is_empty());
         assert!(!snapshot.partial_available);
         drop(coordinator);
         let recovered = HssCoordinator::open(root.path(), "260106173").unwrap();

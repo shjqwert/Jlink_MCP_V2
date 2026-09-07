@@ -164,7 +164,7 @@ pub enum HssRunState {
     Completed,
     /// Capture cleanup completed after an execution failure.
     Failed,
-    /// A prior process ended without completing the capture.
+    /// Acquisition ended without a confirmed normal hardware completion.
     Aborted,
 }
 
