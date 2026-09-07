@@ -1,4 +1,4 @@
-"""Exact, branch-only final checks and diagnostics corrections."""
+"""Final branch-scoped correction; no target access or release action."""
 from pathlib import Path
 import os
 import subprocess
@@ -8,128 +8,69 @@ if os.environ.get("GITHUB_REF") != "refs/heads/codex/hss-recovery-preflight-fixe
 root = Path.cwd()
 subprocess.run(["git", "fetch", "--no-tags", "--depth=1", "origin", "dfbc9f719b85e1e07d5c28bbb6e7fb4ee2bdb1ab"], check=True)
 changed = []
-
-def replace(path, before, after, count=1):
-    text = (root / path).read_text(encoding="utf-8")
-    if before not in text and after in text:
-        return
-    if text.count(before) != count:
-        raise RuntimeError(f"Source anchor mismatch in {path}: {before[:120]!r}")
-    (root / path).write_text(text.replace(before, after), encoding="utf-8", newline="\n")
-    changed.append(path)
-
-replace("crates/jlink-mcp/src/worker_diagnostics.rs", "fn diagnostic_error(error: io::Error)", "fn diagnostic_error(error: &io::Error)")
-replace("crates/jlink-mcp/src/worker_diagnostics.rs", ".map_err(diagnostic_error)?", ".map_err(|error| diagnostic_error(&error))?", 2)
-replace("crates/jlink-mcp/src/worker_client.rs", '''    let stderr = child
-        .stderr
-        .take()
-        .expect("Worker was spawned with piped stderr");''', '''    let Some(stderr) = child.stderr.take() else {
-        // A newly spawned process has not received a target request yet.
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(JlinkError::new(
-            ErrorCode::WorkerUnavailable,
-            "New Worker did not expose the requested diagnostic pipe",
-            false,
-        ));
-    };''')
-
-HARD_EXIT_TESTS = r'''
-
-    #[test]
-    fn recovery_child_exits_without_dropping_admission() {
-        let Some(root) = std::env::var_os("JLINK_TEST_HSS_HARD_EXIT_ROOT") else {
+path = "crates/jlink-worker/src/hss.rs"
+text = (root / path).read_text(encoding="utf-8")
+original = text
+lookup = '''        let Some(root) = std::env::var_os("JLINK_TEST_HSS_HARD_EXIT_ROOT") else {
             return;
         };
         let phase = std::env::var("JLINK_TEST_HSS_HARD_EXIT_PHASE").unwrap();
-        struct ExitAtFormalStart;
-        impl HssIo for ExitAtFormalStart {
-            fn start_hss(&mut self, _: &HssStartPlan) -> Result<(), JlinkError> {
-                std::process::exit(71);
-            }
-            fn read_hss(&mut self, _: &mut [u8], _: usize) -> Result<HssReadOutcome, JlinkError> {
-                panic!("hard-exit fixture must never drain");
-            }
-            fn stop_hss(&mut self) -> Result<(), JlinkError> {
-                panic!("hard-exit fixture must never stop");
-            }
-        }
-        let mut coordinator = HssCoordinator::open(std::path::PathBuf::from(root), "260106173").unwrap();
-        let _ = coordinator.start(
-            "260106173", &target(), start_plan(), TEST_CAPTURE_MAX_BYTES,
-            &mut ExitAtFormalStart,
-            |_| {
-                if phase == "preflight" {
-                    // process::exit does not unwind or flush the Rust BufWriter.
-                    std::process::exit(71);
-                }
-                assert_eq!(phase, "formal_start");
-                Ok(rate_assessment())
-            },
-        );
-        panic!("hard-exit fixture unexpectedly returned");
-    }
-
-    #[test]
-    fn recovery_survives_process_exit_without_destructors_in_both_start_phases() {
-        for phase in ["preflight", "formal_start"] {
-            let root = tempfile::tempdir().unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "hss::tests::recovery_child_exits_without_dropping_admission", "--nocapture"])
-                .env("JLINK_TEST_HSS_HARD_EXIT_ROOT", root.path())
-                .env("JLINK_TEST_HSS_HARD_EXIT_PHASE", phase)
-                .output().unwrap();
-            assert_eq!(output.status.code(), Some(71), "{}", String::from_utf8_lossy(&output.stderr));
-            let mut recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
-            let plan = start_plan();
-            let snapshot = recovered.status_by_key(plan.capture_key(), Instant::now()).unwrap();
-            assert_eq!(snapshot.state, HssRunState::Aborted);
-            assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
-            assert_eq!(snapshot.complete_records, 0);
-            assert!(!snapshot.partial_available);
-            assert!(snapshot.reason.as_deref().unwrap().contains(&format!("{phase}_pending")));
-            assert_eq!(recovered.status(&snapshot.capture_id, Instant::now()).unwrap(), snapshot);
-            let mut io = ScriptedHss::healthy([]);
-            let error = recovered.start(
-                "260106173", &target(), plan, TEST_CAPTURE_MAX_BYTES, &mut io,
-                |_| panic!("historical lookup must not permit a new native stream"),
-            ).unwrap_err();
-            assert_eq!(error.code, ErrorCode::CaptureKeyConflict);
-            assert!(io.calls.is_empty());
-        }
-    }
-
-    #[test]
-    fn recovery_uncertain_preflight_cleanup_remains_aborted_unknown() {
-        let (root, mut coordinator) = open_coordinator();
-        let plan = start_plan();
-        let mut io = ScriptedHss::healthy([]);
-        let error = coordinator.start(
-            "260106173", &target(), plan.clone(), TEST_CAPTURE_MAX_BYTES, &mut io,
-            |_| Err(JlinkError::new(ErrorCode::TargetRecoveryFailed, "temporary Stop unconfirmed", false)),
-        ).unwrap_err();
-        assert_eq!(error.code, ErrorCode::TargetRecoveryFailed);
-        assert!(!error.retryable);
-        let snapshot = coordinator.status_by_key(plan.capture_key(), Instant::now()).unwrap();
-        assert_eq!(snapshot.state, HssRunState::Aborted);
-        assert_eq!(snapshot.integrity, HssDataIntegrity::Unknown);
-        assert_eq!(snapshot.failure_code, Some(ErrorCode::TargetRecoveryFailed));
-        assert!(!snapshot.partial_available);
-        drop(coordinator);
-        let recovered = HssCoordinator::open(root.path(), "260106173").unwrap();
-        assert_eq!(recovered.status_by_key(plan.capture_key(), Instant::now()).unwrap(), snapshot);
-    }
 '''
-path = "crates/jlink-worker/src/hss.rs"
-text = (root / path).read_text(encoding="utf-8")
-if "fn recovery_survives_process_exit_without_destructors_in_both_start_phases()" not in text:
-    if not text.rstrip().endswith("}") or "mod tests {" not in text:
-        raise RuntimeError("Expected inline HSS test module")
-    text = text.rstrip()[:-1] + HARD_EXIT_TESTS + "}\n"
+start = text.index("    fn recovery_child_exits_without_dropping_admission() {")
+end = text.index("    #[test]", start)
+block = text[start:end]
+if block.count(lookup) != 1:
+    raise RuntimeError("Expected the exact child environment guard")
+block = block.replace(lookup, "", 1)
+anchor = "        let mut coordinator =\n            HssCoordinator::open(std::path::PathBuf::from(root), \"260106173\").unwrap();"
+if block.count(anchor) != 1:
+    raise RuntimeError("Expected the exact child coordinator setup")
+block = block.replace(anchor, lookup + anchor, 1)
+text = text[:start] + block + text[end:]
+
+# This is a live admission failure, not evidence that a restart scan occurred.
+start = text.index("    fn record_start_failure(")
+end = text.index("    /// Drains once", start)
+block = text[start:end]
+old = "            recovery_notifications: status.recovery_notifications().to_vec(),"
+new = """            // No restart scan occurred when this live admission was rejected.
+            recovery_notifications: Vec::new(),"""
+if old in block:
+    if block.count(old) != 1:
+        raise RuntimeError("Ambiguous start-failure notification field")
+    block = block.replace(old, new, 1)
+elif new not in block:
+    raise RuntimeError("Unexpected start-failure notification field")
+text = text[:start] + block + text[end:]
+
+start = text.index("    fn recovery_uncertain_preflight_cleanup_remains_aborted_unknown() {")
+block = text[start:]
+anchor = "        assert_eq!(snapshot.failure_code, Some(ErrorCode::TargetRecoveryFailed));"
+assertion = anchor + "\n        assert!(snapshot.recovery_notifications.is_empty());"
+if assertion not in block:
+    if block.count(anchor) != 1:
+        raise RuntimeError("Expected the uncertain-start fixture assertion")
+    block = block.replace(anchor, assertion, 1)
+text = text[:start] + block
+text = text.replace('status_by_key("never-admitted", Instant::now())', 'status_by_key("run-fixture", Instant::now())')
+if text != original:
     (root / path).write_text(text, encoding="utf-8", newline="\n")
     changed.append(path)
 
+# Clarify existing wire-state documentation; the serialized state enum is unchanged.
+path = "crates/jlink-domain/src/hss.rs"
+text = (root / path).read_text(encoding="utf-8")
+old = "    /// A prior process ended without completing the capture.\n    Aborted,"
+new = "    /// Acquisition ended without a confirmed normal hardware completion.\n    Aborted,"
+if old in text:
+    if text.count(old) != 1:
+        raise RuntimeError("Ambiguous aborted-state documentation")
+    (root / path).write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+    changed.append(path)
+elif new not in text:
+    raise RuntimeError("Unexpected aborted-state documentation")
+
 (root / "target").mkdir(exist_ok=True)
 (root / "target" / "hss-repair-paths.txt").write_text(
-    "\n".join(sorted(set(changed)) or [path]) + "\n", encoding="utf-8")
-print("Final correction paths:", changed)
+    "\n".join(changed or ["crates/jlink-worker/src/hss.rs"]) + "\n", encoding="utf-8")
+print("Corrected paths:", changed)
