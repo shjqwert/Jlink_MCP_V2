@@ -1,0 +1,83 @@
+name: Branch-scoped HSS recovery repair
+
+on:
+  push:
+    branches: [codex/hss-recovery-preflight-fixes]
+    paths: [scripts/apply-hss-recovery-fixes.py]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: hss-recovery-repair
+  cancel-in-progress: false
+
+jobs:
+  repair:
+    if: github.ref == 'refs/heads/codex/hss-recovery-preflight-fixes'
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+      - name: Install repository-pinned Rust
+        shell: pwsh
+        run: |
+          $channel = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"').Matches.Groups[1].Value
+          rustup toolchain install $channel --profile minimal --component rustfmt --component clippy
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned Rust installation failed' }
+      - name: Apply the baseline-checked repair
+        shell: pwsh
+        run: |
+          python scripts/apply-hss-recovery-fixes.py
+          if ($LASTEXITCODE -ne 0) { throw 'Repair application failed' }
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'Formatting failed' }
+          $paths = @(Get-Content target/hss-repair-paths.txt)
+          git add -- $paths
+          if ($LASTEXITCODE -ne 0) { throw 'Staging failed' }
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'Diff check failed' }
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'fix: recover HSS admission and improve preflight and diagnostics'
+          if ($LASTEXITCODE -ne 0) { throw 'Repair commit failed' }
+          git push origin HEAD:refs/heads/codex/hss-recovery-preflight-fixes
+          if ($LASTEXITCODE -ne 0) { throw 'Fast-forward repair push failed; no force push attempted' }
+          git rev-parse HEAD | Set-Content target/hss-repair-tested-sha.txt
+      - name: Targeted HSS and capture regressions
+        shell: pwsh
+        run: |
+          cargo test --locked -p jlink-worker hss::
+          if ($LASTEXITCODE -ne 0) { throw 'HSS regressions failed' }
+          cargo test --locked -p jlink-capture store::
+          if ($LASTEXITCODE -ne 0) { throw 'Capture Store regressions failed' }
+          cargo test --locked -p jlink-mcp config::
+          if ($LASTEXITCODE -ne 0) { throw 'Readiness regressions failed' }
+          cargo test --locked -p jlink-mcp worker_client::
+          if ($LASTEXITCODE -ne 0) { throw 'Worker diagnostic regressions failed' }
+      - name: Firmware helper regressions on Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          ./scripts/test-firmware-workflow.ps1
+      - name: Complete non-hardware workspace gate
+        shell: pwsh
+        run: |
+          ./scripts/check-workspace.ps1
+      - name: Save bounded validation evidence
+        if: always()
+        shell: pwsh
+        env:
+          REPAIR_JOB_STATUS: ${{ job.status }}
+        run: |
+          New-Item -ItemType Directory -Force target/repair-evidence | Out-Null
+          git rev-parse HEAD | Set-Content target/repair-evidence/source-sha.txt
+          git diff dfbc9f719b85e1e07d5c28bbb6e7fb4ee2bdb1ab -- crates scripts plugins README.md INSTALL.md | Set-Content target/repair-evidence/source.diff
+          @{ job_status = $env:REPAIR_JOB_STATUS; hardware_tests_executed = $false; release_published = $false } | ConvertTo-Json | Set-Content target/repair-evidence/status.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: hss-recovery-repair-evidence
+          retention-days: 7
+          path: target/repair-evidence/
