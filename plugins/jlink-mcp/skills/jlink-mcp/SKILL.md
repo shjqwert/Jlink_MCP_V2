@@ -42,6 +42,12 @@ firmware design, budget the combined payload and run offline `hss.plan` once the
 ELF/selectors exist. The current payload limit is 40 bytes excluding the timestamp.
 Do not start HSS just to discover its static limits.
 
+Before programming, explicitly `target.connect` to establish the retained,
+validated session. A successful standalone `target.validate` is not that session:
+while disconnected it requires `after: run` or `halt`, performs a temporary
+diagnostic connection, and disconnects afterward. During an existing connection,
+omit `after` when validating; successful connect evidence can be reused.
+
 For DWARF writes/HSS, the final ELF must retain `__jlink_mcp_identity` in loaded,
 read-only Flash. Its bytes are `JLID`, format byte `1`, one-byte ASCII build-ID
 length N, then N printable ASCII bytes; N is 1..58 and total size is at most 64.
