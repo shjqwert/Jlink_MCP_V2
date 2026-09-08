@@ -5,6 +5,15 @@ description: Use jlink_mcp with one local SEGGER J-Link ARM Cortex-M target for 
 
 # J-Link MCP
 
+## Task authorization
+
+Apply this routing within current user, project and application authorization.
+Reuse permission already established for the same target and unchanged operation
+scope; do not add a confirmation for each call. A missing permission or uncertain
+side effect blocks only dependent device work. Continue safe, independent offline
+analysis and identify the exact rule when it requires a pause. Preserve all device
+ownership, firmware identity and non-replay constraints below.
+
 ## Device ownership and memory
 
 Use one named logical device operator for the current target: the primary session

@@ -3,7 +3,6 @@
 
 # Local development context and generated indexes are not release sources.
 /.agent/
-/AGENTS.md
 /.gitmessage
 /.codegraph/
 /.serena/
