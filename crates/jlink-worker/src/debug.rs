@@ -37,17 +37,8 @@ pub(crate) fn execute_debug(
     request: DebugRequest,
 ) -> Result<DebugResult, JlinkError> {
     session.ensure_debug_allowed(target, &request)?;
-    match &request {
-        DebugRequest::ReadVariable { firmware, .. } => {
-            ensure_firmware_identity(session, gateway, target, firmware, false)?;
-        }
-        DebugRequest::WriteVariable { firmware, .. } => {
-            ensure_firmware_identity(session, gateway, target, firmware, true)?;
-        }
-        DebugRequest::ReadMemory { .. }
-        | DebugRequest::WriteMemory { .. }
-        | DebugRequest::ReadRegister { .. }
-        | DebugRequest::WriteRegister { .. } => {}
+    if let DebugRequest::WriteVariable { firmware, .. } = &request {
+        ensure_firmware_identity(session, gateway, target, firmware, true)?;
     }
     match request {
         DebugRequest::ReadMemory { range } => {
@@ -62,7 +53,10 @@ pub(crate) fn execute_debug(
             let memory_map = gateway.device_memory_map(target.device())?;
             write_memory(gateway, &memory_map, address, &data, verify)
         }
-        DebugRequest::ReadVariable { plan, .. } => {
+        DebugRequest::ReadVariable { plan, firmware } => {
+            let firmware_verified =
+                ensure_firmware_identity(session, gateway, target, &firmware, false)?
+                    == FirmwareIdentityStrength::Strong;
             let memory_map = gateway.device_memory_map(target.device())?;
             let range = MemoryRange::new(plan.address(), plan.byte_size())?;
             memory_map.classify(range)?;
@@ -71,7 +65,10 @@ pub(crate) fn execute_debug(
             })?;
             let data = gateway.read_bytes(plan.address(), length)?;
             let value = decode_typed_value(&plan, &data)?;
-            Ok(DebugResult::Variable { value })
+            Ok(DebugResult::Variable {
+                value,
+                firmware_verified,
+            })
         }
         DebugRequest::WriteVariable {
             plan,
@@ -167,14 +164,14 @@ pub(crate) fn ensure_firmware_identity(
     require_strong: bool,
 ) -> Result<FirmwareIdentityStrength, JlinkError> {
     firmware.validate()?;
+    if session.firmware_identity_cached(target, firmware) {
+        return Ok(FirmwareIdentityStrength::Strong);
+    }
     if firmware.strength() == FirmwareIdentityStrength::Weak {
         if require_strong {
             firmware.ensure_strong()?;
         }
         return Ok(FirmwareIdentityStrength::Weak);
-    }
-    if session.firmware_identity_cached(target, firmware) {
-        return Ok(FirmwareIdentityStrength::Strong);
     }
     session.ensure_firmware_identity_read_allowed()?;
     let expected = firmware.ensure_strong()?;

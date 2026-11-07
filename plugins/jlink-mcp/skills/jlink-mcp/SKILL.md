@@ -61,8 +61,14 @@ while disconnected it requires `after: run` or `halt`, performs a temporary
 diagnostic connection, and disconnects afterward. During an existing connection,
 omit `after` when validating; successful connect evidence can be reused.
 
-For DWARF writes/HSS, the final ELF must retain `__jlink_mcp_identity` in loaded,
-read-only Flash. Its bytes are `JLID`, format byte `1`, one-byte ASCII build-ID
+For DWARF writes and HSS start, configure `symbols.elf` before verified flash or
+standalone verify. If the verified image covers the ELF load bytes at the same
+addresses, the Worker can reuse the match for this connection. After reconnect,
+Flash modification or a changed ELF, establish matching evidence again.
+Offline HSS plan needs the ELF and selectors without target identity evidence.
+
+An optional `__jlink_mcp_identity` in loaded, read-only Flash provides a fast
+match when attaching to an already programmed board. Its bytes are `JLID`, format byte `1`, one-byte ASCII build-ID
 length N, then N printable ASCII bytes; N is 1..58 and total size is at most 64.
 Use `scripts/new-firmware-identity.ps1` from the complete package to generate the
 array without a hand-maintained length. GCC/Clang section GC also needs the linker
@@ -174,7 +180,7 @@ follow-up inspect call. Inspect is current state; HSS query is historical data.
 guidance; `start` uses the same planner. Raw-address selectors are explicit
 address/type/length/endianness evidence restricted to declared readable RAM. They
 are not DWARF variables and must not receive symbol semantics. DWARF selectors
-require strong firmware identity. Requested rate is not achieved rate: report
+require matching firmware evidence at start. Requested rate is not achieved rate: report
 actual samples and quality fields. Without independent overflow/sequence evidence,
 never claim that no samples were lost.
 Rate assessment can be reused only in the same gateway/connection with matching
@@ -182,8 +188,10 @@ target, firmware identity, variable addresses/layout and capabilities. Writes,
 execution control and reconnect invalidate it. `rate_assessment.reused` exposes
 reuse; its recommended ceiling is a conservative short-window estimate, not a
 measured absolute maximum.
-`actual_rate_millihz` is derived from source timestamps, not an independent host
-rate measurement. `source_host_clock_mismatch` invalidates period/runtime use:
+`source_rate_millihz` and its legacy alias `actual_rate_millihz` use source
+timestamps. `host_arrival_rate_millihz` measures complete frames between live
+host reads, excluding tail reads. It does not establish individual sampling
+times. `source_host_clock_mismatch` invalidates period/runtime use:
 preserve the raw records and both clocks; do not truncate or rescale to match the
 requested duration.
 

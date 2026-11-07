@@ -1591,6 +1591,8 @@ fn hss_quality_definition() -> Value {
             ("expected_samples", non_negative_integer()),
             ("actual_samples", non_negative_integer()),
             ("actual_rate_millihz", non_negative_integer()),
+            ("source_rate_millihz", non_negative_integer()),
+            ("host_arrival_rate_millihz", non_negative_integer()),
             ("rate_assessment", Value::Bool(true)),
             ("intervals", hss_interval_schema()),
             ("loss", hss_assessment_schema("lost_samples")),

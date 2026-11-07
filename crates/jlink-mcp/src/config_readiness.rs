@@ -66,7 +66,7 @@ impl ConfigInspection {
         let live_checks = "DLL identity and live target/session checks have not been performed";
         let image_checks = "image must be supplied by request or configuration; parsing and Flash range checks remain pending";
         let symbol_checks = "ELF/DWARF parsing and selector resolution remain pending";
-        let identity_checks = "strong firmware identity is required; format and target readback checks remain pending";
+        let identity_checks = "strong firmware identity is required; use verified image coverage or an ELF identity block";
         let hss_checks = format!(
             "run hss.plan with the intended selectors; combined sample payload must not exceed {} bytes (timestamp excluded)",
             jlink_domain::HSS_MAX_EXPANDED_SAMPLE_BYTES
@@ -125,7 +125,7 @@ impl ConfigInspection {
             &mut readiness,
             "hss.plan.dwarf",
             dwarf_plan,
-            &[symbol_checks, identity_checks, &hss_checks],
+            &[symbol_checks, &hss_checks],
         );
         insert(
             &mut readiness,

@@ -289,6 +289,9 @@ pub enum ProgramRequest {
         base_address: Option<u64>,
         /// Whether to compare every programmed segment with target readback.
         verify: bool,
+        /// Optional symbol ELF to associate with a successful image verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbols_elf: Option<PathBuf>,
         /// Explicit final target state policy.
         after: ProgramAfter,
         /// Final Profile-selected Loader RAM used for the no-Flash preflight.
@@ -313,6 +316,9 @@ pub enum ProgramRequest {
         /// Required only for a raw BIN image.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         base_address: Option<u64>,
+        /// Optional symbol ELF to associate with a successful image verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        symbols_elf: Option<PathBuf>,
     },
 }
 

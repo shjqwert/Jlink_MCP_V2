@@ -351,6 +351,9 @@ pub enum DebugResult {
     Variable {
         /// Decoded value without request or type metadata.
         value: Value,
+        /// Whether the Worker verified the ELF against the connected target.
+        #[serde(default)]
+        firmware_verified: bool,
     },
     /// One lossless 32-bit core-register value.
     Register {

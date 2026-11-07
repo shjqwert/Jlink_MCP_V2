@@ -1,9 +1,10 @@
 use std::{fs, path::Path};
 
 use jlink_domain::{
-    ErrorCode, FirmwareImage, FlashModifiedState, JlinkError, ProgramExecutionFacts,
-    ProgramRequest, ProgramStage, TargetConnectionSpec, TargetState, ValidationInvalidation,
-    VerifyMismatchAccumulator, validate_flash_range, validate_image_flash_ranges,
+    ErrorCode, FirmwareIdentityPlan, FirmwareImage, FlashModifiedState, JlinkError,
+    ProgramExecutionFacts, ProgramRequest, ProgramStage, TargetConnectionSpec, TargetState,
+    ValidationInvalidation, VerifyMismatchAccumulator, validate_flash_range,
+    validate_image_flash_ranges,
 };
 
 use crate::{gateway::DllGateway, session::TargetSessionManager};
@@ -25,6 +26,7 @@ pub(crate) fn execute_program(
             image,
             base_address,
             verify,
+            symbols_elf,
             after,
             loader_ram,
         } => {
@@ -32,6 +34,9 @@ pub(crate) fn execute_program(
             let image = read_image(&image, base_address)?;
             let regions = gateway.device_flash_regions(target.device())?;
             validate_image_flash_ranges(&image, &regions)?;
+            let firmware = verify
+                .then(|| verified_symbol_plan(symbols_elf.as_deref(), &image))
+                .flatten();
             let mut facts = ProgramExecutionFacts::new();
             if let Err(error) = gateway.program_image(&image, loader_ram, &mut facts) {
                 return handle_program_failure(session, gateway, facts, error);
@@ -65,6 +70,9 @@ pub(crate) fn execute_program(
             facts.last_completed_stage = Some(ProgramStage::FinalState);
             facts.last_trusted_target_state = Some(state);
             session.record_program_state(state);
+            if let Some(firmware) = firmware {
+                session.record_firmware_identity(target, &firmware);
+            }
             Ok(())
         }
         ProgramRequest::Erase {
@@ -97,27 +105,52 @@ pub(crate) fn execute_program(
         ProgramRequest::Verify {
             image,
             base_address,
+            symbols_elf,
         } => {
             let image = read_image(&image, base_address)?;
             let regions = gateway.device_flash_regions(target.device())?;
             validate_image_flash_ranges(&image, &regions)?;
-            let mut facts = ProgramExecutionFacts::new();
-            facts.current_stage = ProgramStage::RangeVerification;
-            if let Err(error) = verify_image(gateway, &image) {
-                let state = gateway
-                    .observe_target_state()
-                    .unwrap_or(TargetState::Unknown);
-                facts.last_trusted_target_state = Some(state);
-                session.record_program_state(state);
-                return Err(facts.known_error(error));
-            }
-            facts.last_completed_stage = Some(ProgramStage::RangeVerification);
-            let state = gateway.observe_target_state()?;
-            facts.last_trusted_target_state = Some(state);
-            session.record_program_state(state);
-            Ok(())
+            verify_program_request(session, gateway, target, &image, symbols_elf.as_deref())
         }
     }
+}
+
+fn verify_program_request(
+    session: &mut TargetSessionManager,
+    gateway: &mut DllGateway,
+    target: &TargetConnectionSpec,
+    image: &FirmwareImage,
+    symbols_elf: Option<&Path>,
+) -> Result<(), JlinkError> {
+    let firmware = verified_symbol_plan(symbols_elf, image);
+    session.clear_firmware_identity();
+    let mut facts = ProgramExecutionFacts::new();
+    facts.current_stage = ProgramStage::RangeVerification;
+    if let Err(error) = verify_image(gateway, image) {
+        let state = gateway
+            .observe_target_state()
+            .unwrap_or(TargetState::Unknown);
+        facts.last_trusted_target_state = Some(state);
+        session.record_program_state(state);
+        return Err(facts.known_error(error));
+    }
+    session.record_program_state(gateway.observe_target_state()?);
+    if let Some(firmware) = firmware {
+        session.record_firmware_identity(target, &firmware);
+    }
+    Ok(())
+}
+
+fn verified_symbol_plan(
+    path: Option<&Path>,
+    image: &FirmwareImage,
+) -> Option<FirmwareIdentityPlan> {
+    let elf = read_image(path?, None).ok()?;
+    // The caller already validated every byte of image against the device Flash map.
+    if !elf.is_covered_by(image) {
+        return None;
+    }
+    elf.symbol_identity_plan().ok()
 }
 
 fn handle_program_failure(

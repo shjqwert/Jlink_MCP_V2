@@ -138,6 +138,27 @@ impl FirmwareImage {
         &self.segments
     }
 
+    /// Checks that every load byte in this image is present at the same
+    /// address in an already normalized image.
+    #[must_use]
+    pub fn is_covered_by(&self, image: &Self) -> bool {
+        self.segments.iter().all(|expected| {
+            let index = image
+                .segments
+                .partition_point(|segment| segment.address <= expected.address);
+            index.checked_sub(1).is_some_and(|index| {
+                let segment = &image.segments[index];
+                let Ok(offset) = usize::try_from(expected.address - segment.address) else {
+                    return false;
+                };
+                segment
+                    .data
+                    .get(offset..)
+                    .is_some_and(|bytes| bytes.starts_with(&expected.data))
+            })
+        })
+    }
+
     /// Creates the read-only target identity plan for a symbol ELF.
     ///
     /// # Errors
@@ -371,7 +392,7 @@ impl FirmwareIdentityPlan {
         }
     }
 
-    /// Rejects a mutating or symbol-capture operation unless strong identity exists.
+    /// Returns the identity block for verification using the marker path.
     ///
     /// # Errors
     ///
@@ -383,12 +404,12 @@ impl FirmwareIdentityPlan {
             JlinkError::new(
                 ErrorCode::FirmwareIdentityUnknown,
                 format!(
-                    "符号 ELF 缺少 {FIRMWARE_IDENTITY_SYMBOL}，变量写入和符号 HSS 要求强固件身份"
+                    "符号 ELF 缺少 {FIRMWARE_IDENTITY_SYMBOL}，且当前连接没有匹配证据；配置 symbols.elf 后执行带校验的 flash 或 verify"
                 ),
                 false,
             )
             .with_detail("identity_strength", json!("weak"))
-            .with_detail("required_symbol", json!(FIRMWARE_IDENTITY_SYMBOL))
+            .with_detail("optional_identity_symbol", json!(FIRMWARE_IDENTITY_SYMBOL))
             .with_detail("maximum_bytes", json!(MAX_FIRMWARE_IDENTITY_BYTES))
         })
     }
@@ -884,6 +905,30 @@ fn is_sha256(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn verified_image_must_cover_every_load_byte_at_its_address() {
+        let elf = FirmwareImage {
+            format: FirmwareFormat::Elf,
+            sha256: "ab".repeat(32),
+            segments: vec![
+                segment(0x100, vec![2, 3]).unwrap(),
+                segment(0x200, vec![5]).unwrap(),
+            ],
+            has_dwarf: true,
+            identity_block: None,
+        };
+        let mut image = elf.clone();
+        image.segments[0] = segment(0xff, vec![1, 2, 3, 4]).unwrap();
+        assert!(elf.is_covered_by(&image));
+
+        image.segments[1] = segment(0x201, vec![5]).unwrap();
+        assert!(!elf.is_covered_by(&image));
+        image.segments[1] = segment(0x200, vec![6]).unwrap();
+        assert!(!elf.is_covered_by(&image));
+        image.segments.pop();
+        assert!(!elf.is_covered_by(&image));
+    }
+
     fn strong_plan() -> FirmwareIdentityPlan {
         let bytes = [b'J', b'L', b'I', b'D', 1, 5, b'b', b'u', b'i', b'l', b'd'];
         FirmwareIdentityPlan {
@@ -917,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn weak_identity_allows_validation_but_not_mutating_or_hss_use() {
+    fn weak_identity_validates_without_an_identity_block() {
         let plan = FirmwareIdentityPlan {
             elf_sha256: "ab".repeat(32),
             identity_block: None,
@@ -931,7 +976,7 @@ mod tests {
             .expect_err("strong identity is required");
         assert_eq!(error.code, ErrorCode::FirmwareIdentityUnknown);
         assert_eq!(
-            error.details.expect("identity details")["required_symbol"],
+            error.details.expect("identity details")["optional_identity_symbol"],
             json!(FIRMWARE_IDENTITY_SYMBOL)
         );
     }

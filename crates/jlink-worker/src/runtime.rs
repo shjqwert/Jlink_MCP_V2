@@ -1069,6 +1069,7 @@ mod tests {
         .expect("target spec");
         let flash = ProgramRequest::Flash {
             image: PathBuf::from("firmware.bin"),
+            symbols_elf: None,
             base_address: Some(0),
             verify: true,
             after: ProgramAfter::ResetRun,

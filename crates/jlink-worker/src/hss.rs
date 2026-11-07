@@ -774,11 +774,15 @@ fn drain_once<I: HssIo>(
         .incomplete_tail
         .extend_from_slice(&active.buffer[..read]);
     let complete_bytes = active.incomplete_tail.len() / record_bytes * record_bytes;
+    let previous_complete_records = active.complete_records;
     active.complete_records = active.quality.observe_complete_records(
         active.plan.frame_layout(),
         &active.incomplete_tail[..complete_bytes],
         host_elapsed_us,
     )?;
+    if phase == CapturePhase::Live && active.complete_records > previous_complete_records {
+        active.quality.record_live_arrival(host_elapsed_us);
+    }
     let tail = active.incomplete_tail.split_off(complete_bytes);
     active.incomplete_tail = tail;
     if let Some(index) = active.pending_write_impact.take() {

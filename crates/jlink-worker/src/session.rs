@@ -306,9 +306,13 @@ impl TargetSessionManager {
         });
     }
 
+    pub(crate) fn clear_firmware_identity(&mut self) {
+        self.firmware_identity = None;
+    }
+
     /// Records a confirmed Flash mutation before any fallible verification or post-action.
     pub(crate) fn record_flash_modified(&mut self) {
-        self.firmware_identity = None;
+        self.clear_firmware_identity();
         self.running_background_access = None;
         self.last_invalidation = Some(ValidationInvalidation::FlashModified);
     }

@@ -665,9 +665,15 @@ pub struct HssQualitySummary {
     pub expected_samples: u64,
     /// Number of complete source records actually observed.
     pub actual_samples: u64,
-    /// Rate derived from source timestamp span, in milli-hertz.
+    /// Compatibility name for the rate derived from source timestamps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actual_rate_millihz: Option<u64>,
+    /// Rate derived from the source timestamp span, in milli-hertz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_rate_millihz: Option<u64>,
+    /// Complete frame arrivals between live host reads, in milli-hertz.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_arrival_rate_millihz: Option<u64>,
     /// Short-window acceptance evidence captured before the real stream.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_assessment: Option<HssRateAssessment>,
@@ -703,6 +709,8 @@ impl Default for HssQualitySummary {
             expected_samples: 0,
             actual_samples: 0,
             actual_rate_millihz: None,
+            source_rate_millihz: None,
+            host_arrival_rate_millihz: None,
             rate_assessment: None,
             intervals: HssIntervalStatistics::default(),
             loss: HssLossAssessment {
@@ -742,6 +750,8 @@ pub struct HssQualityTracker {
     previous_timestamp_us: Option<u64>,
     previous_slot: Option<u64>,
     last_host_elapsed_us: u64,
+    first_live_arrival: Option<(u64, u64)>,
+    last_live_arrival: Option<(u64, u64)>,
     source_host_clock_mismatch: bool,
 }
 
@@ -773,6 +783,8 @@ impl HssQualityTracker {
             previous_timestamp_us: None,
             previous_slot: None,
             last_host_elapsed_us: 0,
+            first_live_arrival: None,
+            last_live_arrival: None,
             source_host_clock_mismatch: false,
         }
     }
@@ -837,6 +849,13 @@ impl HssQualityTracker {
         Ok(self.summary.actual_samples)
     }
 
+    /// Records the host completion time of a live read with new complete frames.
+    pub fn record_live_arrival(&mut self, host_elapsed_us: u64) {
+        let arrival = (host_elapsed_us, self.summary.actual_samples);
+        self.first_live_arrival.get_or_insert(arrival);
+        self.last_live_arrival = Some(arrival);
+    }
+
     /// Records a direct overflow indication from an ABI that exposes one.
     pub fn record_confirmed_overflow(
         &mut self,
@@ -881,7 +900,7 @@ impl HssQualityTracker {
             .first_timestamp_us
             .zip(summary.clock.last_timestamp_us)
             .and_then(|(first, last)| last.checked_sub(first));
-        summary.actual_rate_millihz = (summary.intervals.regressions == 0)
+        summary.source_rate_millihz = (summary.intervals.regressions == 0)
             .then_some(timestamp_span)
             .flatten()
             .and_then(|span| {
@@ -892,6 +911,16 @@ impl HssQualityTracker {
                         .saturating_mul(1_000_000_000)
                         / span
                 })
+            });
+        summary.actual_rate_millihz = summary.source_rate_millihz;
+        summary.host_arrival_rate_millihz = self
+            .first_live_arrival
+            .zip(self.last_live_arrival)
+            .and_then(|((first_us, first_count), (last_us, last_count))| {
+                last_count
+                    .saturating_sub(first_count)
+                    .saturating_mul(1_000_000_000)
+                    .checked_div(last_us.saturating_sub(first_us))
             });
         if final_tail_bytes > 0 {
             aggregate_quality_event(
@@ -2196,7 +2225,8 @@ impl HssStartPlan {
     /// Validates and normalizes a mixed DWARF/raw selector request.
     ///
     /// Raw selectors remain explicitly classified and do not require an ELF;
-    /// every DWARF selector requires the same strong firmware identity.
+    /// every DWARF selector requires the same ELF identity plan. The Worker
+    /// verifies the target when acquisition starts.
     ///
     /// # Errors
     ///
@@ -2234,8 +2264,7 @@ impl HssStartPlan {
         if requires_firmware {
             firmware
                 .as_ref()
-                .ok_or_else(|| hss_value_invalid("DWARF HSS selector 缺少符号 ELF 身份计划"))?
-                .ensure_strong()?;
+                .ok_or_else(|| hss_value_invalid("DWARF HSS selector 缺少符号 ELF 身份计划"))?;
         }
 
         let mut sample_offset = 0_u32;
@@ -3009,6 +3038,34 @@ mod tests {
                 .and_then(|details| details.get("expanded_sample_bytes")),
             Some(&json!(41))
         );
+    }
+
+    #[test]
+    fn host_arrival_rate_uses_live_read_boundaries_and_excludes_tail() {
+        let plan = raw_plan(100);
+        let mut tracker = HssQualityTracker::new(&plan, 1_000);
+        let records: Vec<u8> = (0_u32..601)
+            .flat_map(|index| [(index * 10).to_le_bytes(), index.to_le_bytes()].concat())
+            .collect();
+        let layout = plan.frame_layout();
+        tracker
+            .observe_complete_records(layout, &records[..80], 50_000)
+            .unwrap();
+        tracker.record_live_arrival(50_000);
+        assert_eq!(tracker.summary(0).host_arrival_rate_millihz, None);
+        tracker
+            .observe_complete_records(layout, &records[80..4_800], 4_966_666)
+            .unwrap();
+        tracker.record_live_arrival(4_966_666);
+        tracker
+            .observe_complete_records(layout, &records[4_800..], 5_000_000)
+            .unwrap();
+        let quality = tracker.summary(0);
+        assert_eq!(quality.actual_samples, 601);
+        assert_eq!(quality.source_rate_millihz, Some(100_000));
+        assert_eq!(quality.actual_rate_millihz, quality.source_rate_millihz);
+        assert_eq!(quality.host_arrival_rate_millihz, Some(120_000));
+        assert!(!quality.usable_for_period_estimation);
     }
 
     #[test]

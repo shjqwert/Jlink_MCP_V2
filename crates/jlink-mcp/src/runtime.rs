@@ -587,6 +587,11 @@ impl Runtime {
         let request = match action {
             "flash" => ProgramRequest::Flash {
                 image: program_image_path(arguments, &resolved)?,
+                symbols_elf: resolved
+                    .symbols
+                    .elf
+                    .as_ref()
+                    .map(|field| field.value.clone()),
                 base_address: optional_address(arguments, "base_address")?,
                 verify: arguments
                     .get("verify")
@@ -615,6 +620,11 @@ impl Runtime {
             "verify" => ProgramRequest::Verify {
                 image: program_image_path(arguments, &resolved)?,
                 base_address: optional_address(arguments, "base_address")?,
+                symbols_elf: resolved
+                    .symbols
+                    .elf
+                    .as_ref()
+                    .map(|field| field.value.clone()),
             },
             _ => unreachable!("program action was validated against the closed catalog"),
         };
@@ -1219,7 +1229,7 @@ impl Runtime {
 
     fn inspect_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
-        let identity = match firmware.identity_block() {
+        let mut identity = match firmware.identity_block() {
             Some(block) => json!({
                 "strength": "strong",
                 "elf_sha256": firmware.elf_sha256(),
@@ -1235,10 +1245,21 @@ impl Runtime {
             }),
         };
         match self.execute_debug(&DebugRequest::ReadVariable { plan, firmware })? {
-            DebugResult::Variable { value } => Ok(ToolCall::success(json!({
-                "value": value,
-                "firmware_identity": identity
-            }))),
+            DebugResult::Variable {
+                value,
+                firmware_verified,
+            } => {
+                if firmware_verified && identity["strength"] == "weak" {
+                    identity = json!({
+                        "strength": "strong",
+                        "elf_sha256": identity["elf_sha256"],
+                        "source": "verified_image"
+                    });
+                }
+                Ok(ToolCall::success(
+                    json!({"value": value, "firmware_identity": identity}),
+                ))
+            }
             DebugResult::Memory { .. } | DebugResult::Register { .. } | DebugResult::Written => {
                 Err(debug_response_error(
                     "Worker 对变量读取返回了错误的结果类型",
@@ -1290,7 +1311,6 @@ impl Runtime {
 
     fn write_variable(&mut self, arguments: &Value) -> Result<ToolCall, JlinkError> {
         let (plan, firmware) = self.variable_plan(arguments)?;
-        firmware.ensure_strong()?;
         let request = DebugRequest::WriteVariable {
             plan,
             firmware,
