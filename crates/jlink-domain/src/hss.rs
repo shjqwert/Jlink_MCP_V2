@@ -571,7 +571,8 @@ pub enum HssQualityReasonCode {
     NoIndependentLossEvidence,
 }
 
-/// One short-window capability measurement and conservative acceptance decision.
+/// Historical short-window assessment retained for old capture compatibility.
+/// New captures do not measure throughput or use this decision for admission.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HssRateAssessment {
@@ -933,15 +934,14 @@ impl HssQualityTracker {
             );
         }
         summary.loss = loss_assessment(&summary, final_tail_bytes);
-        let unmatched_gaps = summary
-            .intervals
-            .gap_slots
-            .saturating_sub(summary.intervals.collisions);
+        let source_gap = has_source_timestamp_gap(&summary);
         summary.usable_for_period_estimation = !self.source_host_clock_mismatch
             && summary.actual_samples >= 2
+            && timestamp_span.is_some_and(|span| span > 0)
             && final_tail_bytes == 0
             && summary.intervals.regressions == 0
-            && unmatched_gaps == 0
+            && has_resolved_local_intervals(&summary)
+            && !source_gap
             && summary.overflow.evidence != HssQualityEvidence::Confirmed;
         summary.usable_for_runtime_estimation = summary.usable_for_period_estimation
             && summary.clock.first_timestamp_us.is_some()
@@ -966,7 +966,7 @@ impl HssQualityTracker {
         if summary.intervals.regressions > 0 {
             reasons.push(HssQualityReasonCode::ClockRegression);
         }
-        if unmatched_gaps > 0 {
+        if source_gap {
             reasons.push(HssQualityReasonCode::SourceTimestampGap);
         }
         if summary.overflow.evidence == HssQualityEvidence::Confirmed {
@@ -980,16 +980,11 @@ impl HssQualityTracker {
     /// Returns the strongest integrity conclusion supported by current quality facts.
     #[must_use]
     pub fn integrity(&self, final_tail_bytes: usize) -> HssDataIntegrity {
-        let unmatched_gaps = self
-            .summary
-            .intervals
-            .gap_slots
-            .saturating_sub(self.summary.intervals.collisions);
         if self.source_host_clock_mismatch
             || final_tail_bytes > 0
             || self.summary.overflow.evidence == HssQualityEvidence::Confirmed
             || self.summary.intervals.regressions > 0
-            || unmatched_gaps > 0
+            || has_source_timestamp_gap(&self.summary)
         {
             HssDataIntegrity::Degraded
         } else {
@@ -1132,6 +1127,31 @@ fn aggregate_quality_event(
     });
 }
 
+// Slot counts depend on the phase of the requested grid. A collision elsewhere
+// cannot cancel a long local interval. Quantizing two timestamps to resolution Q
+// can change their difference by less than Q; use integer arithmetic for P = 1/rate.
+fn has_source_timestamp_gap(summary: &HssQualitySummary) -> bool {
+    let rate = u64::from(summary.requested_rate_hz);
+    let resolution = u64::from(summary.clock.source_resolution_us);
+    rate > 0
+        && summary.intervals.max_us.is_some_and(|delta| {
+            delta.saturating_mul(rate) >= 1_000_000 + resolution.saturating_mul(rate)
+        })
+}
+
+// A constant period quantized to Q produces one interval length or two adjacent
+// Q-sized lengths. Zero intervals do not resolve a local period. This is a
+// conservative use criterion, not a proof of loss or of the requested rate.
+fn has_resolved_local_intervals(summary: &HssQualitySummary) -> bool {
+    summary
+        .intervals
+        .min_us
+        .zip(summary.intervals.max_us)
+        .is_some_and(|(min, max)| {
+            min > 0 && max.saturating_sub(min) <= u64::from(summary.clock.source_resolution_us)
+        })
+}
+
 fn loss_assessment(summary: &HssQualitySummary, final_tail_bytes: usize) -> HssLossAssessment {
     if summary.overflow.evidence == HssQualityEvidence::Confirmed {
         return HssLossAssessment {
@@ -1147,11 +1167,7 @@ fn loss_assessment(summary: &HssQualitySummary, final_tail_bytes: usize) -> HssL
             lost_samples: None,
         };
     }
-    let unmatched_gaps = summary
-        .intervals
-        .gap_slots
-        .saturating_sub(summary.intervals.collisions);
-    if unmatched_gaps > 0 {
+    if has_source_timestamp_gap(summary) {
         return HssLossAssessment {
             evidence: HssQualityEvidence::Suspected,
             basis: HssQualityBasis::SourceTimestampGap,
@@ -3113,6 +3129,114 @@ mod tests {
                 .observe_complete_records(plan.frame_layout(), &records, host)
                 .unwrap();
             assert!(tracker.summary(0).usable_for_period_estimation);
+        }
+    }
+
+    #[test]
+    fn quality_zero_span_preserves_records_without_timing_claims() {
+        let plan = raw_plan(100);
+        let mut tracker = HssQualityTracker::new(&plan, 0);
+        let records: Vec<u8> = (0_u32..3)
+            .flat_map(|i| [0_u32.to_le_bytes(), i.to_le_bytes()].concat())
+            .collect();
+        tracker
+            .observe_complete_records(plan.frame_layout(), &records, 1_000_000)
+            .unwrap();
+        let q = tracker.summary(0);
+        assert_eq!(q.actual_samples, 3);
+        assert_eq!(q.source_rate_millihz, None);
+        assert!(!q.usable_for_period_estimation && !q.usable_for_runtime_estimation);
+        for reason in [
+            HssQualityReasonCode::StableIntervalsAvailable,
+            HssQualityReasonCode::RuntimeBoundsAvailable,
+            HssQualityReasonCode::InsufficientSamples,
+        ] {
+            assert!(!q.reason_codes.contains(&reason));
+        }
+        assert_eq!(tracker.integrity(0), crate::HssDataIntegrity::Unknown);
+        assert_eq!(q.loss.evidence, crate::HssQualityEvidence::Unknown);
+    }
+
+    #[test]
+    fn quality_local_gaps_cannot_be_cancelled_by_collisions() {
+        for stamps in [&[0_u32, 0, 20][..], &[0, 0, 10, 30][..], &[0, 20, 20][..]] {
+            let plan = raw_plan(100);
+            let mut tracker = HssQualityTracker::new(&plan, 0);
+            // Split into individual reads: local evidence must cross read boundaries.
+            for (i, stamp) in stamps.iter().enumerate() {
+                let bytes = [stamp.to_le_bytes(), u32::try_from(i).unwrap().to_le_bytes()].concat();
+                tracker
+                    .observe_complete_records(plan.frame_layout(), &bytes, 1_000_000)
+                    .unwrap();
+            }
+            let q = tracker.summary(0);
+            assert_eq!(q.source_rate_millihz, Some(100_000));
+            assert_eq!(q.intervals.collisions, 1);
+            assert_eq!(q.intervals.gap_slots, 1);
+            assert!(!q.usable_for_period_estimation && !q.usable_for_runtime_estimation);
+            assert!(
+                !q.reason_codes
+                    .contains(&HssQualityReasonCode::StableIntervalsAvailable)
+            );
+            assert!(
+                q.reason_codes
+                    .contains(&HssQualityReasonCode::SourceTimestampGap)
+            );
+            assert_eq!(q.loss.evidence, crate::HssQualityEvidence::Suspected);
+            assert_eq!(q.loss.lost_samples, None);
+            assert_eq!(tracker.integrity(0), crate::HssDataIntegrity::Degraded);
+        }
+    }
+
+    #[test]
+    fn quality_irregular_intervals_keep_average_without_claiming_local_period() {
+        for (stamps, rate) in [
+            (&[0_u32, 0, 10, 20][..], 150_000),
+            (&[1, 4, 10][..], 222_222),
+        ] {
+            let plan = raw_plan(100);
+            let mut tracker = HssQualityTracker::new(&plan, 0);
+            let records: Vec<u8> = stamps
+                .iter()
+                .enumerate()
+                .flat_map(|(i, t)| {
+                    [t.to_le_bytes(), u32::try_from(i).unwrap().to_le_bytes()].concat()
+                })
+                .collect();
+            tracker
+                .observe_complete_records(plan.frame_layout(), &records, 1_000_000)
+                .unwrap();
+            let q = tracker.summary(0);
+            assert_eq!(q.source_rate_millihz, Some(rate));
+            assert_eq!(q.actual_samples, u64::try_from(stamps.len()).unwrap());
+            assert!(!q.usable_for_period_estimation && !q.usable_for_runtime_estimation);
+            // Unresolved timing alone is not affirmative evidence of missing data.
+            assert_eq!(q.loss.evidence, crate::HssQualityEvidence::Unknown);
+            assert_eq!(tracker.integrity(0), crate::HssDataIntegrity::Unknown);
+        }
+    }
+
+    #[test]
+    fn quality_allows_quantized_periods_despite_grid_collisions_and_gaps() {
+        for rate in [333, 600, 900] {
+            let plan = raw_plan(rate);
+            let mut tracker = HssQualityTracker::new(&plan, 0);
+            let records: Vec<u8> = (0_u32..181)
+                .flat_map(|i| [(i * 1000 / rate).to_le_bytes(), i.to_le_bytes()].concat())
+                .collect();
+            tracker
+                .observe_complete_records(plan.frame_layout(), &records, 1_000_000)
+                .unwrap();
+            let q = tracker.summary(0);
+            assert!(
+                q.usable_for_period_estimation && q.usable_for_runtime_estimation,
+                "rate={rate}"
+            );
+            assert_eq!(q.loss.evidence, crate::HssQualityEvidence::Unknown);
+            assert_eq!(tracker.integrity(0), crate::HssDataIntegrity::Unknown);
+            if rate == 900 {
+                assert!(q.intervals.collisions > 0 && q.intervals.gap_slots > 0);
+            }
         }
     }
 

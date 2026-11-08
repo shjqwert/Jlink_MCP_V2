@@ -201,6 +201,10 @@ struct WorkerRuntime {
     hss: HssCoordinator,
 }
 
+#[cfg(test)]
+#[path = "hss_native_validation.rs"]
+mod native_validation;
+
 fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
     validate_target_and_after(request)?;
     validate_program_payload(request)?;
@@ -593,7 +597,7 @@ impl WorkerRuntime {
                             }
                         }
                         let capabilities = gateway.hss_capabilities()?;
-                        gateway.assess_hss_rate(&plan, capabilities)
+                        capabilities.validate_start(&plan)
                     },
                 )?;
                 if outcome.started_new {

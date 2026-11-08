@@ -145,7 +145,7 @@ impl ConfigInspection {
                 symbol_checks,
                 identity_checks,
                 &hss_checks,
-                "native HSS capability and short-window rate assessment remain pending",
+                "native HSS capability validation remains pending",
             ],
         );
         insert(
@@ -155,7 +155,7 @@ impl ConfigInspection {
             &[
                 live_checks,
                 &hss_checks,
-                "device RAM and native HSS capability/rate checks remain pending; no DWARF identity is required",
+                "device RAM and native HSS capability checks remain pending; no DWARF identity is required",
             ],
         );
 

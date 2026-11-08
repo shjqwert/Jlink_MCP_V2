@@ -4,6 +4,7 @@ mod control;
 mod debug;
 mod gateway;
 mod hss;
+mod hss_trace;
 mod lease;
 mod pipe;
 mod program;

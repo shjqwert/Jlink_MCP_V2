@@ -7,9 +7,9 @@ use std::{
 use jlink_capture::{CapturePhase, CaptureRecovery, CaptureSnapshot, CaptureStore, CaptureWriter};
 use jlink_domain::{
     ErrorCode, HssCaptureReservation, HssCaptureState, HssDrainTiming, HssQualitySummary,
-    HssQualityTracker, HssRateAssessment, HssRecoveryNotification, HssReservationOutcome,
-    HssRunSnapshot, HssRunState, HssStartPlan, HssStartRegistry, HssWriteKind, HssWriteResult,
-    HssWriteTiming, JlinkError, TargetConnectionSpec,
+    HssQualityTracker, HssRecoveryNotification, HssReservationOutcome, HssRunSnapshot, HssRunState,
+    HssStartPlan, HssStartRegistry, HssWriteKind, HssWriteResult, HssWriteTiming, JlinkError,
+    TargetConnectionSpec,
 };
 use serde_json::json;
 
@@ -190,7 +190,7 @@ impl HssCoordinator {
     ) -> Result<HssStartOutcome, JlinkError>
     where
         I: HssIo,
-        F: FnOnce(&mut I) -> Result<HssRateAssessment, JlinkError>,
+        F: FnOnce(&mut I) -> Result<(), JlinkError>,
     {
         if let Some(capture_id) = self.retired_keys.get(plan.capture_key()) {
             return Err(JlinkError::new(
@@ -244,27 +244,42 @@ impl HssCoordinator {
                 return Err(error);
             }
         };
-        // The self-describing header is durable before preflight, which can
-        // itself run a temporary native stream. Never lose an admitted key.
+        // The self-describing header is durable before validation or formal Start.
+        // Keep the journal phase readable for historical interrupted preflights.
         if let Err(error) =
             start_journal::record(self.store.root(), &capture_id, StartBoundary::Preflight)
         {
             return Err(self.record_start_failure(&capture_id, plan, writer, error));
         }
-        let rate_assessment = match preflight(io).and_then(HssRateAssessment::ensure_accepted) {
-            Ok(assessment) => assessment,
-            Err(error) => {
-                let error =
-                    error.with_detail("start_boundary", json!(StartBoundary::Preflight.label()));
-                return Err(self.record_start_failure(&capture_id, plan, writer, error));
-            }
-        };
+        if let Some(t) = crate::hss_trace::tick() {
+            crate::hss_trace::emit(
+                "preflight_begin",
+                t,
+                t,
+                json!({"capture_id":capture_id,"requested_rate_hz":plan.rate_hz()}),
+                false,
+            );
+        }
+        if let Err(error) = preflight(io) {
+            let error =
+                error.with_detail("start_boundary", json!(StartBoundary::Preflight.label()));
+            return Err(self.record_start_failure(&capture_id, plan, writer, error));
+        }
         if let Err(error) =
             start_journal::record(self.store.root(), &capture_id, StartBoundary::FormalStart)
         {
             return Err(self.record_start_failure(&capture_id, plan, writer, error));
         }
         let start_called = Instant::now();
+        if let Some(t) = crate::hss_trace::tick() {
+            crate::hss_trace::emit(
+                "formal_start",
+                t,
+                t,
+                json!({"capture_id":capture_id,"requested_rate_hz":plan.rate_hz()}),
+                false,
+            );
+        }
         let start_result = io.start_hss(&plan);
         let started = Instant::now();
         if let Err(error) = start_result {
@@ -277,10 +292,9 @@ impl HssCoordinator {
         status
             .mark_running()
             .expect("a successful Start transitions starting to running");
-        let quality = HssQualityTracker::new_with_rate_assessment(
+        let quality = HssQualityTracker::new(
             &plan,
             duration_us(started.saturating_duration_since(start_called)),
-            Some(rate_assessment),
         );
         self.active = Some(ActiveCapture {
             reservation,
@@ -489,6 +503,9 @@ impl HssCoordinator {
     }
 
     fn complete(&mut self, now: Instant) -> Result<bool, JlinkError> {
+        if let Some(t) = crate::hss_trace::tick() {
+            crate::hss_trace::emit("tail_complete", t, t, json!({}), true);
+        }
         let mut active = self
             .active
             .take()
@@ -785,6 +802,17 @@ fn drain_once<I: HssIo>(
     }
     let tail = active.incomplete_tail.split_off(complete_bytes);
     active.incomplete_tail = tail;
+    if let Some(t) = crate::hss_trace::tick() {
+        crate::hss_trace::emit(
+            "worker_drain",
+            t,
+            t,
+            json!({"host_elapsed_us":host_elapsed_us,
+            "bytes":read,"complete_records":active.complete_records,"tail_bytes":active.incomplete_tail.len(),
+            "live":phase == CapturePhase::Live}),
+            false,
+        );
+    }
     if let Some(index) = active.pending_write_impact.take() {
         active.writes[index].samples_after_next_drain = Some(active.complete_records);
     }
@@ -856,9 +884,9 @@ mod tests {
     use jlink_domain::{
         AccessLayout, AccessPlan, ErrorCode, FirmwareIdentityPlan, HssClockMappingMethod,
         HssDataIntegrity, HssNormalizedTimeUnit, HssQualityBasis, HssQualityEventKind,
-        HssQualityEvidence, HssRateAssessment, HssRecoveryNotification, HssReturnWhen,
-        HssRunSnapshot, HssRunState, HssSourceTimeUnit, HssStartPlan, HssWriteKind, HssWriteResult,
-        ScalarEncoding, TargetConnectionSpec, VariableSelector,
+        HssQualityEvidence, HssRecoveryNotification, HssReturnWhen, HssRunSnapshot, HssRunState,
+        HssSourceTimeUnit, HssStartPlan, HssWriteKind, HssWriteResult, ScalarEncoding,
+        TargetConnectionSpec, VariableSelector,
     };
     use serde_json::json;
     use tempfile::{TempDir, tempdir};
@@ -957,11 +985,6 @@ mod tests {
         .expect("start plan")
     }
 
-    fn rate_assessment() -> HssRateAssessment {
-        HssRateAssessment::new(1_000, 150_000, 167, 1_112, 10, 1_000, 1_000)
-            .expect("rate assessment fixture is self-consistent")
-    }
-
     fn target() -> TargetConnectionSpec {
         TargetConnectionSpec::new(
             "S32K144",
@@ -1024,7 +1047,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("quality capture starts");
         complete_capture(&mut coordinator, &mut io, &capture.snapshot.capture_id)
@@ -1048,6 +1071,34 @@ mod tests {
                 .contains(&jlink_domain::HssQualityReasonCode::SourceHostClockMismatch)
         );
         assert_eq!(snapshot.quality.loss.evidence, HssQualityEvidence::Unknown);
+    }
+
+    #[test]
+    fn thousand_hz_starts_once_without_measurement_and_retains_all_records() {
+        let mut io =
+            ScriptedHss::healthy([(0..1_000).flat_map(|index| record(index, index)).collect()]);
+        let (_root, mut coordinator) = open_coordinator();
+        let outcome = coordinator
+            .start(
+                "260106173",
+                &target(),
+                start_plan(),
+                TEST_CAPTURE_MAX_BYTES,
+                &mut io,
+                |io| {
+                    assert!(io.calls.is_empty(), "validation must precede native Start");
+                    Ok(())
+                },
+            )
+            .expect("valid 1000 Hz request starts directly");
+        assert_eq!(io.calls, ["start"]);
+        assert!(outcome.snapshot.quality.rate_assessment.is_none());
+        let snapshot = complete_capture(&mut coordinator, &mut io, &outcome.snapshot.capture_id);
+        assert_eq!(snapshot.state, HssRunState::Completed);
+        assert_eq!(snapshot.complete_records, 1_000);
+        assert!(snapshot.quality.rate_assessment.is_none());
+        assert_eq!(io.calls.iter().filter(|call| **call == "start").count(), 1);
+        assert_eq!(io.calls.iter().filter(|call| **call == "stop").count(), 1);
     }
 
     #[test]
@@ -1145,7 +1196,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1228,7 +1279,7 @@ mod tests {
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let capture_id = started.snapshot.capture_id;
@@ -1278,7 +1329,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1315,7 +1366,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let capture_id = outcome.snapshot.capture_id;
@@ -1365,7 +1416,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         coordinator.advance(&mut io).expect("first record retained");
@@ -1415,7 +1466,7 @@ mod tests {
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect_err("DLL Start failure remains a tool error");
         let capture_id = error
@@ -1444,7 +1495,7 @@ mod tests {
                 plan,
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("same key and request recover the failed identity");
         assert!(!recovered.started_new);
@@ -1453,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn temporary_preflight_cleanup_failure_retains_aborted_without_formal_start() {
+    fn validation_recovery_failure_retains_aborted_without_formal_start() {
         let (_root, mut coordinator) = open_coordinator();
         let mut io = ScriptedHss::healthy([]);
         let error = coordinator
@@ -1466,7 +1517,7 @@ mod tests {
                 |_| {
                     Err(JlinkError::new(
                         ErrorCode::TargetRecoveryFailed,
-                        "temporary Stop unconfirmed",
+                        "validation recovery unconfirmed",
                         false,
                     ))
                 },
@@ -1502,7 +1553,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
@@ -1540,7 +1591,7 @@ mod tests {
                 start_plan(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut io,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             )
             .expect("capture starts");
         let started = coordinator.active.as_ref().expect("active capture").started;
@@ -1653,7 +1704,7 @@ mod tests {
                 plan.clone(),
                 TEST_CAPTURE_MAX_BYTES,
                 &mut LostAtStart,
-                |_| Ok(rate_assessment()),
+                |_| Ok(()),
             );
         }));
         assert!(result.is_err());
@@ -1785,7 +1836,7 @@ mod tests {
                     std::process::exit(71);
                 }
                 assert_eq!(phase, "formal_start");
-                Ok(rate_assessment())
+                Ok(())
             },
         );
         panic!("hard-exit fixture unexpectedly returned");

@@ -183,17 +183,23 @@ are not DWARF variables and must not receive symbol semantics. DWARF selectors
 require matching firmware evidence at start. Requested rate is not achieved rate: report
 actual samples and quality fields. Without independent overflow/sequence evidence,
 never claim that no samples were lost.
-Rate assessment can be reused only in the same gateway/connection with matching
-target, firmware identity, variable addresses/layout and capabilities. Writes,
-execution control and reconnect invalidate it. `rate_assessment.reused` exposes
-reuse; its recommended ceiling is a conservative short-window estimate, not a
-measured absolute maximum.
+New captures validate explicit native capabilities and resource limits, then
+start at the requested rate without a temporary throughput trial or a measured
+admission ceiling. Optional `rate_assessment` in older captures is historical
+evidence only; it does not constrain a new capture or prove a maximum rate.
 `source_rate_millihz` and its legacy alias `actual_rate_millihz` use source
 timestamps. `host_arrival_rate_millihz` measures complete frames between live
 host reads, excluding tail reads. It does not establish individual sampling
 times. `source_host_clock_mismatch` invalidates period/runtime use:
 preserve the raw records and both clocks; do not truncate or rescale to match the
 requested duration.
+
+Mean source record rate is not a local-period guarantee. Zero source span or
+unresolved local intervals disables timing-use claims while retaining records.
+Global slot collisions cannot cancel a long local interval; legal millisecond
+quantization can itself create slot collisions/gaps. Read the timing-use flags
+and local interval facts instead of deduplicating timestamps or inferring loss
+from slot counts. Existing saved captures retain their original quality summary.
 
 For HSS `status`/`query`, provide exactly one capture identity. A continuation uses
 the same identity and cursor with `action: query`, omitting prior view-specific

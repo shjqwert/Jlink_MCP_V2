@@ -13,9 +13,9 @@ use std::{
 
 use jlink_domain::{
     CoreRegister, DeviceMemoryMap, ErrorCode, FaultDiagnostics, FirmwareImage, FlashRegion,
-    HssCapabilities, HssRateAssessment, HssStartPlan, JlinkError, MemoryRegion, MemoryRegionKind,
-    ProgramAfter, ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface,
-    TargetState, ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
+    HssCapabilities, JlinkError, MemoryRegion, MemoryRegionKind, ProgramAfter,
+    ProgramExecutionFacts, ProgramStage, TargetConnectionSpec, TargetInterface, TargetState,
+    ValidationCheck, ValidationCheckEvidence, ValidationCheckKind, ValidationReport,
     validate_write_count,
 };
 use serde_json::json;
@@ -35,10 +35,6 @@ fn log_hss_boundary(message: &str) {
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(2);
 const RUNNING_STABILITY_WINDOW: Duration = Duration::from_millis(100);
 const TARGET_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const HSS_RATE_MEASUREMENT_WINDOW: Duration = Duration::from_millis(150);
-const HSS_RATE_MEASUREMENT_POLL: Duration = Duration::from_millis(1);
-const HSS_RATE_SAFETY_MARGIN_PERCENT: u32 = 10;
-const HSS_RATE_MEASUREMENT_BUFFER_BYTES: usize = 64 * 1024;
 const ICSR: u32 = 0xE000_ED04;
 const CFSR: u32 = 0xE000_ED28;
 const HFSR: u32 = 0xE000_ED2C;
@@ -401,7 +397,6 @@ pub(crate) struct DllGateway {
     target_id: Option<u32>,
     hss_started: bool,
     quarantined: bool,
-    hss_rate_cache: Option<(serde_json::Value, HssRateAssessment)>,
     path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -446,7 +441,6 @@ impl DllGateway {
             target_id: None,
             hss_started: false,
             quarantined: false,
-            hss_rate_cache: None,
             path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
@@ -463,7 +457,6 @@ impl DllGateway {
 
     /// Forbids further native calls after cleanup could not be confirmed.
     pub(crate) fn quarantine(&mut self) {
-        self.hss_rate_cache = None;
         self.quarantined = true;
         self.opened = false;
         self.hss_started = false;
@@ -557,25 +550,42 @@ impl DllGateway {
         let period_us = i32::try_from(plan.period_us()).map_err(|_| {
             JlinkError::new(ErrorCode::HssUnsupported, "HSS period_us 无法表示", false)
         })?;
+        let flags = jlink_domain::HSS_START_FLAGS_698A_MAINLINE;
+        if let Some(t) = crate::hss_trace::tick() {
+            crate::hss_trace::emit(
+                "native_start_args",
+                t,
+                t,
+                json!({"period_us":period_us,"flags":flags,"block_count":block_count,
+                    "block_size":std::mem::size_of::<HssBlock>(),
+                    "record_bytes":plan.frame_layout().record_bytes(),
+                    "descriptors":blocks.iter().map(|b| json!({"address":b.address,
+                        "byte_count":b.byte_count,"flags":b.flags,"reserved":b.reserved})).collect::<Vec<_>>()}),
+                false,
+            );
+        }
         let start = self
             .api
             .hss
             .start
             .expect("HSS preflight requires the complete export set");
         log_hss_boundary("native_call=Start boundary=enter");
+        let trace_begin = crate::hss_trace::tick();
         // SAFETY: block layout and call signature are frozen by F0-A; the unique
         // gateway owns the live target and serializes every DLL call.
-        let result = unsafe {
-            start(
-                blocks.as_mut_ptr(),
-                block_count,
-                period_us,
-                jlink_domain::HSS_START_FLAGS_698A_MAINLINE,
-            )
-        };
+        let result = unsafe { start(blocks.as_mut_ptr(), block_count, period_us, flags) };
         log_hss_boundary(&format!(
             "native_call=Start boundary=return result={result}"
         ));
+        if let Some(begin) = trace_begin {
+            crate::hss_trace::emit(
+                "native_start",
+                begin,
+                crate::hss_trace::tick().unwrap_or(begin),
+                json!({"result":result,"period_us":period_us,"blocks":block_count}),
+                false,
+            );
+        }
         if result < 0 {
             return Err(hss_start_error(result));
         }
@@ -603,6 +613,7 @@ impl DllGateway {
             .hss
             .read
             .expect("HSS preflight requires the complete export set");
+        let trace_begin = crate::hss_trace::tick();
         // SAFETY: `buffer` is writable for its declared length and the ABI is frozen by F0-A.
         let result = unsafe {
             read(
@@ -610,6 +621,28 @@ impl DllGateway {
                 u32::try_from(buffer.len()).expect("fixed HSS buffer fits u32"),
             )
         };
+        if let Some(begin) = trace_begin {
+            let end = crate::hss_trace::tick().unwrap_or(begin);
+            let first_changed = buffer.iter().position(|b| *b != SENTINEL);
+            let last_changed = buffer.iter().rposition(|b| *b != SENTINEL);
+            let accepted = if result == 0 && buffer[..record_bytes].iter().any(|b| *b != SENTINEL) {
+                record_bytes
+            } else {
+                usize::try_from(result).unwrap_or(0)
+            };
+            crate::hss_trace::emit(
+                "native_read",
+                begin,
+                end,
+                json!({
+                    "result":result,"capacity":buffer.len(),"record_bytes":record_bytes,
+                    "accepted_bytes":accepted,"first_changed":first_changed,"last_changed":last_changed,
+                    "positive_bytes_sha256":crate::hss_trace::positive_read_sha256(buffer, result),
+                    "first_timestamp_raw":if accepted >= 4 && accepted <= buffer.len() {Some(u32::from_le_bytes(buffer[..4].try_into().unwrap()))} else {None}
+                }),
+                false,
+            );
+        }
         if result < 0 {
             return Err(JlinkError::new(
                 ErrorCode::FrameInvalid,
@@ -651,8 +684,18 @@ impl DllGateway {
         // failed Stop against an uncertain DLL state.
         self.hss_started = false;
         log_hss_boundary("native_call=Stop boundary=enter");
+        let trace_begin = crate::hss_trace::tick();
         // SAFETY: the unique gateway owns the matching successful Start call.
         let result = unsafe { stop() };
+        if let Some(begin) = trace_begin {
+            crate::hss_trace::emit(
+                "native_stop",
+                begin,
+                crate::hss_trace::tick().unwrap_or(begin),
+                json!({"result":result}),
+                true,
+            );
+        }
         log_hss_boundary(&format!("native_call=Stop boundary=return result={result}"));
         if result < 0 {
             return Err(JlinkError::new(
@@ -662,104 +705,6 @@ impl DllGateway {
             ));
         }
         Ok(())
-    }
-
-    /// Measures one short temporary stream and rejects an unsafe requested rate.
-    ///
-    /// The temporary rate is never substituted into the real capture request.
-    /// A matching Stop is dispatched exactly once after every successful Start.
-    pub(crate) fn assess_hss_rate(
-        &mut self,
-        plan: &HssStartPlan,
-        capabilities: HssCapabilities,
-    ) -> Result<HssRateAssessment, JlinkError> {
-        capabilities.validate_start(plan)?;
-        let key = json!({"layout": plan.frame_layout(), "variables": plan.variables(), "identity": plan.firmware(), "target": self.connected_spec, "capabilities": capabilities});
-        if let Some((previous, assessment)) = &self.hss_rate_cache
-            && *previous == key
-        {
-            let mut reused = *assessment;
-            reused.requested_rate_hz = plan.rate_hz();
-            reused.accepted = plan.rate_hz() <= reused.recommended_max_rate_hz;
-            reused.reused = true;
-            return reused.ensure_accepted();
-        }
-        let measurement_rate_hz = capabilities.max_frequency_hz().min(1_000);
-        let measurement_plan = plan.with_rate_for_measurement(measurement_rate_hz)?;
-        let record_bytes = usize::try_from(measurement_plan.frame_layout().record_bytes())
-            .map_err(|_| {
-                JlinkError::new(
-                    ErrorCode::HssUnsupported,
-                    "HSS measurement record length 无法表示",
-                    false,
-                )
-            })?;
-        let mut buffer = vec![0_u8; HSS_RATE_MEASUREMENT_BUFFER_BYTES];
-        self.start_hss(&measurement_plan)?;
-        let started = Instant::now();
-        let measured = (|| {
-            let mut total_bytes = 0_u64;
-            while started.elapsed() < HSS_RATE_MEASUREMENT_WINDOW {
-                let read = self.read_hss(&mut buffer, record_bytes)?;
-                total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-                thread::sleep(HSS_RATE_MEASUREMENT_POLL);
-            }
-            Ok::<u64, JlinkError>(total_bytes)
-        })();
-        let stop_result = self.stop_hss();
-        stop_result?;
-        let mut total_bytes = measured?;
-        let mut empty_reads = 0_u32;
-        for _ in 0..20 {
-            let read = self.read_hss(&mut buffer, record_bytes)?;
-            total_bytes = total_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-            if read == 0 {
-                empty_reads += 1;
-                if empty_reads >= 3 {
-                    break;
-                }
-            } else {
-                empty_reads = 0;
-            }
-            thread::sleep(HSS_RATE_MEASUREMENT_POLL);
-        }
-        let measurement_window_us =
-            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-        let complete_samples = total_bytes / u64::try_from(record_bytes).unwrap_or(u64::MAX);
-        if complete_samples == 0 {
-            return Err(JlinkError::new(
-                ErrorCode::HssUnsupported,
-                "HSS 短窗口测量没有获得完整样本",
-                true,
-            )
-            .with_detail("measurement_rate_hz", json!(measurement_rate_hz))
-            .with_detail("measurement_window_us", json!(measurement_window_us)));
-        }
-        let measured_rate_hz = u32::try_from(
-            complete_samples
-                .saturating_mul(1_000_000)
-                .checked_div(measurement_window_us)
-                .unwrap_or_default(),
-        )
-        .unwrap_or(u32::MAX)
-        .max(1);
-        let conservative_rate =
-            measured_rate_hz.saturating_mul(100 - HSS_RATE_SAFETY_MARGIN_PERCENT) / 100;
-        let recommended_max_rate_hz = conservative_rate
-            .min(capabilities.max_frequency_hz())
-            .max(1);
-        let assessment = HssRateAssessment::new(
-            measurement_rate_hz,
-            measurement_window_us,
-            complete_samples,
-            measured_rate_hz,
-            HSS_RATE_SAFETY_MARGIN_PERCENT,
-            recommended_max_rate_hz,
-            plan.rate_hz(),
-        )?
-        .ensure_accepted()?;
-        self.hss_rate_cache = Some((key, assessment));
-        Ok(assessment)
     }
 
     /// Reads authoritative Flash regions from the loaded J-Link device database.
@@ -1055,7 +1000,6 @@ impl DllGateway {
 
     /// Writes one complete ordinary RAM or MMIO range and rejects short writes.
     pub(crate) fn write_bytes(&mut self, address: u64, bytes: &[u8]) -> Result<(), JlinkError> {
-        self.hss_rate_cache = None;
         let mut offset = 0_usize;
         while offset < bytes.len() {
             let count = (bytes.len() - offset).min(PROGRAM_CHUNK_BYTES);
@@ -1330,7 +1274,6 @@ impl DllGateway {
 
     /// Closes the target and clears all gateway-local session facts.
     pub(crate) fn close_target(&mut self) {
-        self.hss_rate_cache = None;
         if self.hss_started
             && let Err(error) = self.stop_hss()
         {
@@ -1478,7 +1421,6 @@ impl DllGateway {
         register: CoreRegister,
         value: u32,
     ) -> Result<(), JlinkError> {
-        self.hss_rate_cache = None;
         register.ensure_writable()?;
         let index = self.register_index(register)?;
         let write_index = i32::try_from(index).map_err(|_| {
@@ -1617,7 +1559,6 @@ impl DllGateway {
 
     /// Halts the connected target and returns the resulting observed state.
     pub(crate) fn halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        self.hss_rate_cache = None;
         // SAFETY: the target connection is active and the call is serialized.
         let halt_status = unsafe { (self.api.halt)() };
         self.wait_until_halted().map_err(|error| {
@@ -1628,7 +1569,6 @@ impl DllGateway {
 
     /// Resumes a halted target and observes the stable final state.
     pub(crate) fn resume_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        self.hss_rate_cache = None;
         // SAFETY: the target connection is active and the call is serialized.
         unsafe { (self.api.go)() };
         self.wait_for_stable_state()
@@ -1636,7 +1576,6 @@ impl DllGateway {
 
     /// Resets and starts the target, then observes the stable final state.
     pub(crate) fn reset_run_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        self.hss_rate_cache = None;
         reset_dll_diagnostics();
         // SAFETY: the target connection is active and the reset call is serialized.
         let reset_status = unsafe { (self.api.reset)() };
@@ -1652,7 +1591,6 @@ impl DllGateway {
 
     /// Resets and explicitly leaves the target halted.
     pub(crate) fn reset_halt_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        self.hss_rate_cache = None;
         reset_dll_diagnostics();
         // SAFETY: the target connection is active and the reset call is serialized.
         let reset_status = unsafe { (self.api.reset)() };
@@ -1673,7 +1611,6 @@ impl DllGateway {
 
     /// Executes exactly one instruction from an already halted target.
     pub(crate) fn step_and_observe(&mut self) -> Result<TargetState, JlinkError> {
-        self.hss_rate_cache = None;
         let before = self.observe_target_state()?;
         if before != TargetState::Halted {
             return Err(JlinkError::new(
