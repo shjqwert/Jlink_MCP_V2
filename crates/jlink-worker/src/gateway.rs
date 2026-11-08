@@ -397,8 +397,19 @@ pub(crate) struct DllGateway {
     target_id: Option<u32>,
     hss_started: bool,
     quarantined: bool,
+    #[cfg(test)]
+    pub(crate) hss_test_timing: HssTestTiming,
     path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
+}
+
+/// Lightweight common observations for both diagnostic arms; no serialization.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct HssTestTiming {
+    pub(crate) start: Option<(Instant, Instant)>,
+    pub(crate) read: Option<(Instant, Instant, i32)>,
+    pub(crate) stop: Option<(Instant, Instant)>,
 }
 
 impl DllGateway {
@@ -441,6 +452,8 @@ impl DllGateway {
             target_id: None,
             hss_started: false,
             quarantined: false,
+            #[cfg(test)]
+            hss_test_timing: HssTestTiming::default(),
             path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
@@ -571,9 +584,15 @@ impl DllGateway {
             .expect("HSS preflight requires the complete export set");
         log_hss_boundary("native_call=Start boundary=enter");
         let trace_begin = crate::hss_trace::tick();
+        #[cfg(test)]
+        let native_begin = Instant::now();
         // SAFETY: block layout and call signature are frozen by F0-A; the unique
         // gateway owns the live target and serializes every DLL call.
         let result = unsafe { start(blocks.as_mut_ptr(), block_count, period_us, flags) };
+        #[cfg(test)]
+        {
+            self.hss_test_timing.start = Some((native_begin, Instant::now()));
+        }
         log_hss_boundary(&format!(
             "native_call=Start boundary=return result={result}"
         ));
@@ -614,6 +633,8 @@ impl DllGateway {
             .read
             .expect("HSS preflight requires the complete export set");
         let trace_begin = crate::hss_trace::tick();
+        #[cfg(test)]
+        let native_begin = Instant::now();
         // SAFETY: `buffer` is writable for its declared length and the ABI is frozen by F0-A.
         let result = unsafe {
             read(
@@ -621,6 +642,10 @@ impl DllGateway {
                 u32::try_from(buffer.len()).expect("fixed HSS buffer fits u32"),
             )
         };
+        #[cfg(test)]
+        {
+            self.hss_test_timing.read = Some((native_begin, Instant::now(), result));
+        }
         if let Some(begin) = trace_begin {
             let end = crate::hss_trace::tick().unwrap_or(begin);
             let first_changed = buffer.iter().position(|b| *b != SENTINEL);
@@ -685,8 +710,14 @@ impl DllGateway {
         self.hss_started = false;
         log_hss_boundary("native_call=Stop boundary=enter");
         let trace_begin = crate::hss_trace::tick();
+        #[cfg(test)]
+        let native_begin = Instant::now();
         // SAFETY: the unique gateway owns the matching successful Start call.
         let result = unsafe { stop() };
+        #[cfg(test)]
+        {
+            self.hss_test_timing.stop = Some((native_begin, Instant::now()));
+        }
         if let Some(begin) = trace_begin {
             crate::hss_trace::emit(
                 "native_stop",

@@ -15,6 +15,17 @@ struct Trace {
     failed: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Test-only A/B switch; the same executable and read adaptation serve both arms.
+#[cfg(test)]
+pub(crate) fn set_test_enabled(enabled: bool) {
+    TEST_ENABLED.set(enabled);
+}
+
 fn trace() -> Option<&'static Mutex<Trace>> {
     static TRACE: OnceLock<Option<Mutex<Trace>>> = OnceLock::new();
     TRACE
@@ -37,6 +48,10 @@ fn trace() -> Option<&'static Mutex<Trace>> {
 }
 
 pub(crate) fn tick() -> Option<u64> {
+    #[cfg(test)]
+    if !TEST_ENABLED.get() {
+        return None;
+    }
     let state = trace()?.lock().ok()?;
     Some(u64::try_from(state.origin.elapsed().as_micros()).unwrap_or(u64::MAX))
 }
@@ -70,6 +85,10 @@ mod tests {
 }
 
 pub(crate) fn emit(event: &str, start: u64, end: u64, details: Value, flush: bool) {
+    #[cfg(test)]
+    if !TEST_ENABLED.get() {
+        return;
+    }
     let Some(trace) = trace() else { return };
     let Ok(mut state) = trace.lock() else { return };
     if state.failed {

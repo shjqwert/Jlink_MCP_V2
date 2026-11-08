@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HSS · 离线波形</title>
+<style>
+:root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#10151e;color:#e2e8f0}*{box-sizing:border-box}body{margin:0;padding:28px;max-width:1600px;margin-inline:auto}header{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{font-size:25px;font-weight:650;margin:0}p{color:#94a3b8;line-height:1.6;font-size:14px}button,.file{border:1px solid #3a4b66;background:#202d42;color:#e2e8f0;border-radius:8px;padding:10px 15px;cursor:pointer;font:inherit}.file{background:#3165cb;border-color:#3165cb}input[type=file]{max-width:280px;font-size:13px}.toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:22px 0 12px}.panel{background:#171f2c;border:1px solid #2a364a;border-radius:12px;overflow:hidden}#status{padding:13px 18px;color:#aec5e8;border-bottom:1px solid #2a364a;font-size:14px;white-space:pre-wrap;line-height:1.6}#notice{color:#e5b76c;font-size:13px;line-height:1.6;white-space:pre-wrap;padding:0 18px}canvas{display:block;width:100%;height:430px}#empty{text-align:center;padding:75px 20px;color:#9aaac3}#plot{display:none}.controls{display:flex;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid #2a364a}input[type=range]{flex:1;min-width:80px;accent-color:#68a5ff}#position{font-variant-numeric:tabular-nums;min-width:240px;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:12px 18px;border-top:1px solid #2a364a}th{color:#92a3bd;font-weight:500}td.value{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}#details{margin-top:18px;color:#aebed3}pre{max-height:300px;overflow:auto;white-space:pre-wrap;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 8px}footer{margin-top:22px;color:#71839f;font-size:12px}@media(max-width:700px){body{padding:14px}header{display:block}canvas{height:300px}.controls{flex-wrap:wrap}td,th{padding:10px 8px}#position{min-width:0}h1{font-size:22px}}
+.file{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}.table-scroll{overflow-x:auto}table{min-width:620px}#channels td:first-child{overflow-wrap:anywhere;max-width:340px}@media(max-width:700px){.file{max-width:100%;font-size:13px;margin-top:8px}input[type=file]{max-width:100%}}
+</style></head><body>
+<header><div><h1>HSS <span style="color:#72a7ff">/</span> 离线波形</h1><p>原始时间与原始值 · 独立幅值适配 · 所有数据留在本机</p></div><label class="file">导入采集文件 <input id="file" type="file" accept=".capture,.partial" aria-label="导入采集文件"></label></header>
+<div class="toolbar"><button id="fit">显示全部</button><button id="zoom">放大至选中点</button><span style="color:#94a3b8;font-size:13px">横轴：文件中的源时间（ms） · 各通道独立缩放，幅值请看下表</span></div>
+<section class="panel"><div id="status" role="status">等待导入 .capture / .partial 文件</div><p id="notice"></p><div id="empty">导入本地采集文件，开始查看波形。<br><p>异常状态不妨碍查看可校验的数据；不校正时间、不去重。</p></div><canvas id="plot" aria-label="统一通道波形图"></canvas><div class="controls"><button id="prev" aria-label="上一条记录">←</button><input id="cursor" type="range" min="0" max="0" value="0" aria-label="记录索引"><button id="next" aria-label="下一条记录">→</button><span id="position">尚无记录</span></div><div class="table-scroll" role="region" aria-label="通道原始值，可横向滚动" tabindex="0"><table><thead><tr><th>通道</th><th>当前原始值</th><th>可见最小值</th><th>可见最大值</th></tr></thead><tbody id="channels"></tbody></table></div></section>
+<details id="details"><summary>文件信息与质量证据</summary><pre id="metadata"></pre></details><footer>离线初版 · 支持 JMCPV101 自描述格式，单文件上限 64 MiB。屏幕按像素保留极值绘制，原始记录不变。64 位超安全整数保留精确文本，不绘制不可靠幅值。</footer>
+<script>
+'use strict';
+const $=id=>document.getElementById(id), palette=['#65a4ff','#52d7b4','#f5bf65','#c199ff','#ff839b','#6bd4eb','#a4ca6b','#e994cf','#c0b18c','#d7e6fc'];
+const crcTable=Uint32Array.from({length:256},(_,i)=>{for(let k=0;k<8;k++)i=i&1?0xedb88320^(i>>>1):i>>>1;return i>>>0});
+function crc32(b){let c=0xffffffff;for(const v of b)c=crcTable[(c^v)&255]^(c>>>8);return (c^0xffffffff)>>>0}
+const decoder=new TextDecoder('utf-8',{fatal:true});
+function need(v,m){if(!v)throw Error(m)}
+function integer(v,min,max,m){need(Number.isSafeInteger(v)&&v>=min&&v<=max,m);return v}
+async function parseCapture(buffer){
+ const b=new Uint8Array(buffer),v=new DataView(buffer),str=(p,n)=>String.fromCharCode(...b.subarray(p,p+n));
+ need(b.length>=20&&str(0,8)==='JMCPV101','不是受支持的 JMCPV101 采集文件');need(v.getUint32(8,true)===1,'不支持的文件版本');
+ function jsonAt(p,n,crc){need(n<=16*1024*1024&&p+n<=b.length,'JSON 区段不完整或过大');const data=b.subarray(p,p+n);need(crc32(data)===crc,'JSON CRC 校验失败');return JSON.parse(decoder.decode(data))}
+ const hl=v.getUint32(12,true),h=jsonAt(20,hl,v.getUint32(16,true));
+ need(h.plan&&Array.isArray(h.plan.variables)&&h.plan.variables.length>0&&h.plan.variables.length<=10,'变量计划无效');
+ need(h.capture_key===h.plan.capture_key&&h.request_fingerprint===h.plan.request_fingerprint,'文件身份与计划不一致');
+ const rb=integer(h.plan.frame_layout?.record_bytes,5,44,'记录布局无效');need(h.plan.frame_layout.sample_bytes===rb-4,'记录载荷不一致');
+ let p=20+hl,parts=[],blocks=0,total=0,manifest=null,warnings=[],complete=false;
+ while(p<b.length){
+  if(p+4>b.length){warnings.push('文件末尾不完整');break}
+  const magic=str(p,4);
+  if(magic==='END1'){
+   try{need(p+12<=b.length,'终态头不完整');const n=v.getUint32(p+4,true);manifest=jsonAt(p+12,n,v.getUint32(p+8,true));need(p+12+n===b.length,'终态后存在额外字节');complete=true}catch(e){manifest=null;warnings.push(e.message)}break;
+  }
+  if(magic!=='BLK1'||p+24>b.length){warnings.push('块标记或块头不完整，只展示此前有效前缀');break}
+  const n=v.getUint32(p+4,true),crc=v.getUint32(p+8,true),phase=v.getUint32(p+20,true);
+  if(n>16*1024*1024||p+24+n>b.length||phase>1){warnings.push('数据块不完整或块头无效，只展示此前有效前缀');break}
+  const data=b.subarray(p+24,p+24+n);if(crc32(data)!==crc){warnings.push('数据块 CRC 错误，只展示此前已通过校验的前缀');break}
+  parts.push(data);total+=n;blocks++;p+=24+n;
+ }
+ const raw=new Uint8Array(total);let off=0;for(const part of parts){raw.set(part,off);off+=part.length}
+ let sha=null;
+ if(complete){sha=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',raw)),x=>x.toString(16).padStart(2,'0')).join('');
+  need(manifest.blocks===blocks&&manifest.payload_bytes===total&&manifest.raw_sha256===sha,'终态摘要或字节数不匹配');
+  need(manifest.snapshot?.capture_id===h.capture_id,'终态采集身份不匹配');need(total%rb===0,'完整文件含不完整记录');
+ }
+ const count=Math.floor(total/rb);need(count>0,'没有可展示的完整记录');
+ if(complete){need(manifest.snapshot.complete_records===count&&manifest.snapshot.quality?.actual_samples===count,'终态记录数量不匹配')}
+ else warnings.push('partial：仅展示校验通过的完整记录，完整性未知');
+ if(total%rb)warnings.push('末尾不足一条记录的字节未绘制，源文件保持原样');
+ const dv=new DataView(raw.buffer),times=new Float64Array(count);let equal=0,backward=0,minT=Infinity,maxT=-Infinity;
+ for(let i=0;i<count;i++){times[i]=dv.getUint32(i*rb,true);minT=Math.min(minT,times[i]);maxT=Math.max(maxT,times[i]);if(i){equal+=times[i]===times[i-1];backward+=times[i]<times[i-1]}}
+ if(equal)warnings.push(`相邻相等时间戳 ${equal} 次，所有记录均保留；用记录滑块区分同一时刻的点`);
+ if(backward)warnings.push(`时间倒退 ${backward} 次，按原顺序绘制，不修正时间`);
+ const channels=[];
+ function expand(layout,name,offset,span,bit=null,depth=0){
+  need(depth<=16&&channels.length<128,'类型层级或通道数超出初版限制');integer(offset,4,rb-1,'通道偏移无效');integer(span,1,rb-offset,'通道超出记录');
+  if(layout.kind==='array'){const n=integer(layout.count,1,40,'数组长度无效'),size=span/n;need(Number.isInteger(size),'数组字节数无效');for(let i=0;i<n;i++)expand(layout.element,`${name}[${i}]`,offset+i*size,size,null,depth+1);return}
+  if(layout.kind==='structure'){
+   need(Array.isArray(layout.members),'结构体成员无效');for(const m of layout.members){if(m.bit_size!=null){warnings.push(`${name}.${m.name}：成员位域暂不绘制`);continue}let size=m.layout.byte_size;if(m.layout.kind==='array')size=sizeOf(m.layout);expand(m.layout,`${name}.${m.name}`,offset+integer(m.byte_offset,0,span-1,'成员偏移无效'),integer(size,1,span-m.byte_offset,'成员大小无效'),null,depth+1)}return;
+  }
+  if(!['scalar','pointer'].includes(layout.kind)){warnings.push(`${name}：${layout.kind} 类型暂不绘制，原始字节保留`);return}
+  const size=integer(layout.byte_size,1,8,'标量长度无效'),enc=layout.kind==='pointer'?'unsigned':layout.encoding;
+  if(![1,2,4,8].includes(size)||!['signed','unsigned','float','boolean'].includes(enc)||size>span||(enc==='float'&&![4,8].includes(size))){warnings.push(`${name}：不支持的标量类型`);return}
+  if(bit){integer(bit.lsb,0,size*8-1,'位域起点无效');integer(bit.width,1,size*8-bit.lsb,'位域宽度无效');need(enc!=='float','浮点位域无效')}
+  function value(i){const pos=i*rb+offset;if(enc==='float')return size===4?dv.getFloat32(pos,true):dv.getFloat64(pos,true);
+   let n=0n;for(let j=0;j<size;j++)n|=BigInt(dv.getUint8(pos+j))<<BigInt(j*8);
+   let bits=size*8;if(bit){bits=bit.width;n=(n>>BigInt(bit.lsb))&((1n<<BigInt(bits))-1n)}if(enc==='signed')n=BigInt.asIntN(bits,n);
+   if(enc==='boolean')return n!==0n?1:0;return n>=-9007199254740991n&&n<=9007199254740991n?Number(n):n;
+  }
+  channels.push({name,value,enabled:true,color:palette[channels.length%palette.length]});
+ }
+ function sizeOf(l){return l.kind==='array'?integer(l.count,1,40,'数组长度无效')*sizeOf(l.element):l.byte_size}
+ for(const item of h.plan.variables){
+  if(!item.plan){warnings.push('本初版仅解码 DWARF 类型通道，raw-address 元数据保留在文件信息中');continue}
+  const ap=item.plan;expand(ap.layout,ap.selector.path,4+integer(item.sample_offset,0,rb-5,'样本偏移无效'),integer(ap.byte_size,1,rb-4,'变量长度无效'),ap.bit_range);
+ }
+ const quality=manifest?.snapshot?.quality||{integrity:'unknown'},state=complete?manifest.snapshot.state:'aborted / partial';
+ if(quality.reason_codes?.length)warnings.push(`质量提示：${quality.reason_codes.join('、')}`);
+ return {header:h,manifest,raw,times,count,channels,minT,maxT,equal,backward,warnings,complete,state,quality,sha};
+}
+let data=null,selected=0,view=[0,1],generation=0;
+const cv=$('plot'),ctx=cv.getContext('2d');
+function textCell(row,text,cls=''){const td=document.createElement('td');td.className=cls;td.textContent=text;row.append(td);return td}
+function format(v){return typeof v==='bigint'?v.toString():Number.isFinite(v)?String(v):String(v)}
+function render(){if(!data)return;const rect=cv.getBoundingClientRect(),dpr=devicePixelRatio||1,w=rect.width,h=rect.height;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const left=54,right=w-24,top=22,bottom=h-38,width=right-left,range=Math.max(1e-9,view[1]-view[0]);
+ ctx.font='12px system-ui';ctx.strokeStyle='#2b394e';ctx.fillStyle='#8a9dbb';const ticks=w<500?3:5;for(let k=0;k<=ticks;k++){const x=left+width*k/ticks;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.textAlign=k===0?'left':k===ticks?'right':'center';ctx.fillText((view[0]+range*k/ticks).toFixed(2),x,bottom+23)}ctx.textAlign='left';for(let k=0;k<=4;k++){const y=top+(bottom-top)*k/4;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(right,y);ctx.stroke()}
+ $('channels').replaceChildren();
+ for(const c of data.channels){let lo=Infinity,hi=-Infinity;for(let i=0;i<data.count;i++){if(data.times[i]<view[0]||data.times[i]>view[1])continue;const value=c.value(i);if(typeof value==='number'&&Number.isFinite(value)){lo=Math.min(lo,value);hi=Math.max(hi,value)}}
+  if(c.enabled&&Number.isFinite(lo)){ctx.strokeStyle=c.color;ctx.lineWidth=1.4;ctx.beginPath();let started=false,bucket=-1,points=[];const amplitude=hi-lo||1;
+   function flush(){if(!points.length)return;const keep=new Set([0,points.length-1]);let min=0,max=0;for(let i=1;i<points.length;i++){if(points[i][1]<points[min][1])min=i;if(points[i][1]>points[max][1])max=i}keep.add(min);keep.add(max);for(const i of [...keep].sort((a,b)=>a-b)){const [x,y]=points[i];if(started)ctx.lineTo(x,y);else{ctx.moveTo(x,y);started=true}}points=[]}
+   for(let i=0;i<data.count;i++){const t=data.times[i];if(t<view[0]||t>view[1]){flush();started=false;continue}const value=c.value(i);if(typeof value!=='number'||!Number.isFinite(value)){flush();started=false;continue}const x=left+(t-view[0])/range*width,y=hi===lo?(top+bottom)/2:bottom-(value-lo)/amplitude*(bottom-top),px=Math.floor(x);if(px!==bucket){flush();bucket=px}points.push([x,y])}flush();ctx.stroke();
+  }
+  const row=document.createElement('tr'),cell=textCell(row,'');const check=document.createElement('input');check.type='checkbox';check.checked=c.enabled;check.setAttribute('aria-label',`显示 ${c.name}`);check.onchange=()=>{c.enabled=check.checked;render()};const dot=document.createElement('span');dot.className='dot';dot.style.background=c.color;cell.append(check,dot,document.createTextNode(c.name));textCell(row,format(c.value(selected)),'value');textCell(row,Number.isFinite(lo)?format(lo):'不可绘制','value');textCell(row,Number.isFinite(hi)?format(hi):'不可绘制','value');$('channels').append(row);
+ }
+ const x=left+(data.times[selected]-view[0])/range*width;if(x>=left&&x<=right){ctx.strokeStyle='#f2f6ff';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([])}
+ $('position').textContent=`记录 ${selected+1} / ${data.count} · ${data.times[selected]} ms`;$('cursor').value=selected;
+}
+function select(i){if(!data)return;selected=Math.max(0,Math.min(data.count-1,i));render()}
+async function loadFile(file){const ticket=++generation;data=null;$('plot').style.display='none';$('empty').style.display='block';$('channels').replaceChildren();$('notice').textContent='';$('metadata').textContent='';$('position').textContent='尚无记录';$('status').textContent='正在校验并读取本地文件…';try{need(file.size<=64*1024*1024,'初版单文件上限为 64 MiB');const parsed=await parseCapture(await file.arrayBuffer());if(ticket!==generation)return;data=parsed;selected=0;view=[data.minT,data.maxT>data.minT?data.maxT:data.minT+1];$('cursor').max=data.count-1;$('empty').style.display='none';$('plot').style.display='block';$('status').textContent=`${file.name} · ${data.count.toLocaleString()} 条记录 · ${data.channels.length} 通道 · ${data.state} · integrity=${data.quality.integrity||data.manifest?.snapshot.integrity||'unknown'}`;$('notice').textContent=data.warnings.join('\n');$('metadata').textContent=JSON.stringify({header:data.header,manifest:data.manifest,verified_payload_sha256:data.sha},null,2);render()}catch(e){if(ticket!==generation)return;$('status').textContent=`无法打开：${e.message}`;$('empty').textContent='请选择受支持且包含有效记录的文件。';data=null}}
+$('file').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0])};$('cursor').oninput=e=>select(Number(e.target.value));$('prev').onclick=()=>select(selected-1);$('next').onclick=()=>select(selected+1);$('fit').onclick=()=>{if(data){view=[data.minT,data.maxT>data.minT?data.maxT:data.minT+1];render()}};$('zoom').onclick=()=>{if(data){const half=Math.max(.001,(view[1]-view[0])/4),t=data.times[selected];view=[t-half,t+half];render()}};
+cv.onclick=e=>{if(!data)return;const r=cv.getBoundingClientRect(),t=view[0]+(e.clientX-r.left-54)/(r.width-78)*(view[1]-view[0]);let nearest=0,dist=Infinity;for(let i=0;i<data.count;i++){const d=Math.abs(data.times[i]-t);if(d<dist){dist=d;nearest=i}}select(nearest)};window.addEventListener('resize',render);
+window.HssViewer={parseCapture,loadFile,getData:()=>data};
+</script></body></html>

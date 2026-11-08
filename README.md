@@ -27,6 +27,12 @@ Codex、兼容的 SEGGER 软件和探针所需驱动由用户自行准备。本�
 
 连接可能恢复 CPU 运行，故障恢复可能复位目标。操作前确保测试板和控制输出安全；调试使用的 ELF/OUT 应与板内固件对应。
 
+## 离线 HSS Viewer（初版）
+
+用现代浏览器直接打开 [tools/hss-viewer.html](tools/hss-viewer.html)，导入本地 `.capture` 或 `.partial`。单个 HTML 无外部依赖或网络请求，提供统一绘图区、通道独立幅值适配、记录索引和原始值查看。CRC/SHA 校验及质量状态可见，相同时间戳不去重，时间轴不自动校正。
+
+当前已验证真实 3/10 通道 DWARF 标量、旧文件和 partial 前缀。初版单文件上限 64 MiB；raw-address 通道、union 和结构体成员位域暂不绘制，会明确提示。64 位超安全整数保留精确文本。该页面尚未纳入正式安装包，不代表 HSS 时间准确性已通过。
+
 ## 源码构建
 
 开发者需要 Windows x64、[固定的 Rust 工具链](rust-toolchain.toml)、MSVC C++ 构建工具和 Windows SDK。用户安装预编译包不需要这些依赖。
@@ -51,6 +57,7 @@ cargo build --locked --release --target x86_64-pc-windows-msvc -p jlink-mcp -p j
 - `crates/`：四个 crate 的生产源码、源码内单元测试和编译必需资源。
 - `plugins/`、`.agents/plugins/`：Codex 插件、使用指引和市场入口。
 - `scripts/`：源码检查、构建、打包、安装和启动脚本。
+- `tools/`：无需安装的离线工具，当前包含 HSS Viewer 初版。
 - `.github/workflows/`：公开源码检查与预编译包构建流程。
 
 设计资料、实验、独立集成测试、硬件验证脚本和开发上下文保留在开发者本地，不再纳入后续 Git 提交；旧历史不会改写。这些本地文件需要单独备份。
