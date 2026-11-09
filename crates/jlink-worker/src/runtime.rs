@@ -201,14 +201,6 @@ struct WorkerRuntime {
     hss: HssCoordinator,
 }
 
-#[cfg(test)]
-#[path = "hss_native_validation.rs"]
-mod native_validation;
-
-#[cfg(test)]
-#[path = "hss_diagnostic_validation.rs"]
-mod diagnostic_validation;
-
 fn validate_request_contract(request: &IpcRequest) -> Result<(), JlinkError> {
     validate_target_and_after(request)?;
     validate_program_payload(request)?;

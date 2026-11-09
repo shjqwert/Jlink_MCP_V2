@@ -397,19 +397,8 @@ pub(crate) struct DllGateway {
     target_id: Option<u32>,
     hss_started: bool,
     quarantined: bool,
-    #[cfg(test)]
-    pub(crate) hss_test_timing: HssTestTiming,
     path: PathBuf,
     _single_thread: PhantomData<Rc<()>>,
-}
-
-/// Lightweight common observations for both diagnostic arms; no serialization.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct HssTestTiming {
-    pub(crate) start: Option<(Instant, Instant)>,
-    pub(crate) read: Option<(Instant, Instant, i32)>,
-    pub(crate) stop: Option<(Instant, Instant)>,
 }
 
 impl DllGateway {
@@ -452,8 +441,6 @@ impl DllGateway {
             target_id: None,
             hss_started: false,
             quarantined: false,
-            #[cfg(test)]
-            hss_test_timing: HssTestTiming::default(),
             path: path.to_path_buf(),
             _single_thread: PhantomData,
         })
@@ -564,47 +551,18 @@ impl DllGateway {
             JlinkError::new(ErrorCode::HssUnsupported, "HSS period_us 无法表示", false)
         })?;
         let flags = jlink_domain::HSS_START_FLAGS_698A_MAINLINE;
-        if let Some(t) = crate::hss_trace::tick() {
-            crate::hss_trace::emit(
-                "native_start_args",
-                t,
-                t,
-                json!({"period_us":period_us,"flags":flags,"block_count":block_count,
-                    "block_size":std::mem::size_of::<HssBlock>(),
-                    "record_bytes":plan.frame_layout().record_bytes(),
-                    "descriptors":blocks.iter().map(|b| json!({"address":b.address,
-                        "byte_count":b.byte_count,"flags":b.flags,"reserved":b.reserved})).collect::<Vec<_>>()}),
-                false,
-            );
-        }
         let start = self
             .api
             .hss
             .start
             .expect("HSS preflight requires the complete export set");
         log_hss_boundary("native_call=Start boundary=enter");
-        let trace_begin = crate::hss_trace::tick();
-        #[cfg(test)]
-        let native_begin = Instant::now();
         // SAFETY: block layout and call signature are frozen by F0-A; the unique
         // gateway owns the live target and serializes every DLL call.
         let result = unsafe { start(blocks.as_mut_ptr(), block_count, period_us, flags) };
-        #[cfg(test)]
-        {
-            self.hss_test_timing.start = Some((native_begin, Instant::now()));
-        }
         log_hss_boundary(&format!(
             "native_call=Start boundary=return result={result}"
         ));
-        if let Some(begin) = trace_begin {
-            crate::hss_trace::emit(
-                "native_start",
-                begin,
-                crate::hss_trace::tick().unwrap_or(begin),
-                json!({"result":result,"period_us":period_us,"blocks":block_count}),
-                false,
-            );
-        }
         if result < 0 {
             return Err(hss_start_error(result));
         }
@@ -632,9 +590,6 @@ impl DllGateway {
             .hss
             .read
             .expect("HSS preflight requires the complete export set");
-        let trace_begin = crate::hss_trace::tick();
-        #[cfg(test)]
-        let native_begin = Instant::now();
         // SAFETY: `buffer` is writable for its declared length and the ABI is frozen by F0-A.
         let result = unsafe {
             read(
@@ -642,32 +597,6 @@ impl DllGateway {
                 u32::try_from(buffer.len()).expect("fixed HSS buffer fits u32"),
             )
         };
-        #[cfg(test)]
-        {
-            self.hss_test_timing.read = Some((native_begin, Instant::now(), result));
-        }
-        if let Some(begin) = trace_begin {
-            let end = crate::hss_trace::tick().unwrap_or(begin);
-            let first_changed = buffer.iter().position(|b| *b != SENTINEL);
-            let last_changed = buffer.iter().rposition(|b| *b != SENTINEL);
-            let accepted = if result == 0 && buffer[..record_bytes].iter().any(|b| *b != SENTINEL) {
-                record_bytes
-            } else {
-                usize::try_from(result).unwrap_or(0)
-            };
-            crate::hss_trace::emit(
-                "native_read",
-                begin,
-                end,
-                json!({
-                    "result":result,"capacity":buffer.len(),"record_bytes":record_bytes,
-                    "accepted_bytes":accepted,"first_changed":first_changed,"last_changed":last_changed,
-                    "positive_bytes_sha256":crate::hss_trace::positive_read_sha256(buffer, result),
-                    "first_timestamp_raw":if accepted >= 4 && accepted <= buffer.len() {Some(u32::from_le_bytes(buffer[..4].try_into().unwrap()))} else {None}
-                }),
-                false,
-            );
-        }
         if result < 0 {
             return Err(JlinkError::new(
                 ErrorCode::FrameInvalid,
@@ -709,24 +638,8 @@ impl DllGateway {
         // failed Stop against an uncertain DLL state.
         self.hss_started = false;
         log_hss_boundary("native_call=Stop boundary=enter");
-        let trace_begin = crate::hss_trace::tick();
-        #[cfg(test)]
-        let native_begin = Instant::now();
         // SAFETY: the unique gateway owns the matching successful Start call.
         let result = unsafe { stop() };
-        #[cfg(test)]
-        {
-            self.hss_test_timing.stop = Some((native_begin, Instant::now()));
-        }
-        if let Some(begin) = trace_begin {
-            crate::hss_trace::emit(
-                "native_stop",
-                begin,
-                crate::hss_trace::tick().unwrap_or(begin),
-                json!({"result":result}),
-                true,
-            );
-        }
         log_hss_boundary(&format!("native_call=Stop boundary=return result={result}"));
         if result < 0 {
             return Err(JlinkError::new(

@@ -251,15 +251,6 @@ impl HssCoordinator {
         {
             return Err(self.record_start_failure(&capture_id, plan, writer, error));
         }
-        if let Some(t) = crate::hss_trace::tick() {
-            crate::hss_trace::emit(
-                "preflight_begin",
-                t,
-                t,
-                json!({"capture_id":capture_id,"requested_rate_hz":plan.rate_hz()}),
-                false,
-            );
-        }
         if let Err(error) = preflight(io) {
             let error =
                 error.with_detail("start_boundary", json!(StartBoundary::Preflight.label()));
@@ -271,15 +262,6 @@ impl HssCoordinator {
             return Err(self.record_start_failure(&capture_id, plan, writer, error));
         }
         let start_called = Instant::now();
-        if let Some(t) = crate::hss_trace::tick() {
-            crate::hss_trace::emit(
-                "formal_start",
-                t,
-                t,
-                json!({"capture_id":capture_id,"requested_rate_hz":plan.rate_hz()}),
-                false,
-            );
-        }
         let start_result = io.start_hss(&plan);
         let started = Instant::now();
         if let Err(error) = start_result {
@@ -503,9 +485,6 @@ impl HssCoordinator {
     }
 
     fn complete(&mut self, now: Instant) -> Result<bool, JlinkError> {
-        if let Some(t) = crate::hss_trace::tick() {
-            crate::hss_trace::emit("tail_complete", t, t, json!({}), true);
-        }
         let mut active = self
             .active
             .take()
@@ -802,17 +781,6 @@ fn drain_once<I: HssIo>(
     }
     let tail = active.incomplete_tail.split_off(complete_bytes);
     active.incomplete_tail = tail;
-    if let Some(t) = crate::hss_trace::tick() {
-        crate::hss_trace::emit(
-            "worker_drain",
-            t,
-            t,
-            json!({"host_elapsed_us":host_elapsed_us,
-            "bytes":read,"complete_records":active.complete_records,"tail_bytes":active.incomplete_tail.len(),
-            "live":phase == CapturePhase::Live}),
-            false,
-        );
-    }
     if let Some(index) = active.pending_write_impact.take() {
         active.writes[index].samples_after_next_drain = Some(active.complete_records);
     }
