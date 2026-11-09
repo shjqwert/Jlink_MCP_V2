@@ -190,9 +190,21 @@ evidence only; it does not constrain a new capture or prove a maximum rate.
 `source_rate_millihz` and its legacy alias `actual_rate_millihz` use source
 timestamps. `host_arrival_rate_millihz` measures complete frames between live
 host reads, excluding tail reads. It does not establish individual sampling
-times. `source_host_clock_mismatch` invalidates period/runtime use:
-preserve the raw records and both clocks; do not truncate or rescale to match the
-requested duration.
+times.
+
+For whole-capture value analysis, use every complete, decodable record by
+default, including records beyond `expected_samples` and records with equal
+timestamps. Read the original capture resource or page a raw query across the
+actual source range until there is no `next_cursor`. Use record order to resolve
+equal timestamps. Report extrema, thresholds, trends, and sample statistics over
+the full record set. Label sample statistics as such when time weighting matters.
+
+`source_host_clock_mismatch` limits timing conclusions. Continue value and order
+analysis with the full record set. Report the host acquisition window and source
+timestamp span separately, identifying a requested duration or a host elapsed
+value including Stop and tail drain when that is the evidence available. Follow
+the timing-use flags for physical period and runtime estimates. A latency
+calculation across the two clocks requires a separately supported mapping.
 
 Mean source record rate is not a local-period guarantee. Zero source span or
 unresolved local intervals disables timing-use claims while retaining records.
