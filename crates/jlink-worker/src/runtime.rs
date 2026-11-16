@@ -3,8 +3,9 @@ use std::{
     ffi::OsString,
     fmt::Write as _,
     fs,
+    io::{self, Write as _},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
@@ -887,6 +888,9 @@ pub fn run_worker(options: &WorkerOptions) -> Result<(), JlinkError> {
         options.capture_root.join(&identity_hash),
         &options.probe_identity,
     )?;
+    if let Err(error) = install_hss_viewer(&options.capture_root) {
+        eprintln!("无法放置离线 HSS Viewer：{error}");
+    }
     let actual_dll_sha256 = sha256_file(&options.dll_path)?;
     if actual_dll_sha256 != options.dll_sha256 {
         return Err(JlinkError::new(
@@ -988,6 +992,27 @@ fn sha256_file(path: &std::path::Path) -> Result<String, JlinkError> {
     Ok(encoded)
 }
 
+fn install_hss_viewer(capture_root: &Path) -> io::Result<()> {
+    let Some(project_dir) = capture_root
+        .parent()
+        .filter(|dir| dir.ends_with(".jlink-mcp"))
+    else {
+        return Ok(());
+    };
+    let viewer = project_dir.join("hss-viewer.html");
+    if viewer.try_exists()? {
+        return Ok(());
+    }
+
+    let mut temporary = tempfile::NamedTempFile::new_in(project_dir)?;
+    temporary.write_all(include_bytes!("../../../tools/hss-viewer.html"))?;
+    match temporary.persist_noclobber(viewer) {
+        Ok(_) => Ok(()),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error.error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -998,6 +1023,25 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn installs_viewer_at_project_root_and_preserves_existing_viewer() {
+        let project = tempfile::tempdir().unwrap();
+        let project_dir = project.path().join(".jlink-mcp");
+        let capture_root = project_dir.join("captures");
+        fs::create_dir_all(&capture_root).unwrap();
+
+        install_hss_viewer(&capture_root).unwrap();
+
+        let viewer = project_dir.join("hss-viewer.html");
+        assert_eq!(
+            fs::read(&viewer).unwrap().as_slice(),
+            include_bytes!("../../../tools/hss-viewer.html")
+        );
+        fs::write(&viewer, b"existing viewer").unwrap();
+        install_hss_viewer(&capture_root).unwrap();
+        assert_eq!(fs::read(&viewer).unwrap().as_slice(), b"existing viewer");
+    }
 
     #[test]
     fn uncertain_hss_cleanup_quarantines_device_commands_but_preserves_status() {
