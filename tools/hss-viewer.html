@@ -5,10 +5,61 @@
 .file{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}.table-scroll{overflow-x:auto}table{min-width:620px}#channels td:first-child{overflow-wrap:anywhere;max-width:340px}@media(max-width:700px){.file{max-width:100%;font-size:13px;margin-top:8px}input[type=file]{max-width:100%}}
 .timing{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin:12px 18px}.timing div{padding:10px 12px;background:#202d42;border-radius:8px}.timing dt{color:#aec5e8;font-size:13px}.timing dd{margin:4px 0 0;font-variant-numeric:tabular-nums}.timing small{display:block;color:#aebed3;margin-top:4px}#timing[hidden]{display:none}#axis{font:inherit;color:inherit;background:#202d42;border:1px solid #3a4b66;border-radius:8px;padding:8px}#timing-note{color:#aebed3;margin:6px 0}
 .channel-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 18px;border-top:1px solid #2a364a;font-size:13px}.channel-controls label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}.channel-controls input{accent-color:#68a5ff}#channel-count{color:#aebed3}button:disabled{opacity:.45;cursor:default}
+.plot-caption{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px 18px;padding:0 18px;color:#aebed3;font-size:13px;overflow-wrap:anywhere}
+.plot-caption[hidden]{display:none}.plot-caption strong{color:#aecaf7}#scale-reference{color:#aebed3}#scale-overflow{color:#e5b76c}
+.table-scroll table{min-width:740px}.table-scroll th:last-child{text-align:right}
+.scale-cell{text-align:right;white-space:nowrap}.scale-controls{display:inline-flex;align-items:center;gap:5px}
+.scale-controls button{padding:3px 9px}.scale-controls button:nth-child(2){min-width:110px;font-variant-numeric:tabular-nums;color:#c6dbff}
+.scale-note{display:block;color:#e5b76c;margin-top:4px;font-size:12px}
+.scale-note[hidden],dialog [hidden]{display:none}
+.keyboard-scales{display:flex;flex-wrap:wrap;align-items:center;gap:6px;color:#aebed3;font-size:13px}
+.keyboard-scales[hidden]{display:none}.keyboard-scales button{padding:5px 8px}
+.keyboard-scales button[aria-pressed=true]{background:#284370;border-color:#5687dd;color:#e2e8f0}
+#scale-target{overflow-wrap:anywhere}
+#channels tr.current-channel{background:#202d42}
+.channel-name{padding:2px 4px;background:transparent;border-color:transparent;text-align:left;overflow-wrap:anywhere}
+.channel-name[aria-pressed=true]{color:#c6dbff}
+dialog{width:min(470px,calc(100% - 28px));color:inherit;background:#171f2c;border:1px solid #3a4b66;border-radius:12px;padding:20px}
+dialog::backdrop{background:#080d16bf}dialog h2{margin:0 0 12px;font-size:18px}
+dialog label{display:grid;gap:5px;margin:8px 0;color:#aec5e8;font-size:13px}
+dialog select,dialog input{max-width:100%;min-width:0;background:#202d42;color:#e2e8f0;border:1px solid #3a4b66;border-radius:6px;padding:7px;font:inherit}
+.dialog-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}.dialog-actions button[value=apply]{background:#3165cb;border-color:#5687dd}
 </style></head><body>
-<header><div><h1>HSS <span style="color:#72a7ff">/</span> 离线波形</h1><p>原始时间与原始值 · 独立幅值适配 · 所有数据留在本机</p></div><label class="file">导入采集文件 <input id="file" type="file" accept=".capture,.partial" aria-label="导入采集文件"></label></header>
-<div class="toolbar"><button id="fit">显示全部</button><button id="zoom" title="以当前选中点为锚点放大" disabled>＋ 放大</button><button id="zoom-out" title="以当前选中点为锚点缩小" disabled>－ 缩小</button><label>横轴 <select id="axis" disabled><option value="source">源时间（ms）</option><option value="record">记录序号</option></select></label><span style="color:#94a3b8;font-size:13px">折线和采样点 · 白圈标出选中点 · 各通道独立缩放</span></div>
-<section class="panel"><div id="status" role="status">等待导入 .capture / .partial 文件</div><dl id="timing" class="timing" hidden><div><dt>主机采集窗口</dt><dd id="host-window"></dd><small id="host-basis"></small></div><div><dt>源时间跨度</dt><dd id="source-span"></dd><small id="source-bounds"></small></div></dl><p id="notice"></p><div id="empty">导入本地采集文件，开始查看波形。<br><p>按文件顺序查看全部通过校验的完整记录。</p></div><canvas id="plot" aria-label="统一通道波形图"></canvas><div class="controls"><button id="prev" aria-label="上一条记录">←</button><input id="cursor" type="range" min="0" max="0" value="0" aria-label="记录索引"><button id="next" aria-label="下一条记录">→</button><span id="position">尚无记录</span></div><div class="channel-controls"><label><input id="select-all" type="checkbox" disabled>全选</label><span id="channel-count"></span></div><div class="table-scroll" role="region" aria-label="通道原始值，可横向滚动" tabindex="0"><table><thead><tr><th>通道</th><th>当前原始值</th><th>可见最小值</th><th>可见最大值</th></tr></thead><tbody id="channels"></tbody></table></div></section>
+<header><div><h1>HSS <span style="color:#72a7ff">/</span> 离线波形</h1><p>原始时间与原始值 · 所有数据留在本机</p></div><label class="file">导入采集文件 <input id="file" type="file" accept=".capture,.partial" aria-label="导入采集文件"></label></header>
+<div id="viewer-toolbar" class="toolbar">
+ <button id="fit" aria-keyshortcuts="Control+H">显示全部 <kbd>Ctrl+H</kbd></button>
+ <button id="zoom" title="以当前选中点为锚点放大横轴（]）" disabled>＋ 横向放大</button>
+ <button id="zoom-out" title="以当前选中点为锚点缩小横轴（[）" disabled>－ 横向缩小</button>
+ <label>横轴 <select id="axis" disabled><option value="source">源时间（ms）</option><option value="record">记录序号</option></select></label>
+ <div id="scale-scope" class="keyboard-scales" role="group" aria-label="纵轴快捷键调节范围" hidden>
+  <span>纵轴 − / +</span>
+  <button type="button" data-scope="current" aria-pressed="true">当前通道</button>
+  <button type="button" data-scope="checked" aria-pressed="false">已勾选通道</button>
+  <span id="scale-target" aria-live="polite"></span>
+ </div>
+</div>
+<section class="panel">
+ <div id="status" role="status">等待导入 .capture / .partial 文件</div>
+ <dl id="timing" class="timing" hidden><div><dt>主机采集窗口</dt><dd id="host-window"></dd><small id="host-basis"></small></div><div><dt>源时间跨度</dt><dd id="source-span"></dd><small id="source-bounds"></small></div></dl>
+ <p id="notice"></p><div id="empty">导入本地采集文件，开始查看波形。<br><p>按文件顺序查看全部通过校验的完整记录。</p></div>
+ <div id="plot-caption" class="plot-caption" hidden><span><strong>纵轴固定</strong> <span id="scale-reference"></span></span><span id="scale-overflow" role="status"></span></div>
+ <canvas id="plot" tabindex="0" aria-label="统一通道波形图"></canvas>
+ <div class="controls"><button id="prev" aria-label="上一条记录">←</button><input id="cursor" type="range" min="0" max="0" value="0" aria-label="记录索引"><button id="next" aria-label="下一条记录">→</button><span id="position">尚无记录</span></div>
+ <div class="channel-controls"><label><input id="select-all" type="checkbox" disabled>全选</label><span id="channel-count"></span></div>
+ <div id="channel-table" class="table-scroll" role="region" aria-label="通道原始值和纵轴比例，可横向滚动" tabindex="0"><table><thead><tr><th>通道</th><th>当前原始值</th><th>可见最小值</th><th>可见最大值</th><th>纵轴比例</th></tr></thead><tbody id="channels"></tbody></table></div>
+</section>
+<dialog id="scale-dialog" aria-labelledby="scale-title">
+ <form id="scale-form" method="dialog">
+  <h2 id="scale-title">导入时设置纵轴</h2>
+  <label id="scale-mode-label">初始比例<select id="scale-mode"><option value="auto">按全文件适配一次</option><option value="manual">手动设置通道</option></select></label>
+  <div id="scale-fields" hidden>
+   <label>通道<select id="scale-channel"></select></label>
+   <label>每格数值（原始单位）<input id="scale-value" type="number" step="any" required></label>
+   <label>纵轴中心<input id="scale-center" type="number" step="any" required></label>
+  </div>
+  <div class="dialog-actions"><button type="submit" value="cancel" formnovalidate>取消</button><button type="submit" value="apply">应用</button></div>
+ </form>
+</dialog>
 <details id="details"><summary>文件信息与质量证据</summary><p><label>关联同次采集的诊断计时（可选） <input id="timing-file" type="file" accept=".json" disabled></label></p><p id="timing-note" role="status"></p><pre id="metadata"></pre></details><footer>离线初版 · 支持 JMCPV101 自描述格式，单文件上限 64 MiB。点密集时按屏幕像素保留首尾点和极值，放大或按记录逐点查看。64 位超安全整数保留精确文本，不绘制不可靠幅值。</footer>
 <script>
 'use strict';
@@ -133,19 +184,226 @@ function measuredHostWindow(receipt,capture){
 }
 const cv=$('plot'),ctx=cv.getContext('2d');
 function textCell(row,text,cls=''){const td=document.createElement('td');td.className=cls;td.textContent=text;row.append(td);return td}
-function format(v){return typeof v==='bigint'?v.toString():Number.isFinite(v)?String(v):String(v)}
-function render(){if(!data)return;const rect=cv.getBoundingClientRect(),dpr=devicePixelRatio||1,w=rect.width,h=rect.height;cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);const left=54,right=w-24,top=22,bottom=h-38,width=right-left,range=Math.max(1e-9,view[1]-view[0]);
+const format=String;
+const scaleDialog=$('scale-dialog'),scaleMode=$('scale-mode'),scaleChannel=$('scale-channel');
+const scaleValue=$('scale-value'),scaleCenter=$('scale-center');
+const scaleScope=$('scale-scope'),scaleScopeButtons=[...scaleScope.querySelectorAll('button')];
+let currentChannel=null,keyboardScaleScope='current',scaleDrafts=new Map(),visibleRanges=null;
+const yDivisions=4,plotLeft=78,plotRight=24;
+
+function plotNumber(value){return Number.isFinite(value)?String(Number(value.toPrecision(6))):'—'}
+function isPlotNumber(value){return typeof value==='number'&&Number.isFinite(value)}
+function bounds(channel,windowRange){
+ let min=Infinity,max=-Infinity;
+ for(let i=0;i<data.count;i++){
+  if(windowRange){
+   const x=xValue(i);
+   if(x<windowRange[0]||x>windowRange[1])continue;
+  }
+  const value=channel.value(i);
+  if(isPlotNumber(value)){min=Math.min(min,value);max=Math.max(max,value)}
+ }
+ return {min,max};
+}
+function neighboringScale(scale,larger){
+ const exponent=Math.floor(Math.log10(scale));
+ let best=larger?Infinity:0;
+ for(let power=Math.max(-324,exponent-1);power<=Math.min(308,exponent+1);power++){
+  for(const multiplier of [1,2,5]){
+   const step=Number(multiplier+'e'+power);
+   if(larger&&step>scale&&step<best)best=step;
+   if(!larger&&step<scale&&step>best)best=step;
+  }
+ }
+ return best>0&&Number.isFinite(best)?best:scale;
+}
+function suggestedScale({min,max}){
+ if(!Number.isFinite(min))return null;
+ const center=min===max?min:min/2+max/2;
+ // Divide before subtracting so even a span across both signed float limits fits.
+ const required=min===max?Math.abs(center)*.1||1:(max/yDivisions-min/yDivisions)*1.1;
+ return {center,scale:neighboringScale(Math.max(Number.MIN_VALUE,required),true)};
+}
+function divisionsFromCenter(value,{center,scale}){
+ const delta=value-center;
+ return Number.isFinite(delta)?delta/scale:value/scale-center/scale;
+}
+function setChannelScale(channel,setting){
+ channel.vertical=setting;
+ currentChannel=channel;
+}
+function setupChannelRows(){
+ const table=$('channels');
+ table.replaceChildren();
+ for(const channel of data.channels){
+  channel.fullBounds=bounds(channel);
+  channel.vertical=suggestedScale(channel.fullBounds);
+  const row=document.createElement('tr'),nameCell=textCell(row,'');
+  const checkbox=document.createElement('input');
+  checkbox.type='checkbox';checkbox.checked=channel.enabled;
+  checkbox.setAttribute('aria-label',`显示 ${channel.name}`);
+  checkbox.onchange=()=>{channel.enabled=checkbox.checked;render()};
+  const dot=document.createElement('span');
+  dot.className='dot';dot.style.background=channel.color;
+  const name=document.createElement('button');
+  name.type='button';name.className='channel-name';name.textContent=channel.name;
+  name.disabled=!channel.vertical;
+  name.onclick=()=>{currentChannel=channel;render()};
+  nameCell.append(checkbox,dot,name);
+  const readings=['','',''].map(text=>textCell(row,text,'value'));
+  const cell=textCell(row,'','scale-cell');
+  const controls=document.createElement('div');
+  controls.className='scale-controls';
+  const buttons=['−','','+'].map((label,i)=>{
+   const button=document.createElement('button');
+   button.type='button';button.textContent=label;button.disabled=!channel.vertical;
+   button.setAttribute('aria-label',`${['缩小','设置','放大'][i]} ${channel.name} 纵轴`);
+   controls.append(button);
+   return button;
+  });
+  buttons[0].onclick=()=>adjustScale(channel,true);
+  buttons[1].onclick=()=>openScaleDialog(channel);
+  buttons[2].onclick=()=>adjustScale(channel,false);
+  const overflow=document.createElement('span');
+  overflow.className='scale-note';overflow.hidden=true;
+  cell.append(controls,overflow);
+  table.append(row);
+  channel.row={row,name,checkbox,readings,scale:buttons[1],overflow};
+ }
+ currentChannel=data.channels.find(channel=>channel.vertical)??null;
+}
+function adjustScale(channel,larger){
+ const {center,scale}=channel.vertical;
+ setChannelScale(channel,{center,scale:neighboringScale(scale,larger)});
+ render();
+}
+function checkedScaleChannels(){
+ return data.channels.filter(channel=>channel.enabled&&channel.vertical);
+}
+function updateScaleTarget(){
+ for(const button of scaleScopeButtons){
+  button.setAttribute('aria-pressed',String(button.dataset.scope===keyboardScaleScope));
+ }
+ const checked=data.channels.filter(channel=>channel.enabled).length;
+ const adjustable=checkedScaleChannels().length;
+ const target=keyboardScaleScope==='current'
+  ? currentChannel?.name??'无可调节通道'
+  : `已勾选 ${checked} 个通道${checked===adjustable?'':` · 可调节 ${adjustable} 个`}`;
+ const label=$('scale-target');
+ if(label.textContent!==target)label.textContent=target;
+}
+scaleScope.onclick=event=>{
+ const choice=event.target.closest('button[data-scope]');
+ if(!choice)return;
+ keyboardScaleScope=choice.dataset.scope;
+ updateScaleTarget();
+};
+function adjustKeyboardScale(larger){
+ if(keyboardScaleScope==='current'){
+  if(currentChannel)adjustScale(currentChannel,larger);
+  return;
+ }
+ const channels=checkedScaleChannels(),factor=larger?2:.5;
+ const scales=channels.map(channel=>channel.vertical.scale*factor);
+ // Keep the group together when a channel cannot represent the next scale.
+ if(scales.some((scale,i)=>!Number.isFinite(scale)||scale<=0||scale/factor!==channels[i].vertical.scale))return;
+ channels.forEach((channel,i)=>{channel.vertical.scale=scales[i]});
+ render();
+}
+function showScaleFields(){
+ const hidden=scaleMode.value!=='manual';
+ $('scale-fields').hidden=hidden;
+ scaleChannel.disabled=scaleValue.disabled=scaleCenter.disabled=hidden;
+}
+function loadScaleFields(){
+ const channel=data.channels[Number(scaleChannel.value)];
+ const setting=scaleDrafts.get(channel)??channel.vertical;
+ scaleValue.setCustomValidity('');
+ scaleValue.value=setting.scale;
+ scaleCenter.value=setting.center;
+}
+function openScaleDialog(channel){
+ const drawable=data.channels.filter(c=>c.vertical&&(!channel||c===channel));
+ if(!drawable.length)return;
+ scaleDrafts=new Map();
+ $('scale-title').textContent=channel?'调整通道纵轴':'导入时设置纵轴';
+ $('scale-mode-label').hidden=Boolean(channel);
+ scaleMode.value=channel?'manual':'auto';
+ scaleChannel.replaceChildren(...drawable.map(c=>new Option(c.name,data.channels.indexOf(c))));
+ loadScaleFields();
+ showScaleFields();
+ scaleDialog.showModal();
+}
+scaleMode.onchange=showScaleFields;
+scaleChannel.onchange=loadScaleFields;
+function recordScaleDraft(){
+ const scale=scaleValue.valueAsNumber,center=scaleCenter.valueAsNumber;
+ scaleValue.setCustomValidity(scale>0&&Number.isFinite(scale)?'':'每格数值须为大于零的有限数值。');
+ if(scaleValue.validity.valid&&scaleCenter.validity.valid){
+  scaleDrafts.set(data.channels[Number(scaleChannel.value)],{scale,center});
+ }
+}
+scaleValue.oninput=scaleCenter.oninput=recordScaleDraft;
+$('scale-form').onsubmit=event=>{
+ if(event.submitter?.value==='apply'&&scaleMode.value==='manual'){
+  for(const [channel,setting] of scaleDrafts)setChannelScale(channel,setting);
+  render();
+ }
+};
+
+function render(){
+ if(!data)return;
+ const rect=cv.getBoundingClientRect(),dpr=devicePixelRatio||1,w=rect.width,h=rect.height;
+ cv.width=w*dpr;cv.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);
+ const left=plotLeft,right=w-plotRight,top=22,bottom=h-38,width=right-left,range=Math.max(1e-9,view[1]-view[0]);
  const [fullStart,fullEnd]=fullRange();
+ if(visibleRanges?.view!==view){
+  const isFullView=view[0]===fullStart&&view[1]===fullEnd;
+  visibleRanges={view,ranges:data.channels.map(channel=>isFullView?channel.fullBounds:bounds(channel,view))};
+ }
  $('zoom').disabled=range<=1;
  $('zoom-out').disabled=range>=fullEnd-fullStart;
  updateChannelSelection();
- ctx.font='12px system-ui';ctx.strokeStyle='#2b394e';ctx.fillStyle='#8a9dbb';const ticks=w<500?3:5;for(let k=0;k<=ticks;k++){const x=left+width*k/ticks,t=view[0]+range*k/ticks;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.textAlign=k===0?'left':k===ticks?'right':'center';ctx.fillText(axis.value==='record'?String(Math.round(t)):t.toFixed(2),x,bottom+23)}ctx.textAlign='left';for(let k=0;k<=4;k++){const y=top+(bottom-top)*k/4;ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(right,y);ctx.stroke()}
- $('channels').replaceChildren();
- for(const c of data.channels){let lo=Infinity,hi=-Infinity;for(let i=0;i<data.count;i++){const x=xValue(i);if(x<view[0]||x>view[1])continue;const value=c.value(i);if(typeof value==='number'&&Number.isFinite(value)){lo=Math.min(lo,value);hi=Math.max(hi,value)}}
-  if(c.enabled&&Number.isFinite(lo)){
+ updateScaleTarget();
+ const reference=currentChannel?.enabled?currentChannel:data.channels.find(channel=>channel.enabled&&channel.vertical);
+ $('scale-reference').textContent=reference?`· 刻度参考 ${reference.name}`:'';
+ ctx.font='12px system-ui';ctx.strokeStyle='#2b394e';ctx.fillStyle='#aebed3';const ticks=w<500?3:5;for(let k=0;k<=ticks;k++){const x=left+width*k/ticks,t=view[0]+range*k/ticks;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.textAlign=k===0?'left':k===ticks?'right':'center';ctx.fillText(axis.value==='record'?String(Math.round(t)):t.toFixed(2),x,bottom+23)}
+ ctx.textAlign='right';ctx.textBaseline='middle';
+ const divisionHeight=(bottom-top)/yDivisions;
+ for(let k=0;k<=yDivisions;k++){
+  const y=top+divisionHeight*k;
+  ctx.beginPath();ctx.moveTo(left,y);ctx.lineTo(right,y);ctx.stroke();
+  if(reference){
+   const {center,scale}=reference.vertical;
+   ctx.fillText(plotNumber(center+(yDivisions/2-k)*scale),left-7,y,left-11);
+  }
+ }
+ // Paint the current channel last while retaining the original table and range indices.
+ const drawOrder=data.channels.map((_,index)=>index);
+ const foreground=data.channels.indexOf(currentChannel);
+ if(foreground>=0){
+  drawOrder.splice(foreground,1);
+  drawOrder.push(foreground);
+ }
+ let overflowing=0;
+ for(const index of drawOrder){
+  const c=data.channels[index];
+  const {min:lo,max:hi}=visibleRanges.ranges[index];
+  const hasVisibleValues=Number.isFinite(lo);
+  const t=xValue(selected),value=c.value(selected);
+  let overflow='';
+  if(c.enabled&&c.vertical&&hasVisibleValues){
+   const overTop=divisionsFromCenter(hi,c.vertical)>yDivisions/2;
+   const overBottom=divisionsFromCenter(lo,c.vertical)<-yDivisions/2;
+   if(overTop||overBottom){
+    overflow=`${overTop&&overBottom?'↑↓':overTop?'↑':'↓'} 超出纵轴`;
+    overflowing++;
+   }
+   ctx.save();
+   ctx.beginPath();ctx.rect(left,top,width,bottom-top);ctx.clip();
    ctx.strokeStyle=c.color;ctx.lineWidth=1.4;ctx.beginPath();
-   const dots=new Path2D(),radius=2.1,amplitude=hi-lo||1;
-   const yValue=value=>hi===lo?(top+bottom)/2:bottom-(value-lo)/amplitude*(bottom-top);
+   const dots=new Path2D(),radius=2.1;
+   const yValue=sample=>(top+bottom)/2-divisionsFromCenter(sample,c.vertical)*divisionHeight;
    let started=false,bucket=-1,points=[];
    function flush(){
     if(!points.length)return;
@@ -156,7 +414,8 @@ function render(){if(!data)return;const rect=cv.getBoundingClientRect(),dpr=devi
     }
     const keep=[...new Set([0,min,max,points.length-1])].sort((a,b)=>a-b);
     for(const i of keep){
-     const [x,y]=points[i];
+     const [x,sample]=points[i],y=yValue(sample);
+     if(!Number.isFinite(y)){started=false;continue}
      if(started)ctx.lineTo(x,y);else{ctx.moveTo(x,y);started=true}
      dots.moveTo(x+radius,y);dots.arc(x,y,radius,0,2*Math.PI);
     }
@@ -166,21 +425,31 @@ function render(){if(!data)return;const rect=cv.getBoundingClientRect(),dpr=devi
     const t=xValue(i);
     if(t<view[0]||t>view[1]){flush();started=false;continue}
     const value=c.value(i);
-    if(typeof value!=='number'||!Number.isFinite(value)){flush();started=false;continue}
+    if(!isPlotNumber(value)){flush();started=false;continue}
     const x=left+(t-view[0])/range*width,px=Math.floor(x);
     if(px!==bucket){flush();bucket=px}
-    points.push([x,yValue(value)]);
+    points.push([x,value]);
    }
    flush();ctx.stroke();ctx.fillStyle=c.color;ctx.fill(dots);
-   const t=xValue(selected),value=c.value(selected);
-   if(t>=view[0]&&t<=view[1]&&typeof value==='number'&&Number.isFinite(value)){
+   if(t>=view[0]&&t<=view[1]&&isPlotNumber(value)&&Math.abs(divisionsFromCenter(value,c.vertical))<=yDivisions/2){
     const x=left+(t-view[0])/range*width,y=yValue(value);
     ctx.beginPath();ctx.arc(x,y,radius,0,2*Math.PI);ctx.fill();
     ctx.strokeStyle='#f2f6ff';ctx.beginPath();ctx.arc(x,y,5,0,2*Math.PI);ctx.stroke();
    }
+   ctx.restore();
   }
-  const row=document.createElement('tr'),cell=textCell(row,'');const check=document.createElement('input');check.type='checkbox';check.checked=c.enabled;check.setAttribute('aria-label',`显示 ${c.name}`);check.onchange=()=>{c.enabled=check.checked;render()};const dot=document.createElement('span');dot.className='dot';dot.style.background=c.color;cell.append(check,dot,document.createTextNode(c.name));textCell(row,format(c.value(selected)),'value');textCell(row,Number.isFinite(lo)?format(lo):'不可绘制','value');textCell(row,Number.isFinite(hi)?format(hi):'不可绘制','value');$('channels').append(row);
+  const {row,name,checkbox,readings,scale,overflow:scaleNote}=c.row;
+  row.classList.toggle('current-channel',c===currentChannel);
+  name.setAttribute('aria-pressed',String(c===currentChannel));
+  checkbox.checked=c.enabled;
+  readings[0].textContent=format(value);
+  readings[1].textContent=hasVisibleValues?format(lo):'不可绘制';
+  readings[2].textContent=hasVisibleValues?format(hi):'不可绘制';
+  scale.textContent=c.vertical?`${plotNumber(c.vertical.scale)} 单位/格`:'—';
+  scaleNote.hidden=!overflow;
+  scaleNote.textContent=overflow;
  }
+ $('scale-overflow').textContent=overflowing?`${overflowing} 个通道超出纵轴`:'';
  const x=left+(xValue(selected)-view[0])/range*width;if(x>=left&&x<=right){ctx.strokeStyle='#f2f6ff';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.setLineDash([])}
  $('position').textContent=`记录 ${selected+1} / ${data.count} · 源时间 ${data.times[selected]} ms`;$('cursor').value=selected;
 }
@@ -192,10 +461,12 @@ function select(i,follow=false){
 }
 async function loadFile(file){
  const ticket=++generation;
- data=null;hostWindowUs=null;axis.disabled=true;
+ if(scaleDialog.open)scaleDialog.close();
+ data=null;hostWindowUs=null;axis.disabled=true;currentChannel=null;visibleRanges=null;scaleDrafts.clear();
  $('zoom').disabled=true;$('zoom-out').disabled=true;updateChannelSelection();
+ scaleScope.hidden=true;
  $('timing').hidden=true;$('timing-file').value='';$('timing-file').disabled=true;$('timing-note').textContent='';
- $('plot').style.display='none';$('empty').style.display='block';$('channels').replaceChildren();
+ $('plot').style.display='none';$('empty').style.display='block';$('plot-caption').hidden=true;$('channels').replaceChildren();
  $('notice').textContent='';$('metadata').textContent='';$('position').textContent='尚无记录';
  $('status').textContent='正在校验并读取本地文件…';
  try{
@@ -203,12 +474,14 @@ async function loadFile(file){
   const parsed=await parseCapture(await file.arrayBuffer());
   if(ticket!==generation)return;
   data=parsed;selected=0;axis.value=data.clockMismatch?'record':'source';axis.disabled=false;fitView();
+  setupChannelRows();
   $('cursor').max=data.count-1;$('timing-file').disabled=!data.complete;
-  $('empty').style.display='none';$('plot').style.display='block';
+  scaleScope.hidden=false;
+  $('empty').style.display='none';$('plot').style.display='block';$('plot-caption').hidden=false;
   $('status').textContent=`${file.name} · ${data.count.toLocaleString()} 条完整记录 · ${data.channels.length} 通道 · ${data.state}`;
   $('notice').textContent=data.warnings.join('\n');
   $('metadata').textContent=JSON.stringify({header:data.header,manifest:data.manifest,verified_payload_sha256:data.sha},null,2);
-  showTiming();render();
+  showTiming();render();openScaleDialog();
  }catch(e){
   if(ticket!==generation)return;
   $('status').textContent=`无法打开：${e.message}`;$('empty').textContent='请选择受支持且包含有效记录的文件。';data=null;
@@ -231,7 +504,8 @@ async function loadTiming(file){
 }
 $('file').onchange=e=>{if(e.target.files[0])loadFile(e.target.files[0])};
 $('timing-file').onchange=e=>{if(e.target.files[0])loadTiming(e.target.files[0])};
-axis.onchange=$('fit').onclick=()=>{if(data){fitView();render()}};
+function showFullRange(){if(data){fitView();render()}}
+axis.onchange=$('fit').onclick=showFullRange;
 $('cursor').oninput=e=>select(Number(e.target.value),true);
 $('prev').onclick=()=>select(selected-1,true);
 $('next').onclick=()=>select(selected+1,true);
@@ -242,6 +516,31 @@ selectAll.onchange=()=>{
  for(const channel of data.channels)channel.enabled=selectAll.checked;
  render();
 };
-cv.onclick=e=>{if(!data)return;const r=cv.getBoundingClientRect(),t=view[0]+(e.clientX-r.left-54)/(r.width-78)*(view[1]-view[0]);let nearest=0,dist=Infinity;for(let i=0;i<data.count;i++){const d=Math.abs(xValue(i)-t);if(d<dist){dist=d;nearest=i}}select(nearest)};window.addEventListener('resize',render);
+document.addEventListener('keydown',event=>{
+ const target=event.target;
+ if(!data||scaleDialog.open||event.defaultPrevented||event.isComposing||event.altKey||event.metaKey||
+    !(target instanceof Element)||!target.closest('#viewer-toolbar,#plot,.controls,#channel-table,.channel-controls')||
+    target.isContentEditable||target.matches('input:not([type=checkbox]):not([type=range]),select,textarea'))return;
+ if(event.ctrlKey){
+  if(event.shiftKey||event.key.toLowerCase()!=='h')return;
+  event.preventDefault();
+  showFullRange();
+  return;
+ }
+ switch(event.key){
+  case 'ArrowLeft':select(selected-1,true);break;
+  case 'ArrowRight':select(selected+1,true);break;
+  case '[':zoomAtSelection(2);break;
+  case ']':zoomAtSelection(.5);break;
+  case '-':adjustKeyboardScale(true);break;
+  case '+':adjustKeyboardScale(false);break;
+  default:return;
+ }
+ event.preventDefault();
+});
+scaleDialog.addEventListener('close',()=>{
+ if(data&&!$('scale-mode-label').hidden)cv.focus({preventScroll:true});
+});
+cv.onclick=e=>{if(!data)return;const r=cv.getBoundingClientRect(),t=view[0]+(e.clientX-r.left-plotLeft)/(r.width-plotLeft-plotRight)*(view[1]-view[0]);let nearest=0,dist=Infinity;for(let i=0;i<data.count;i++){const d=Math.abs(xValue(i)-t);if(d<dist){dist=d;nearest=i}}select(nearest)};window.addEventListener('resize',render);
 window.HssViewer={parseCapture,loadFile,getData:()=>data};
 </script></body></html>
