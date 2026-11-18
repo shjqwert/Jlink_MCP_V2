@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{BufWriter, ErrorKind, Read, Seek, SeekFrom, Write},
@@ -15,7 +16,11 @@ use jlink_domain::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use windows_sys::Win32::{Foundation::GetLastError, Storage::FileSystem::GetDiskFreeSpaceExW};
+use windows_sys::Win32::{
+    Foundation::{FILETIME, GetLastError, SYSTEMTIME},
+    Storage::FileSystem::GetDiskFreeSpaceExW,
+    System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTimeEx},
+};
 
 const FILE_MAGIC: &[u8; 8] = b"JMCPV101";
 const BLOCK_MAGIC: &[u8; 4] = b"BLK1";
@@ -271,6 +276,12 @@ pub struct CaptureStore {
     root: PathBuf,
 }
 
+#[derive(Default)]
+struct CapturePaths {
+    completed: Option<PathBuf>,
+    partial: Option<PathBuf>,
+}
+
 impl CaptureStore {
     /// Creates or opens one local store root without modifying completed captures.
     ///
@@ -390,21 +401,19 @@ impl CaptureStore {
         validate_capture_id(capture_id)?;
         target.validate()?;
         self.preflight(plan, max_bytes)?;
-        let partial_path = self.partial_path(capture_id);
-        let completed_path = self.completed_path(capture_id);
-        if completed_path.exists() {
-            return Err(storage_error("不可变完成 capture 已存在，拒绝覆盖")
-                .with_detail("capture_id", json!(capture_id)));
-        }
+        let _name_lock = lock_capture_names(&self.root)?;
+        let created_unix_us = unix_time_us()?;
+        let date = capture_local_date(created_unix_us)?;
+        let partial_path = next_partial_path(&self.root, &date, capture_id)?;
         let header = CaptureHeader {
             capture_id: capture_id.to_owned(),
             capture_key: plan.capture_key().to_owned(),
             request_fingerprint: plan.request_fingerprint().to_owned(),
-            created_unix_us: unix_time_us()?,
+            created_unix_us,
             target: target.clone(),
             plan: plan.clone(),
         };
-        CaptureWriter::create(partial_path, completed_path, header, max_bytes)
+        CaptureWriter::create(partial_path, header, max_bytes)
     }
 
     /// Opens and fully verifies one immutable completed resource.
@@ -414,7 +423,16 @@ impl CaptureStore {
     /// Returns a stable identity, frame, CRC, digest, or local storage error.
     pub fn open_snapshot(&self, capture_id: &str) -> Result<CaptureSnapshot, JlinkError> {
         validate_capture_id(capture_id)?;
-        let path = self.completed_path(capture_id);
+        let path = find_capture_paths(&self.root, capture_id)?
+            .completed
+            .ok_or_else(|| {
+                storage_error("找不到完成 capture").with_detail("capture_id", json!(capture_id))
+            })?;
+        Self::open_snapshot_at(path, capture_id)
+    }
+
+    fn open_snapshot_at(path: PathBuf, capture_id: &str) -> Result<CaptureSnapshot, JlinkError> {
+        validate_capture_id(capture_id)?;
         let scan = scan_capture(&path, false)?;
         if scan.header.capture_id != capture_id {
             return Err(invalid_store("完成 capture 文件名与自描述身份不一致")
@@ -444,33 +462,30 @@ impl CaptureStore {
     /// Returns a stable identity, frame, CRC, digest, or local storage error.
     pub fn find_snapshot(&self, capture_id: &str) -> Result<Option<CaptureSnapshot>, JlinkError> {
         validate_capture_id(capture_id)?;
-        let path = self.completed_path(capture_id);
-        match fs::metadata(&path) {
-            Ok(metadata) if metadata.is_file() => self.open_snapshot(capture_id).map(Some),
-            Ok(_) => Err(invalid_store(format!(
-                "完成 capture 路径不是文件：{}",
-                path.display()
-            ))),
-            Err(error) if error.kind() == ErrorKind::NotFound => {
-                self.find_partial_snapshot(capture_id)
+        let paths = find_capture_paths(&self.root, capture_id)?;
+        if let Some(path) = paths.completed {
+            return Self::open_snapshot_at(path, capture_id).map(Some);
+        }
+        let Some(path) = paths.partial else {
+            return Ok(None);
+        };
+        // A writer can publish the same stem between directory enumeration and open.
+        match Self::open_partial_snapshot(&path, capture_id) {
+            Ok(snapshot) => Ok(Some(snapshot)),
+            Err(error) if !path.exists() => {
+                let completed = path.with_extension("capture");
+                if completed.exists() {
+                    Self::open_snapshot_at(completed, capture_id).map(Some)
+                } else {
+                    Err(error)
+                }
             }
-            Err(error) => Err(storage_error(format!(
-                "无法读取完成 capture 元数据 {}：{error}",
-                path.display()
-            ))),
+            Err(error) => Err(error),
         }
     }
 
-    /// Finds one immutable completed capture by Agent-provided recovery key.
-    fn find_partial_snapshot(
-        &self,
-        capture_id: &str,
-    ) -> Result<Option<CaptureSnapshot>, JlinkError> {
-        let path = self.partial_path(capture_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let scan = scan_capture(&path, true)?;
+    fn open_partial_snapshot(path: &Path, capture_id: &str) -> Result<CaptureSnapshot, JlinkError> {
+        let scan = scan_capture(path, true)?;
         if scan.header.capture_id != capture_id {
             return Err(invalid_store("partial identity mismatch"));
         }
@@ -479,12 +494,12 @@ impl CaptureStore {
             Some(manifest) => manifest.clone(),
             None => partial_manifest(&scan)?,
         };
-        Ok(Some(CaptureSnapshot {
-            path,
+        Ok(CaptureSnapshot {
+            path: path.to_path_buf(),
             header: scan.header,
             manifest,
             recovered_prefix,
-        }))
+        })
     }
 
     /// Finds a finalized capture or an orphaned partial by its recovery key.
@@ -521,7 +536,11 @@ impl CaptureStore {
                     let snapshot = self
                         .find_snapshot(&header.capture_id)?
                         .ok_or_else(|| invalid_store("capture disappeared"))?;
-                    if snapshot.path() != path {
+                    if snapshot.path() != path
+                        && !(path.extension() == Some(OsStr::new("partial"))
+                            && snapshot.path() == path.with_extension("capture")
+                            && !path.exists())
+                    {
                         return Err(invalid_store("capture path/identity mismatch"));
                     }
                     if found.replace(snapshot).is_some() {
@@ -550,18 +569,17 @@ impl CaptureStore {
             .filter(|path| path.extension() == Some(OsStr::new("capture")))
             .collect::<Vec<_>>();
         paths.sort();
+        let mut ids = HashSet::new();
         paths
             .into_iter()
             .map(|path| {
-                let capture_id = capture_id_from_store_path(&path, "capture").ok_or_else(|| {
-                    invalid_store("完成 capture 文件名不符合 capture-<id>.capture")
-                })?;
-                let snapshot = self.open_snapshot(&capture_id)?;
-                if snapshot.path() != path {
-                    return Err(invalid_store("完成 capture 路径与自描述身份不一致")
+                let capture_id = capture_id_from_store_path(&path, "capture")
+                    .ok_or_else(|| invalid_store("无法从完成 capture 文件名识别采集 ID"))?;
+                if !ids.insert(capture_id.to_owned()) {
+                    return Err(invalid_store("同一 Capture Store 存在重复 capture_id")
                         .with_detail("capture_id", json!(capture_id)));
                 }
-                Ok(snapshot)
+                Self::open_snapshot_at(path.clone(), capture_id)
             })
             .collect()
     }
@@ -581,26 +599,21 @@ impl CaptureStore {
             .filter(|path| path.extension() == Some(OsStr::new("partial")))
             .collect::<Vec<_>>();
         paths.sort();
-        paths
-            .into_iter()
-            .map(|path| self.recover_one(path))
-            .collect()
+        paths.into_iter().map(Self::recover_one).collect()
     }
 
-    fn recover_one(&self, path: PathBuf) -> Result<CaptureRecovery, JlinkError> {
-        match scan_capture(&path, false) {
+    fn recover_one(path: PathBuf) -> Result<CaptureRecovery, JlinkError> {
+        let scan = scan_capture(&path, false).and_then(|scan| {
+            if capture_id_from_store_path(&path, "partial") != Some(scan.header.capture_id.as_str())
+            {
+                return Err(invalid_store("partial 文件名与自描述身份不一致"));
+            }
+            Ok(scan)
+        });
+        match scan {
             Ok(scan) => {
                 if let Some(manifest) = scan.manifest {
-                    let completed_path = self.completed_path(&scan.header.capture_id);
-                    if completed_path.exists() {
-                        return Err(storage_error(
-                            "partial 与不可变完成 capture 同时存在，拒绝覆盖",
-                        )
-                        .with_detail("capture_id", json!(scan.header.capture_id)));
-                    }
-                    fs::rename(&path, &completed_path).map_err(|error| {
-                        storage_error(format!("无法原子发布恢复 capture：{error}"))
-                    })?;
+                    let completed_path = publish_capture(&path, &scan.header.capture_id)?;
                     return Ok(CaptureRecovery::Published(CaptureSnapshot {
                         path: completed_path,
                         header: scan.header,
@@ -624,8 +637,8 @@ impl CaptureStore {
                 }))
             }
             Err(error) => {
-                let capture_id = capture_id_from_partial_path(&path)
-                    .unwrap_or_else(|| "unknown-partial".to_owned());
+                let capture_id = capture_id_from_store_path(&path, "partial")
+                    .map_or_else(|| "unknown-partial".to_owned(), str::to_owned);
                 Ok(aborted_recovery(AbortedRecoveryInput {
                     path,
                     capture_id,
@@ -642,21 +655,12 @@ impl CaptureStore {
             }
         }
     }
-
-    fn partial_path(&self, capture_id: &str) -> PathBuf {
-        self.root.join(format!("capture-{capture_id}.partial"))
-    }
-
-    fn completed_path(&self, capture_id: &str) -> PathBuf {
-        self.root.join(format!("capture-{capture_id}.capture"))
-    }
 }
 
 /// Append-only active capture writer that publishes exactly one immutable file.
 pub struct CaptureWriter {
     writer: Option<BufWriter<File>>,
     partial_path: PathBuf,
-    completed_path: PathBuf,
     header: CaptureHeader,
     max_bytes: u64,
     bytes_written: u64,
@@ -669,7 +673,6 @@ pub struct CaptureWriter {
 impl CaptureWriter {
     fn create(
         partial_path: PathBuf,
-        completed_path: PathBuf,
         header: CaptureHeader,
         max_bytes: u64,
     ) -> Result<Self, JlinkError> {
@@ -713,7 +716,6 @@ impl CaptureWriter {
         Ok(Self {
             writer: Some(writer),
             partial_path,
-            completed_path,
             header,
             max_bytes,
             bytes_written,
@@ -858,13 +860,9 @@ impl CaptureWriter {
         let verified_manifest = scan
             .manifest
             .ok_or_else(|| invalid_store("原子发布前缺少已校验终态清单"))?;
-        if self.completed_path.exists() {
-            return Err(storage_error("不可变完成 capture 已存在，拒绝原子覆盖"));
-        }
-        fs::rename(&self.partial_path, &self.completed_path)
-            .map_err(|error| storage_error(format!("无法原子发布 Capture Store：{error}")))?;
+        let completed_path = publish_capture(&self.partial_path, &self.header.capture_id)?;
         Ok(CaptureSnapshot {
-            path: self.completed_path,
+            path: completed_path,
             header: scan.header,
             manifest: verified_manifest,
             recovered_prefix: false,
@@ -1217,6 +1215,127 @@ fn unix_time_us() -> Result<u64, JlinkError> {
         .map_err(|_| storage_error("Capture Store 创建时间超出 u64 微秒范围"))
 }
 
+fn capture_local_date(created_unix_us: u64) -> Result<String, JlinkError> {
+    // FILETIME counts 100 ns intervals from 1601-01-01 UTC.
+    const UNIX_EPOCH_FILETIME: u64 = 116_444_736_000_000_000;
+    let ticks = created_unix_us
+        .checked_mul(10)
+        .and_then(|ticks| ticks.checked_add(UNIX_EPOCH_FILETIME))
+        .ok_or_else(|| storage_error("Capture Store 创建时间超出 Windows FILETIME 范围"))?;
+    let to_dword = |part| u32::try_from(part).expect("32-bit half of FILETIME");
+    let file_time = FILETIME {
+        dwLowDateTime: to_dword(ticks & u64::from(u32::MAX)),
+        dwHighDateTime: to_dword(ticks >> 32),
+    };
+    let mut utc = SYSTEMTIME::default();
+    let mut local = SYSTEMTIME::default();
+    // SAFETY: both pointers refer to initialized structures of the expected type.
+    if unsafe { FileTimeToSystemTime(&raw const file_time, &raw mut utc) } == 0 {
+        return Err(storage_error(format!(
+            "无法转换 Capture Store 的 UTC 创建时间：{}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    // SAFETY: null selects the Windows local time zone; utc and local are separate valid structures.
+    if unsafe {
+        SystemTimeToTzSpecificLocalTimeEx(std::ptr::null(), &raw const utc, &raw mut local)
+    } == 0
+    {
+        return Err(storage_error(format!(
+            "无法转换 Capture Store 的本地日期：{}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(format!(
+        "{:04}-{:02}-{:02}",
+        local.wYear, local.wMonth, local.wDay
+    ))
+}
+
+fn lock_capture_names(root: &Path) -> Result<File, JlinkError> {
+    let path = root.join(".capture-names.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|error| {
+            storage_error(format!("无法打开采集命名锁 {}：{error}", path.display()))
+        })?;
+    lock.lock().map_err(|error| {
+        storage_error(format!("无法锁定采集文件名 {}：{error}", path.display()))
+    })?;
+    Ok(lock)
+}
+
+fn next_partial_path(root: &Path, date: &str, capture_id: &str) -> Result<PathBuf, JlinkError> {
+    let mut highest = 0;
+    for entry in fs::read_dir(root).map_err(|error| storage_error(error.to_string()))? {
+        let path = entry
+            .map_err(|error| storage_error(error.to_string()))?
+            .path();
+        let Some(extension @ ("capture" | "partial")) = path.extension().and_then(OsStr::to_str)
+        else {
+            continue;
+        };
+        if capture_id_from_store_path(&path, extension) == Some(capture_id) {
+            return Err(storage_error("已有同一 capture_id 的采集文件，拒绝覆盖")
+                .with_detail("capture_id", json!(capture_id)));
+        }
+        let stem = path.file_stem().and_then(OsStr::to_str).unwrap_or_default();
+        if let Some((stored_date, sequence, _)) = dated_capture_stem(stem)
+            && stored_date == date
+        {
+            highest = highest.max(sequence);
+        }
+    }
+    let next = highest
+        .checked_add(1)
+        .ok_or_else(|| capacity_error("Capture Store 当日序号已达上限"))?;
+    Ok(root.join(format!("{date}_{next:03}__{capture_id}.partial")))
+}
+
+fn find_capture_paths(root: &Path, capture_id: &str) -> Result<CapturePaths, JlinkError> {
+    let mut paths = CapturePaths::default();
+    for entry in fs::read_dir(root).map_err(|error| storage_error(error.to_string()))? {
+        let path = entry
+            .map_err(|error| storage_error(error.to_string()))?
+            .path();
+        let Some(extension) = path.extension().and_then(OsStr::to_str) else {
+            continue;
+        };
+        let slot = match extension {
+            "capture" => &mut paths.completed,
+            "partial" => &mut paths.partial,
+            _ => continue,
+        };
+        if capture_id_from_store_path(&path, extension) == Some(capture_id)
+            && slot.replace(path).is_some()
+        {
+            return Err(invalid_store("同一 Capture Store 存在重复 capture_id")
+                .with_detail("capture_id", json!(capture_id)));
+        }
+    }
+    Ok(paths)
+}
+
+fn publish_capture(partial: &Path, capture_id: &str) -> Result<PathBuf, JlinkError> {
+    let root = partial
+        .parent()
+        .expect("capture file has a store directory");
+    // Hold the same lock as the allocator while the stem moves between extensions.
+    let _name_lock = lock_capture_names(root)?;
+    if find_capture_paths(root, capture_id)?.completed.is_some() {
+        return Err(storage_error("不可变完成 capture 已存在，拒绝原子覆盖")
+            .with_detail("capture_id", json!(capture_id)));
+    }
+    let completed = partial.with_extension("capture");
+    fs::rename(partial, &completed)
+        .map_err(|error| storage_error(format!("无法原子发布 Capture Store：{error}")))?;
+    Ok(completed)
+}
+
 fn validate_capture_id(capture_id: &str) -> Result<(), JlinkError> {
     if capture_id.is_empty()
         || !capture_id
@@ -1240,18 +1359,34 @@ fn validate_json_length(length: usize) -> Result<(), JlinkError> {
     }
 }
 
-fn capture_id_from_partial_path(path: &Path) -> Option<String> {
-    capture_id_from_store_path(path, "partial")
+fn dated_capture_stem(stem: &str) -> Option<(&str, u64, &str)> {
+    let (date, rest) = stem.split_once('_')?;
+    let (sequence, capture_id) = rest.split_once("__")?;
+    if date.len() != 10
+        || !date.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 4 | 7) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit()
+            }
+        })
+        || sequence.len() < 3
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let sequence = sequence.parse().ok().filter(|&value| value > 0)?;
+    validate_capture_id(capture_id).ok()?;
+    Some((date, sequence, capture_id))
 }
 
-fn capture_id_from_store_path(path: &Path, extension: &str) -> Option<String> {
+fn capture_id_from_store_path<'path>(path: &'path Path, extension: &str) -> Option<&'path str> {
     if path.extension()?.to_str()? != extension {
         return None;
     }
-    path.file_stem()?
-        .to_str()?
-        .strip_prefix("capture-")
-        .map(str::to_owned)
+    let stem = path.file_stem()?.to_str()?;
+    stem.strip_prefix("capture-")
+        .or_else(|| dated_capture_stem(stem).map(|(_, _, capture_id)| capture_id))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -1278,7 +1413,7 @@ fn invalid_store(message: impl Into<String>) -> JlinkError {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs::OpenOptions,
+        fs::{self, OpenOptions},
         io::{Seek, SeekFrom, Write},
     };
 
@@ -1290,7 +1425,10 @@ mod tests {
     use serde_json::json;
     use tempfile::tempdir;
 
-    use super::{CapturePhase, CaptureRecovery, CaptureStore};
+    use super::{
+        CapturePhase, CaptureRecovery, CaptureStore, capture_local_date, dated_capture_stem,
+        next_partial_path,
+    };
 
     fn start_plan() -> HssStartPlan {
         let firmware: FirmwareIdentityPlan = serde_json::from_value(json!({
@@ -1378,6 +1516,13 @@ mod tests {
             .create_writer("cap-store", &target(), &plan, 16 * 1024 * 1024)
             .expect("partial writer");
         let partial = writer.partial_path().to_path_buf();
+        let date = capture_local_date(writer.header.created_unix_us).unwrap();
+        assert_eq!(
+            partial,
+            directory
+                .path()
+                .join(format!("{date}_001__cap-store.partial"))
+        );
         writer
             .append(
                 10,
@@ -1391,7 +1536,7 @@ mod tests {
             .finish(&completed_snapshot("cap-store"))
             .expect("atomic publish");
         assert!(!partial.exists());
-        assert!(snapshot.path().exists());
+        assert_eq!(snapshot.path(), partial.with_extension("capture"));
         assert_eq!(snapshot.capture_key(), "store-fixture");
         assert_eq!(snapshot.payload_bytes(), 8);
         assert_eq!(snapshot.raw_sha256().len(), 64);
@@ -1414,9 +1559,124 @@ mod tests {
     }
 
     #[test]
+    fn daily_sequence_uses_both_extensions_and_ignores_other_dates_and_exports() {
+        let directory = tempdir().unwrap();
+        for name in [
+            "2026-11-18_004__cap_a.capture",
+            "2026-11-18_014__cap_b.partial",
+            "2026-11-17_035__cap_c.capture",
+            "2026-11-18_042__cap_d.csv",
+            "capture-cap_legacy.capture",
+        ] {
+            fs::write(directory.path().join(name), b"fixture").unwrap();
+        }
+        let store = CaptureStore::open(directory.path()).unwrap();
+        assert_eq!(
+            next_partial_path(store.root(), "2026-11-18", "cap_new").unwrap(),
+            directory.path().join("2026-11-18_015__cap_new.partial")
+        );
+        assert_eq!(
+            next_partial_path(store.root(), "2026-11-19", "cap_new").unwrap(),
+            directory.path().join("2026-11-19_001__cap_new.partial")
+        );
+        assert!(next_partial_path(store.root(), "2026-11-19", "cap_legacy").is_err());
+    }
+
+    #[test]
+    fn concurrent_writers_reserve_different_daily_sequences() {
+        let directory = tempdir().unwrap();
+        let store = CaptureStore::open(directory.path()).unwrap();
+        let mut names = std::thread::scope(|scope| {
+            let start = |capture_id| {
+                let writer = store
+                    .create_writer(capture_id, &target(), &start_plan(), 16 * 1024 * 1024)
+                    .unwrap();
+                writer
+                    .partial_path()
+                    .file_stem()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            let first = scope.spawn(move || start("cap_a"));
+            let second = scope.spawn(move || start("cap_b"));
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        names.sort_unstable();
+        let (date_a, sequence_a, _) = dated_capture_stem(&names[0]).unwrap();
+        let (date_b, sequence_b, _) = dated_capture_stem(&names[1]).unwrap();
+        assert_eq!(sequence_a, 1);
+        assert_eq!(sequence_b, if date_a == date_b { 2 } else { 1 });
+    }
+
+    #[test]
+    fn recovery_preserves_the_stem_and_queries_both_name_formats() {
+        for legacy in [false, true] {
+            let directory = tempdir().unwrap();
+            let store = CaptureStore::open(directory.path()).unwrap();
+            let capture_id = "cap-recovered";
+            let writer = store
+                .create_writer(capture_id, &target(), &start_plan(), 16 * 1024 * 1024)
+                .unwrap();
+            let dated_partial = writer.partial_path().to_path_buf();
+            let completed = writer.finish(&completed_snapshot(capture_id)).unwrap();
+            let partial = if legacy {
+                directory.path().join("capture-cap-recovered.partial")
+            } else {
+                dated_partial
+            };
+            // Simulate an interruption after the terminal manifest was flushed.
+            fs::rename(completed.path(), &partial).unwrap();
+            let store = CaptureStore::open(directory.path()).unwrap();
+            let recovered = store.recover_partials().unwrap();
+            let [CaptureRecovery::Published(snapshot)] = recovered.as_slice() else {
+                panic!("durable terminal manifest must be published");
+            };
+            assert_eq!(snapshot.path(), partial.with_extension("capture"));
+            assert!(!partial.exists());
+            assert_eq!(
+                store.find_snapshot(capture_id).unwrap().as_ref(),
+                Some(snapshot)
+            );
+            assert_eq!(
+                store
+                    .find_snapshot_by_key("store-fixture")
+                    .unwrap()
+                    .as_ref(),
+                Some(snapshot)
+            );
+            assert_eq!(
+                store.completed_snapshots().unwrap().as_slice(),
+                std::slice::from_ref(snapshot)
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_dated_partial_retains_the_capture_id_from_its_name() {
+        let directory = tempdir().unwrap();
+        let store = CaptureStore::open(directory.path()).unwrap();
+        let path = directory.path().join("2026-11-18_001__cap_corrupt.partial");
+        fs::write(&path, b"corrupt header").unwrap();
+        let recovery = store.recover_partials().unwrap();
+        let [
+            CaptureRecovery::Aborted {
+                capture_id,
+                path: retained,
+                ..
+            },
+        ] = recovery.as_slice()
+        else {
+            panic!("corrupt partial must be retained as aborted");
+        };
+        assert_eq!(capture_id, "cap_corrupt");
+        assert_eq!(retained, &path);
+    }
+
+    #[test]
     fn orphan_prefix_is_queryable_and_exported_as_aborted_without_modifying_source() {
         use super::scan_capture;
-        use std::{fs, io::Write};
         let directory = tempdir().unwrap();
         let store = CaptureStore::open(directory.path()).unwrap();
         let mut writer = store

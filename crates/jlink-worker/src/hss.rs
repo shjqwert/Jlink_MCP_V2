@@ -1156,7 +1156,7 @@ mod tests {
         let first_record = [1_u32.to_le_bytes(), 10_u32.to_le_bytes()].concat();
         let second_record = [2_u32.to_le_bytes(), 20_u32.to_le_bytes()].concat();
         let mut io = ScriptedHss::healthy([first_record, second_record]);
-        let (store_root, mut coordinator) = open_coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let outcome = coordinator
             .start(
                 "260106173",
@@ -1228,9 +1228,11 @@ mod tests {
         assert_eq!(io.calls.iter().filter(|call| **call == "stop").count(), 1);
         assert!(snapshot.drain.calls >= 23);
         assert!(
-            store_root
+            coordinator
+                .store
+                .open_snapshot(&capture_id)
+                .unwrap()
                 .path()
-                .join(format!("capture-{capture_id}.capture"))
                 .is_file()
         );
     }
@@ -1288,7 +1290,7 @@ mod tests {
 
     #[test]
     fn t_p3_recover_graceful_shutdown_stops_drains_and_persists_failed_capture() {
-        let (store_root, mut coordinator) = open_coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let mut io = ScriptedHss::healthy([record(1, 7)]);
         let outcome = coordinator
             .start(
@@ -1316,16 +1318,18 @@ mod tests {
         assert_eq!(io.calls[0..2], ["start", "stop"]);
         assert_eq!(io.calls.iter().filter(|call| **call == "stop").count(), 1);
         assert!(
-            store_root
+            coordinator
+                .store
+                .open_snapshot(&capture_id)
+                .unwrap()
                 .path()
-                .join(format!("capture-{capture_id}.capture"))
                 .is_file()
         );
     }
 
     #[test]
     fn t_p3_recover_shutdown_reports_tail_drain_failure_after_persisting_it() {
-        let (store_root, mut coordinator) = open_coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let mut io = ScriptedHss::healthy([]);
         let outcome = coordinator
             .start(
@@ -1354,9 +1358,11 @@ mod tests {
         assert_eq!(snapshot.state, HssRunState::Failed);
         assert_ne!(snapshot.state, HssRunState::Completed);
         assert!(
-            store_root
+            coordinator
+                .store
+                .open_snapshot(&capture_id)
+                .unwrap()
                 .path()
-                .join(format!("capture-{capture_id}.capture"))
                 .is_file()
         );
     }
@@ -1426,7 +1432,7 @@ mod tests {
             reads: VecDeque::new(),
             calls: Vec::new(),
         };
-        let (store_root, mut coordinator) = open_coordinator();
+        let (_store_root, mut coordinator) = open_coordinator();
         let error = coordinator
             .start(
                 "260106173",
@@ -1450,9 +1456,11 @@ mod tests {
         assert_eq!(failed.failure_code, Some(ErrorCode::HssStartFailed));
         assert!(!failed.partial_available);
         assert!(
-            store_root
+            coordinator
+                .store
+                .open_snapshot(capture_id)
+                .unwrap()
                 .path()
-                .join(format!("capture-{capture_id}.capture"))
                 .is_file()
         );
 
