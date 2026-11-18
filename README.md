@@ -2,7 +2,9 @@
 
 通过 Codex 使用 SEGGER J-Link 调试 ARM Cortex-M 目标。Windows x64 Rust 实现，以独立 Worker 隔离 J-Link DLL 和目标会话。
 
-当前源码版本为 **1.2.2**。离线 HSS Viewer 支持固定纵轴、快捷键和选中通道波形置顶。
+当前源码版本为 **1.2.3**。新 HSS 采集文件名包含 Windows 本地日期、当日序号和完整采集 ID，历史采集仍可按原有 ID 或恢复键查询。
+
+1.2.2 的离线 HSS Viewer 支持固定纵轴、快捷键和选中通道波形置顶。
 
 1.2.1 在初始化工程的 `.jlink-mcp` 目录时自动放入离线 HSS Viewer。
 
