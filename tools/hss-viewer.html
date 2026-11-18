@@ -1,12 +1,23 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>HSS · 离线波形</title>
 <style>
-:root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#10151e;color:#e2e8f0}*{box-sizing:border-box}body{margin:0;padding:28px;max-width:1600px;margin-inline:auto}header{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{font-size:25px;font-weight:650;margin:0}p{color:#94a3b8;line-height:1.6;font-size:14px}button,.file{border:1px solid #3a4b66;background:#202d42;color:#e2e8f0;border-radius:8px;padding:10px 15px;cursor:pointer;font:inherit}.file{background:#3165cb;border-color:#3165cb}input[type=file]{max-width:280px;font-size:13px}.toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:22px 0 12px}.panel{background:#171f2c;border:1px solid #2a364a;border-radius:12px;overflow:hidden}#status{padding:13px 18px;color:#aec5e8;border-bottom:1px solid #2a364a;font-size:14px;white-space:pre-wrap;line-height:1.6}#notice{color:#e5b76c;font-size:13px;line-height:1.6;white-space:pre-wrap;padding:0 18px}canvas{display:block;width:100%;height:430px}#empty{text-align:center;padding:75px 20px;color:#9aaac3}#plot{display:none}.controls{display:flex;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid #2a364a}input[type=range]{flex:1;min-width:80px;accent-color:#68a5ff}#position{font-variant-numeric:tabular-nums;min-width:240px;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:12px 18px;border-top:1px solid #2a364a}th{color:#92a3bd;font-weight:500}td.value{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}#details{margin-top:18px;color:#aebed3}pre{max-height:300px;overflow:auto;white-space:pre-wrap;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 8px}footer{margin-top:22px;color:#71839f;font-size:12px}@media(max-width:700px){body{padding:14px}header{display:block}canvas{height:300px}.controls{flex-wrap:wrap}td,th{padding:10px 8px}#position{min-width:0}h1{font-size:22px}}
+:root{color-scheme:dark;font-family:system-ui,"Microsoft YaHei",sans-serif;background:#10151e;color:#e2e8f0}*{box-sizing:border-box}body{margin:0;padding:28px;max-width:1600px;margin-inline:auto}header{display:flex;justify-content:space-between;align-items:center;gap:20px}h1{font-size:25px;font-weight:650;margin:0}p{color:#94a3b8;line-height:1.6;font-size:14px}button,.file{border:1px solid #3a4b66;background:#202d42;color:#e2e8f0;border-radius:8px;padding:10px 15px;cursor:pointer;font:inherit}.file{background:#3165cb;border-color:#3165cb}input[type=file]{max-width:280px;font-size:13px}.toolbar{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin:22px 0 12px}.panel{background:#171f2c;border:1px solid #2a364a;border-radius:12px;overflow:hidden}#status{padding:13px 18px;color:#aec5e8;border-bottom:1px solid #2a364a;font-size:14px;white-space:pre-wrap;line-height:1.6}#notice{color:#e5b76c;font-size:13px;line-height:1.6;white-space:pre-wrap;padding:0 18px}canvas{display:block;width:100%;min-width:0;height:560px}#empty{text-align:center;padding:75px 20px;color:#9aaac3}.controls{display:flex;align-items:center;gap:12px;padding:12px 18px;border-top:1px solid #2a364a}input[type=range]{flex:1;min-width:80px;accent-color:#68a5ff}#position{font-variant-numeric:tabular-nums;min-width:240px;font-size:13px}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;padding:12px 18px;border-top:1px solid #2a364a}th{color:#92a3bd;font-weight:500}td.value{font-family:ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}#details{margin-top:18px;color:#aebed3}pre{max-height:300px;overflow:auto;white-space:pre-wrap;font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin:0 8px}footer{margin-top:22px;color:#71839f;font-size:12px}@media(max-width:700px){body{padding:14px}header{display:block}canvas{height:300px}.controls{flex-wrap:wrap}td,th{padding:10px 8px}#position{min-width:0}h1{font-size:22px}}
 .file{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}.table-scroll{overflow-x:auto}table{min-width:620px}#channels td:first-child{overflow-wrap:anywhere;max-width:340px}@media(max-width:700px){.file{max-width:100%;font-size:13px;margin-top:8px}input[type=file]{max-width:100%}}
 .timing{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:12px;margin:12px 18px}.timing div{padding:10px 12px;background:#202d42;border-radius:8px}.timing dt{color:#aec5e8;font-size:13px}.timing dd{margin:4px 0 0;font-variant-numeric:tabular-nums}.timing small{display:block;color:#aebed3;margin-top:4px}#timing[hidden]{display:none}#axis{font:inherit;color:inherit;background:#202d42;border:1px solid #3a4b66;border-radius:8px;padding:8px}#timing-note{color:#aebed3;margin:6px 0}
 .channel-controls{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 18px;border-top:1px solid #2a364a;font-size:13px}.channel-controls label{display:inline-flex;align-items:center;gap:6px;cursor:pointer}.channel-controls input{accent-color:#68a5ff}#channel-count{color:#aebed3}button:disabled{opacity:.45;cursor:default}
 .plot-caption{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px 18px;padding:0 18px;color:#aebed3;font-size:13px;overflow-wrap:anywhere}
 .plot-caption[hidden]{display:none}.plot-caption strong{color:#aecaf7}#scale-reference{color:#aebed3}#scale-overflow{color:#e5b76c}
+.plot-area{display:grid;grid-template-columns:minmax(0,1fr) 84px}
+.plot-area[hidden]{display:none}
+.vertical-pan{display:grid;grid-template-rows:auto minmax(0,1fr) auto;justify-items:center;align-items:center;gap:8px;margin:20px 0 28px;padding:0 5px;border-left:1px solid #2a364a;color:#aebed3;font-size:12px}
+.vertical-pan output{color:#e2e8f0;font-variant-numeric:tabular-nums}
+#vertical-pan{writing-mode:vertical-lr;direction:ltr;appearance:none;min-width:0;width:40px;height:100%;margin:0;background:transparent}
+#vertical-pan::-webkit-slider-runnable-track{width:5px;height:100%;border-radius:5px;background:#344761}
+#vertical-pan::-webkit-slider-thumb{appearance:none;width:19px;height:15px;margin-left:-7px;border:1px solid #a6c6ff;border-radius:5px;background:#75aaff}
+#vertical-pan::-moz-range-track{width:5px;height:100%;border-radius:5px;background:#344761}
+#vertical-pan::-moz-range-thumb{width:17px;height:13px;border:1px solid #a6c6ff;border-radius:5px;background:#75aaff}
+#vertical-pan:disabled{opacity:.45}
+@media(max-width:700px){.plot-area{grid-template-columns:minmax(0,1fr) 62px}}
 .table-scroll table{min-width:740px}.table-scroll th:last-child{text-align:right}
 .scale-cell{text-align:right;white-space:nowrap}.scale-controls{display:inline-flex;align-items:center;gap:5px}
 .scale-controls button{padding:3px 9px}.scale-controls button:nth-child(2){min-width:110px;font-variant-numeric:tabular-nums;color:#c6dbff}
@@ -43,7 +54,14 @@ dialog select,dialog input{max-width:100%;min-width:0;background:#202d42;color:#
  <dl id="timing" class="timing" hidden><div><dt>主机采集窗口</dt><dd id="host-window"></dd><small id="host-basis"></small></div><div><dt>源时间跨度</dt><dd id="source-span"></dd><small id="source-bounds"></small></div></dl>
  <p id="notice"></p><div id="empty">导入本地采集文件，开始查看波形。<br><p>按文件顺序查看全部通过校验的完整记录。</p></div>
  <div id="plot-caption" class="plot-caption" hidden><span><strong>纵轴固定</strong> <span id="scale-reference"></span></span><span id="scale-overflow" role="status"></span></div>
- <canvas id="plot" tabindex="0" aria-label="统一通道波形图"></canvas>
+ <div id="plot-area" class="plot-area" hidden>
+  <canvas id="plot" tabindex="0" aria-label="统一通道波形图"></canvas>
+  <div class="vertical-pan">
+   <label for="vertical-pan">纵轴位置</label>
+   <input id="vertical-pan" type="range" orient="vertical" min="0" max="1000" step="1" aria-orientation="vertical" disabled>
+   <output id="vertical-center" for="vertical-pan" aria-label="纵轴中心" aria-live="off">—</output>
+  </div>
+ </div>
  <div class="controls"><button id="prev" aria-label="上一条记录">←</button><input id="cursor" type="range" min="0" max="0" value="0" aria-label="记录索引"><button id="next" aria-label="下一条记录">→</button><span id="position">尚无记录</span></div>
  <div class="channel-controls"><label><input id="select-all" type="checkbox" disabled>全选</label><span id="channel-count"></span></div>
  <div id="channel-table" class="table-scroll" role="region" aria-label="通道原始值和纵轴比例，可横向滚动" tabindex="0"><table><thead><tr><th>通道</th><th>当前原始值</th><th>可见最小值</th><th>可见最大值</th><th>纵轴比例</th></tr></thead><tbody id="channels"></tbody></table></div>
@@ -183,12 +201,14 @@ function measuredHostWindow(receipt,capture){
  return T2_us-T1_us;
 }
 const cv=$('plot'),ctx=cv.getContext('2d');
+const verticalPan=$('vertical-pan'),verticalCenter=$('vertical-center');
 function textCell(row,text,cls=''){const td=document.createElement('td');td.className=cls;td.textContent=text;row.append(td);return td}
 const format=String;
 const scaleDialog=$('scale-dialog'),scaleMode=$('scale-mode'),scaleChannel=$('scale-channel');
 const scaleValue=$('scale-value'),scaleCenter=$('scale-center');
 const scaleScope=$('scale-scope'),scaleScopeButtons=[...scaleScope.querySelectorAll('button')];
 let currentChannel=null,keyboardScaleScope='current',scaleDrafts=new Map(),visibleRanges=null;
+let pendingPanRender=false;
 const yDivisions=4,plotLeft=78,plotRight=24;
 
 function plotNumber(value){return Number.isFinite(value)?String(Number(value.toPrecision(6))):'—'}
@@ -228,8 +248,42 @@ function divisionsFromCenter(value,{center,scale}){
  const delta=value-center;
  return Number.isFinite(delta)?delta/scale:value/scale-center/scale;
 }
+function panBounds({min,max},{center,scale}){
+ const padding=max*.08-min*.08||scale;
+ return {min:Math.min(Math.max(-Number.MAX_VALUE,min-padding),center),
+         max:Math.max(Math.min(Number.MAX_VALUE,max+padding),center)};
+}
+function updateVerticalPan(){
+ const channel=currentChannel;
+ verticalPan.disabled=!channel?.enabled;
+ if(!channel){
+  verticalCenter.textContent='—';
+  verticalPan.removeAttribute('aria-valuetext');
+  return;
+ }
+ const {min,max}=channel.panBounds,center=channel.vertical.center;
+ const span=max-min;
+ const fraction=Number.isFinite(span)?(center-min)/span:(center/2-min/2)/(max/2-min/2);
+ verticalPan.valueAsNumber=Math.round(fraction*Number(verticalPan.max));
+ const shown=plotNumber(center);
+ verticalCenter.textContent=channel.enabled?shown:'未显示';
+ verticalPan.setAttribute('aria-valuetext',`${channel.name} · 纵轴中心 ${shown}`);
+}
+verticalPan.oninput=()=>{
+ const channel=currentChannel;
+ if(!channel?.enabled)return;
+ const {min,max}=channel.panBounds,fraction=verticalPan.valueAsNumber/Number(verticalPan.max);
+ const span=max-min;
+ const center=Number.isFinite(span)?min+span*fraction:min*(1-fraction)+max*fraction;
+ channel.vertical.center=Math.max(min,Math.min(max,center));
+ if(pendingPanRender)return;
+ pendingPanRender=true;
+ requestAnimationFrame(()=>{pendingPanRender=false;render()});
+};
 function setChannelScale(channel,setting){
  channel.vertical=setting;
+ channel.panBounds.min=Math.min(channel.panBounds.min,setting.center);
+ channel.panBounds.max=Math.max(channel.panBounds.max,setting.center);
  currentChannel=channel;
 }
 function setupChannelRows(){
@@ -238,6 +292,7 @@ function setupChannelRows(){
  for(const channel of data.channels){
   channel.fullBounds=bounds(channel);
   channel.vertical=suggestedScale(channel.fullBounds);
+  if(channel.vertical)channel.panBounds=panBounds(channel.fullBounds,channel.vertical);
   const row=document.createElement('tr'),nameCell=textCell(row,'');
   const checkbox=document.createElement('input');
   checkbox.type='checkbox';checkbox.checked=channel.enabled;
@@ -365,6 +420,7 @@ function render(){
  $('zoom-out').disabled=range>=fullEnd-fullStart;
  updateChannelSelection();
  updateScaleTarget();
+ updateVerticalPan();
  const reference=currentChannel?.enabled?currentChannel:data.channels.find(channel=>channel.enabled&&channel.vertical);
  $('scale-reference').textContent=reference?`· 刻度参考 ${reference.name}`:'';
  ctx.font='12px system-ui';ctx.strokeStyle='#2b394e';ctx.fillStyle='#aebed3';const ticks=w<500?3:5;for(let k=0;k<=ticks;k++){const x=left+width*k/ticks,t=view[0]+range*k/ticks;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,bottom);ctx.stroke();ctx.textAlign=k===0?'left':k===ticks?'right':'center';ctx.fillText(axis.value==='record'?String(Math.round(t)):t.toFixed(2),x,bottom+23)}
@@ -466,7 +522,7 @@ async function loadFile(file){
  $('zoom').disabled=true;$('zoom-out').disabled=true;updateChannelSelection();
  scaleScope.hidden=true;
  $('timing').hidden=true;$('timing-file').value='';$('timing-file').disabled=true;$('timing-note').textContent='';
- $('plot').style.display='none';$('empty').style.display='block';$('plot-caption').hidden=true;$('channels').replaceChildren();
+ $('plot-area').hidden=true;$('empty').style.display='block';$('plot-caption').hidden=true;$('channels').replaceChildren();
  $('notice').textContent='';$('metadata').textContent='';$('position').textContent='尚无记录';
  $('status').textContent='正在校验并读取本地文件…';
  try{
@@ -477,7 +533,7 @@ async function loadFile(file){
   setupChannelRows();
   $('cursor').max=data.count-1;$('timing-file').disabled=!data.complete;
   scaleScope.hidden=false;
-  $('empty').style.display='none';$('plot').style.display='block';$('plot-caption').hidden=false;
+  $('empty').style.display='none';$('plot-area').hidden=false;$('plot-caption').hidden=false;
   $('status').textContent=`${file.name} · ${data.count.toLocaleString()} 条完整记录 · ${data.channels.length} 通道 · ${data.state}`;
   $('notice').textContent=data.warnings.join('\n');
   $('metadata').textContent=JSON.stringify({header:data.header,manifest:data.manifest,verified_payload_sha256:data.sha},null,2);
@@ -519,7 +575,7 @@ selectAll.onchange=()=>{
 document.addEventListener('keydown',event=>{
  const target=event.target;
  if(!data||scaleDialog.open||event.defaultPrevented||event.isComposing||event.altKey||event.metaKey||
-    !(target instanceof Element)||!target.closest('#viewer-toolbar,#plot,.controls,#channel-table,.channel-controls')||
+    !(target instanceof Element)||!target.closest('#viewer-toolbar,#plot-area,.controls,#channel-table,.channel-controls')||
     target.isContentEditable||target.matches('input:not([type=checkbox]):not([type=range]),select,textarea'))return;
  if(event.ctrlKey){
   if(event.shiftKey||event.key.toLowerCase()!=='h')return;
